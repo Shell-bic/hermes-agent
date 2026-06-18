@@ -1019,8 +1019,16 @@ export function WorkspaceConversationRenderer({
   const [localPanelTab, setLocalPanelTab] = useState<WorkspacePanelTab>('detail')
   const [localSelectedBlockId, setLocalSelectedBlockId] = useState<string | null>(null)
   const [localSelectedArtifactId, setLocalSelectedArtifactId] = useState<string | null>(null)
-  const projectedBlocks = useMemo(() => sortCanvasBlocks(blocks as readonly WorkspaceBlockRecord[]), [blocks])
-  const artifacts = useMemo(() => projectBlocksToArtifacts(projectedBlocks, messages), [projectedBlocks, messages])
+  const messageBlocks = useMemo(
+    () => (blocks.length ? [] : projectChatMessagesToWorkspaceBlocks(messages)),
+    [blocks.length, messages]
+  )
+  const effectiveBlocks = blocks.length ? blocks : messageBlocks
+  const projectedBlocks = useMemo(() => sortCanvasBlocks(effectiveBlocks as readonly WorkspaceBlockRecord[]), [effectiveBlocks])
+  const artifacts = useMemo(
+    () => projectBlocksToArtifacts(projectedBlocks, blocks.length ? messages : []),
+    [blocks.length, projectedBlocks, messages]
+  )
   const rawObjects = useMemo(() => objectArray(objects), [objects])
   const selectedArtifactId = localSelectedArtifactId ?? defaultSelectedArtifactId(artifacts)
   const selectedArtifact =
@@ -1085,6 +1093,210 @@ export function WorkspaceConversationRenderer({
       />
     </div>
   )
+}
+
+function projectChatMessagesToWorkspaceBlocks(messages: readonly ChatMessage[]): WorkspaceBlock[] {
+  const assistant = [...messages]
+    .reverse()
+    .find(message => message.role === 'assistant' && chatMessageText(message).trim())
+
+  if (!assistant) {
+    const user = [...messages].reverse().find(message => message.role === 'user' && chatMessageText(message).trim())
+
+    return user ? [chatTaskBlock(user)] : []
+  }
+
+  const text = chatMessageText(assistant).trim()
+  const updatedAt = messageTime(assistant)
+  const sections = splitMessageSections(text)
+  const summaryIsArtifact = !sections.length && sectionRenderer(text) === 'artifact'
+  const blocks: WorkspaceBlock[] = []
+
+  blocks.push({
+    actions: [],
+    body: sections.length ? firstMeaningfulParagraph(text) : text,
+    created_at: updatedAt,
+    debug_refs: [],
+    id: `block:chat:summary:${assistant.id}`,
+    note_kind: summaryIsArtifact ? 'artifact' : 'summary',
+    source_event_ids: [],
+    source_object_ids: [],
+    status: assistant.pending ? 'active' : 'done',
+    title: summaryIsArtifact ? 'Answer' : 'Answer summary',
+    type: 'NOTE',
+    updated_at: updatedAt
+  })
+
+  const sectionBlocks = sections.slice(0, 8).map((section, index): WorkspaceBlock => {
+    const renderer = sectionRenderer(section.content)
+
+    if (renderer === 'artifact') {
+      return {
+        actions: [],
+        body: section.content,
+        created_at: updatedAt,
+        debug_refs: [],
+        id: `block:chat:artifact:${assistant.id}:${index + 1}:${slugForBlockId(section.title)}`,
+        note_kind: 'artifact',
+        source_event_ids: [],
+        source_object_ids: [],
+        status: assistant.pending ? 'active' : 'done',
+        title: section.title,
+        type: 'NOTE',
+        updated_at: updatedAt
+      }
+    }
+
+    return {
+      actions: [],
+      bullets: sectionBullets(section.content),
+      created_at: updatedAt,
+      debug_refs: [],
+      id: `block:chat:topic:${assistant.id}:${index + 1}:${slugForBlockId(section.title)}`,
+      source_event_ids: [],
+      source_object_ids: [],
+      state: assistant.pending ? 'exploring' : 'decided',
+      thesis: compactText(stripMarkdown(section.content), 180),
+      title: section.title,
+      topic_kind: 'findings',
+      type: 'TOPIC',
+      updated_at: updatedAt
+    }
+  })
+
+  blocks.push(...sectionBlocks)
+
+  return blocks
+}
+
+function chatTaskBlock(message: ChatMessage): WorkspaceBlock {
+  const text = chatMessageText(message).trim()
+  const updatedAt = messageTime(message)
+
+  return {
+    actions: [],
+    body: text,
+    created_at: updatedAt,
+    debug_refs: [],
+    id: `block:chat:task:${message.id}`,
+    note_kind: 'summary',
+    source_event_ids: [],
+    source_object_ids: [],
+    status: message.pending ? 'active' : 'done',
+    title: 'Current task',
+    type: 'NOTE',
+    updated_at: updatedAt
+  }
+}
+
+function messageTime(message: ChatMessage): string {
+  return message.timestamp ? new Date(message.timestamp).toISOString() : '1970-01-01T00:00:00.000Z'
+}
+
+function splitMessageSections(content: string): { content: string; title: string }[] {
+  if (content.length < 500) {
+    return []
+  }
+
+  const lines = content.split(/\r?\n/)
+  const headings: { lineIndex: number; title: string }[] = []
+  let inFence = false
+
+  lines.forEach((line, lineIndex) => {
+    if (/^\s*```/.test(line)) {
+      inFence = !inFence
+      return
+    }
+
+    if (inFence) {
+      return
+    }
+
+    const match = /^(#{2,4})\s+(.+?)\s*#*\s*$/.exec(line)
+
+    if (match) {
+      headings.push({ lineIndex, title: match[2].trim() })
+    }
+  })
+
+  return headings
+    .map((heading, index) => {
+      const nextHeading = headings[index + 1]
+      const sectionContent = lines.slice(heading.lineIndex, nextHeading?.lineIndex).join('\n').trim()
+
+      return {
+        content: sectionContent,
+        title: heading.title
+      }
+    })
+    .filter(section => section.content.length >= 80)
+}
+
+function firstMeaningfulParagraph(content: string): string {
+  const paragraph =
+    content
+      .split(/\n{2,}/)
+      .map(part => stripMarkdown(part).trim())
+      .find(Boolean) || stripMarkdown(content)
+
+  return compactText(paragraph, 420)
+}
+
+function sectionRenderer(content: string): 'artifact' | 'topic' {
+  return hasMarkdownTable(content) || hasCodeFence(content) ? 'artifact' : 'topic'
+}
+
+function sectionBullets(content: string): WorkspaceBlock extends infer _ ? { id: string; text: string }[] : never {
+  const stripped = stripMarkdown(content)
+  const explicit = content
+    .split(/\r?\n/)
+    .map(line => /^\s*(?:[-*]|\d+[.)])\s+(.+)$/.exec(line)?.[1]?.trim())
+    .filter((line): line is string => Boolean(line))
+
+  const candidates = explicit.length
+    ? explicit
+    : stripped
+        .split(/[。.!?]\s+|\n+/)
+        .map(line => line.trim())
+        .filter(Boolean)
+
+  return candidates.slice(0, 6).map((text, index) => ({
+    id: `bullet:${index + 1}`,
+    text: compactText(text, 180)
+  })) as never
+}
+
+function hasCodeFence(content: string): boolean {
+  return /(?:^|\n)```[\s\S]*?\n```(?:\n|$)/.test(content.trim())
+}
+
+function hasMarkdownTable(content: string): boolean {
+  const tableLines = content.split(/\r?\n/).filter(line => /^\s*\|.+\|\s*$/.test(line))
+
+  return tableLines.length >= 2 && tableLines.some(line => /\|\s*:?-{3,}:?\s*\|/.test(line))
+}
+
+function stripMarkdown(content: string): string {
+  return content
+    .replace(/```[\s\S]*?```/g, ' ')
+    .replace(/`([^`]+)`/g, '$1')
+    .replace(/^#{1,6}\s+/gm, '')
+    .replace(/^\s*[-*]\s+/gm, '')
+    .replace(/^\s*\d+[.)]\s+/gm, '')
+    .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
+function slugForBlockId(value: string): string {
+  const slug = value
+    .toLowerCase()
+    .replace(/`([^`]+)`/g, '$1')
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 48)
+
+  return slug || 'section'
 }
 
 function WorkspaceHeader({ primaryViewToggle }: { primaryViewToggle?: ReactNode }) {
@@ -1723,7 +1935,7 @@ function DetailPanel({
           </div>
           {artifact && <ArtifactDetail artifact={artifact} />}
           {showUserContext && <UserContextDetail content={userContext} />}
-          <BlockDetail block={detailBlock} />
+          {!artifact?.sourceBlockId?.startsWith('block:chat:summary:') && <BlockDetail block={detailBlock} />}
           <ArtifactActions artifact={artifact} onAction={onAction} />
           <BlockActions actions={detailBlock.actions} block={detailBlock} onAction={onAction} />
           <DebugRefs block={detailBlock} relatedObjects={relatedObjects} />
@@ -1761,6 +1973,8 @@ function ArtifactDetail({ artifact }: { artifact: WorkspaceArtifactRecord }) {
   ].filter(([, value]) => Boolean(value)) as [string, string][]
   const content = artifact.canvasArtifact.content ?? ''
   const runEntries = 'entries' in artifact.canvasArtifact ? artifact.canvasArtifact.entries : []
+  const contentDuplicatesSummary =
+    Boolean(artifact.summary) && normalizeDetailText(content) === normalizeDetailText(artifact.summary)
 
   return (
     <div className="grid gap-2">
@@ -1771,7 +1985,7 @@ function ArtifactDetail({ artifact }: { artifact: WorkspaceArtifactRecord }) {
           </p>
         </DetailSection>
       )}
-      {content && !runEntries.length && (
+      {content && !runEntries.length && !contentDuplicatesSummary && (
         <DetailSection label="Content">
           <ArtifactContentPreview artifact={artifact} content={content} />
         </DetailSection>
@@ -1809,6 +2023,10 @@ function ArtifactDetail({ artifact }: { artifact: WorkspaceArtifactRecord }) {
       </dl>
     </div>
   )
+}
+
+function normalizeDetailText(value: string): string {
+  return value.replace(/\s+/g, ' ').trim()
 }
 
 function DetailSection({ children, label }: { children: ReactNode; label: string }) {

@@ -12,7 +12,7 @@ interface PrimaryViewToggleProps {
 
 const OPTIONS: { icon: string; label: string; value: PrimaryView }[] = [
   { icon: 'comment-discussion', label: 'Chat', value: 'chat' },
-  { icon: 'layout', label: 'DSL Chat', value: 'dsl' }
+  { icon: 'layout', label: 'DSL', value: 'dsl' }
 ]
 
 export function PrimaryViewToggle({ className, onChange, value }: PrimaryViewToggleProps) {
@@ -27,9 +27,10 @@ export function PrimaryViewToggle({ className, onChange, value }: PrimaryViewTog
     >
       {OPTIONS.map(option => (
         <Button
+          aria-label={option.value === 'dsl' ? 'DSL Chat' : option.label}
           aria-pressed={value === option.value}
           className={cn(
-            'h-5 gap-1 px-1.5 py-0 text-[0.6875rem] text-(--ui-text-tertiary) hover:text-(--ui-text-primary)',
+            'h-5 min-w-10 gap-1 px-1.5 py-0 text-[0.6875rem] text-(--ui-text-tertiary) hover:text-(--ui-text-primary)',
             value === option.value && 'bg-(--ui-bg-secondary) text-(--ui-text-primary)'
           )}
           key={option.value}
