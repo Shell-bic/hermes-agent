@@ -50,6 +50,7 @@ import {
 } from '@/store/session'
 import { broadcastSessionsChanged } from '@/store/session-sync'
 import { reportBackendContract } from '@/store/updates'
+import { hydrateWorkspaceFromMessages } from '@/store/workspace'
 import { isWatchWindow } from '@/store/windows'
 import type { SessionCreateResponse, SessionInfo, SessionResumeResponse, SessionRuntimeInfo, UsageStats } from '@/types/hermes'
 
@@ -723,6 +724,8 @@ export function useSessionActions({
               if (!chatMessageArraysEquivalent($messages.get(), localSnapshot)) {
                 setMessages(localSnapshot)
               }
+
+              hydrateWorkspaceFromMessages(activeSessionIdRef.current, localSnapshot)
             }
           }
         } catch {
@@ -763,6 +766,7 @@ export function useSessionActions({
         patchSessionWorkspace(storedSessionId, runtimeInfo?.cwd)
 
         resumedRunning = Boolean((resumed as { running?: boolean }).running)
+        hydrateWorkspaceFromMessages(resumed.session_id, messagesForView)
 
         updateSessionState(
           resumed.session_id,
@@ -795,7 +799,10 @@ export function useSessionActions({
             return
           }
 
-          setMessages(preserveLocalAssistantErrors(toChatMessages(fallback.messages), $messages.get()))
+          const fallbackMessages = preserveLocalAssistantErrors(toChatMessages(fallback.messages), $messages.get())
+
+          setMessages(fallbackMessages)
+          hydrateWorkspaceFromMessages(activeSessionIdRef.current, fallbackMessages)
         } catch {
           // Fallback also failed: nothing to paint. Leave whatever messages are
           // already shown and fall through to arm the resume-failure latch so

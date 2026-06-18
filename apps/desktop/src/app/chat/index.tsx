@@ -63,7 +63,7 @@ import { ScrollToBottomButton } from './scroll-to-bottom-button'
 import { SessionActionsMenu } from './sidebar/session-actions-menu'
 import { threadLoadingState } from './thread-loading'
 
-interface ChatViewProps extends Omit<React.ComponentProps<'div'>, 'onSubmit'> {
+export interface ChatViewProps extends Omit<React.ComponentProps<'div'>, 'onSubmit'> {
   gateway: HermesGateway | null
   modelMenuContent?: React.ReactNode
   onToggleSelectedPin: () => void
@@ -94,7 +94,7 @@ interface ChatViewProps extends Omit<React.ComponentProps<'div'>, 'onSubmit'> {
   onDismissError?: (messageId: string) => void
 }
 
-interface ChatHeaderProps {
+export interface ChatHeaderProps {
   activeSessionId: null | string
   isRoutedSessionView: boolean
   onDeleteSelectedSession: () => void
@@ -102,7 +102,7 @@ interface ChatHeaderProps {
   selectedSessionId: null | string
 }
 
-function ChatHeader({
+export function ChatHeader({
   activeSessionId,
   isRoutedSessionView,
   onDeleteSelectedSession,
@@ -165,7 +165,7 @@ function ChatHeader({
   )
 }
 
-interface ChatRuntimeBoundaryProps {
+export interface ChatRuntimeBoundaryProps {
   busy: boolean
   children: React.ReactNode
   onCancel: () => Promise<void> | void
@@ -189,7 +189,7 @@ const NO_MESSAGES: ChatMessage[] = []
  * of re-rendering them by element identity and the stream's render cost stays
  * confined to the streaming message's own subtree.
  */
-function ChatRuntimeBoundary({
+export function ChatRuntimeBoundary({
   busy,
   children,
   onCancel,

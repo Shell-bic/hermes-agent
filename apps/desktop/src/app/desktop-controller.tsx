@@ -1,6 +1,6 @@
 import { useStore } from '@nanostores/react'
 import { useQueryClient } from '@tanstack/react-query'
-import { lazy, Suspense, useCallback, useEffect, useMemo, useRef } from 'react'
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Navigate, Route, Routes, useLocation, useNavigate, useParams } from 'react-router-dom'
 
 import { BootFailureOverlay } from '@/components/boot-failure-overlay'
@@ -21,6 +21,7 @@ import {
   normalizeSessionSource
 } from '../lib/session-source'
 import { latestSessionTodos } from '../lib/todos'
+import type { WorkspaceBlock } from '../lib/workspace-blocks'
 import { setCronFocusJobId, setCronJobs } from '../store/cron'
 import {
   $panesFlipped,
@@ -39,6 +40,7 @@ import {
 } from '../store/layout'
 import { respondToApprovalAction } from '../store/native-notifications'
 import { $filePreviewTarget, $previewTarget, closeActiveRightRailTab } from '../store/preview'
+import { clearApprovalRequest } from '../store/prompts'
 import {
   $activeGatewayProfile,
   $freshSessionRequest,
@@ -52,10 +54,10 @@ import {
   $currentCwd,
   $freshDraftReady,
   $gatewayState,
-  $messages,
   $messagingSessions,
   $resumeFailedSessionId,
   $resumeExhaustedSessionId,
+  $messages,
   $selectedStoredSessionId,
   $sessions,
   $workingSessionIds,
@@ -84,6 +86,19 @@ import { onSessionsChanged } from '../store/session-sync'
 import { clearSessionTodos, setSessionTodos, todoListActive } from '../store/todos'
 import { openUpdatesWindow, startUpdatePoller, stopUpdatePoller } from '../store/updates'
 import { isSecondaryWindow } from '../store/windows'
+import {
+  $rawWorkspaceEvents,
+  $selectedWorkspaceObjectId,
+  $workspaceBlocks,
+  $workspaceObjects,
+  hydrateWorkspaceFromMessages,
+  rawWorkspaceEventsForSession,
+  resolveWorkspaceSessionIdForRoute,
+  selectedWorkspaceObjectForSession,
+  setSelectedWorkspaceObjectId,
+  workspaceBlocksForSession,
+  workspaceObjectsForSession
+} from '../store/workspace'
 
 import { ChatView } from './chat'
 import { requestComposerFocus, requestComposerInsert } from './chat/composer/focus'
@@ -96,12 +111,14 @@ import {
 } from './chat/right-rail'
 import { ChatSidebar } from './chat/sidebar'
 import { CommandPalette } from './command-palette'
+import { DslChatView } from './dsl-chat'
 import { useGatewayBoot } from './gateway/hooks/use-gateway-boot'
 import { useGatewayRequest } from './gateway/hooks/use-gateway-request'
 import { useKeybinds } from './hooks/use-keybinds'
 import { SIDEBAR_COLLAPSE_MEDIA_QUERY } from './layout-constants'
 import { ModelPickerOverlay } from './model-picker-overlay'
 import { ModelVisibilityOverlay } from './model-visibility-overlay'
+import { type PrimaryView, PrimaryViewToggle } from './primary-view-toggle'
 import { RightSidebarPane } from './right-sidebar'
 import { $terminalTakeover } from './right-sidebar/store'
 import { PersistentTerminal, TerminalSlot } from './right-sidebar/terminal/persistent'
@@ -152,6 +169,7 @@ const SIDEBAR_EXCLUDED_SOURCES = ['cron', 'subagent', 'tool', ...MESSAGING_SESSI
 // The messaging slice is the inverse: drop cron + every local source so only
 // external-platform conversations remain, then split per platform in the UI.
 const MESSAGING_EXCLUDED_SOURCES = ['cron', ...LOCAL_SESSION_SOURCE_IDS]
+export const DEFAULT_PRIMARY_VIEW: PrimaryView = 'dsl'
 
 // Cheap signature compare so the poll only swaps the atom (and re-renders the
 // sidebar) when the visible cron rows actually changed.
@@ -193,6 +211,7 @@ export function DesktopController() {
   const queryClient = useQueryClient()
   const location = useLocation()
   const navigate = useNavigate()
+  const [primaryView, setPrimaryView] = useState<PrimaryView>(DEFAULT_PRIMARY_VIEW)
 
   const busyRef = useRef(false)
   const creatingSessionRef = useRef(false)
@@ -210,12 +229,40 @@ export function DesktopController() {
   const terminalTakeover = useStore($terminalTakeover)
   const panesFlipped = useStore($panesFlipped)
   const profileScope = useStore($profileScope)
+  const rawWorkspaceEvents = useStore($rawWorkspaceEvents)
+  const selectedWorkspaceObjectId = useStore($selectedWorkspaceObjectId)
+  const messages = useStore($messages)
+  const workspaceBlocks = useStore($workspaceBlocks)
+  const workspaceObjects = useStore($workspaceObjects)
   // Below SIDEBAR_COLLAPSE_BREAKPOINT_PX there's no room for a docked rail —
   // collapse both sidebars (without touching their stored open state) so the
   // hover-reveal overlay becomes the way in. Restores once it's wide again.
   const narrowViewport = useMediaQuery(SIDEBAR_COLLAPSE_MEDIA_QUERY)
 
   const routedSessionId = routeSessionId(location.pathname)
+  const currentWorkspaceSessionId = resolveWorkspaceSessionIdForRoute({
+    activeSessionId,
+    newChatPath: NEW_CHAT_ROUTE,
+    pathname: location.pathname,
+    routedSessionId,
+    selectedStoredSessionId
+  })
+  const currentWorkspaceBlocks = useMemo(
+    () => workspaceBlocksForSession(workspaceBlocks, currentWorkspaceSessionId),
+    [currentWorkspaceSessionId, workspaceBlocks]
+  )
+  const currentWorkspaceObjects = useMemo(
+    () => workspaceObjectsForSession(workspaceObjects, currentWorkspaceSessionId),
+    [currentWorkspaceSessionId, workspaceObjects]
+  )
+  const currentRawWorkspaceEvents = useMemo(
+    () => rawWorkspaceEventsForSession(rawWorkspaceEvents, currentWorkspaceSessionId),
+    [currentWorkspaceSessionId, rawWorkspaceEvents]
+  )
+  const currentSelectedWorkspaceObjectId = useMemo(
+    () => selectedWorkspaceObjectForSession(selectedWorkspaceObjectId, workspaceBlocks, currentWorkspaceSessionId),
+    [currentWorkspaceSessionId, selectedWorkspaceObjectId, workspaceBlocks]
+  )
   const routeToken = `${location.pathname}:${location.search}:${location.hash}`
   const routeTokenRef = useRef(routeToken)
   routeTokenRef.current = routeToken
@@ -600,6 +647,7 @@ export function DesktopController() {
         try {
           const latest = await getSessionMessages(storedSessionId, storedProfile)
           const messages = toChatMessages(latest.messages)
+          hydrateWorkspaceFromMessages(runtimeSessionId, messages)
           updateSessionState(
             runtimeSessionId,
             state => ({
@@ -1052,8 +1100,8 @@ export function DesktopController() {
       onPickImages={() => void composer.pickImages()}
       onReload={reloadFromMessage}
       onRemoveAttachment={id => void composer.removeAttachment(id)}
-      onRestoreToMessage={restoreToMessage}
       onRetryResume={sessionId => void resumeSession(sessionId, true)}
+      onRestoreToMessage={restoreToMessage}
       onSteer={steerPrompt}
       onSubmit={submitText}
       onThreadMessagesChange={handleThreadMessagesChange}
@@ -1062,6 +1110,79 @@ export function DesktopController() {
     />
   )
 
+  const handleWorkspaceBlockAction = useCallback(
+    async (action: WorkspaceBlock['actions'][number]) => {
+      if (action.kind !== 'approve' && action.kind !== 'reject') {
+        return
+      }
+
+      const sessionId = typeof action.metadata?.session_id === 'string' ? action.metadata.session_id : activeSessionId
+      const choice = action.kind === 'approve' ? 'once' : 'deny'
+
+      try {
+        await requestGateway('approval.respond', { choice, session_id: sessionId ?? undefined })
+        clearApprovalRequest(sessionId ?? null)
+      } catch {
+        // Leave the prompt parked so the user can retry from Workspace or Chat.
+      }
+    },
+    [activeSessionId, requestGateway]
+  )
+
+  const dslChatView = (
+    <DslChatView
+      gateway={gatewayRef.current}
+      maxVoiceRecordingSeconds={voiceMaxRecordingSeconds}
+      onAddContextRef={composer.addContextRefAttachment}
+      onAddUrl={url => composer.addContextRefAttachment(`@url:${formatRefValue(url)}`, url)}
+      onAttachDroppedItems={composer.attachDroppedItems}
+      onAttachImageBlob={composer.attachImageBlob}
+      onBranchInNewChat={branchInNewChat}
+      onCancel={cancelRun}
+      onDeleteSelectedSession={() => {
+        if (selectedStoredSessionId) {
+          void removeSession(selectedStoredSessionId)
+        }
+      }}
+      onEdit={editMessage}
+      onPasteClipboardImage={() => void composer.pasteClipboardImage()}
+      onPickFiles={() => void composer.pickContextPaths('file')}
+      onPickFolders={() => void composer.pickContextPaths('folder')}
+      onPickImages={() => void composer.pickImages()}
+      onReload={reloadFromMessage}
+      onRemoveAttachment={id => void composer.removeAttachment(id)}
+      onRetryResume={sessionId => void resumeSession(sessionId, true)}
+      onRestoreToMessage={restoreToMessage}
+      onSelectWorkspaceBlock={setSelectedWorkspaceObjectId}
+      onSteer={steerPrompt}
+      onSubmit={submitText}
+      onThreadMessagesChange={handleThreadMessagesChange}
+      onToggleSelectedPin={toggleSelectedPin}
+      onTranscribeAudio={transcribeVoiceAudio}
+      onWorkspaceBlockAction={action => void handleWorkspaceBlockAction(action)}
+      primaryViewToggle={<PrimaryViewToggle onChange={setPrimaryView} value={primaryView} />}
+      rawWorkspaceEvents={currentRawWorkspaceEvents}
+      selectedWorkspaceObjectId={currentSelectedWorkspaceObjectId}
+      workspaceBlocks={currentWorkspaceBlocks}
+      workspaceObjects={currentWorkspaceObjects}
+    />
+  )
+
+  const dslMode = primaryView === 'dsl'
+  const primaryRouteView = dslMode ? dslChatView : chatView
+
+  useEffect(() => {
+    if (selectedWorkspaceObjectId && !currentSelectedWorkspaceObjectId) {
+      setSelectedWorkspaceObjectId(null)
+    }
+  }, [currentSelectedWorkspaceObjectId, selectedWorkspaceObjectId])
+
+  useEffect(() => {
+    if (dslMode && activeSessionId && !currentWorkspaceBlocks.length && messages.length) {
+      hydrateWorkspaceFromMessages(activeSessionId, messages)
+    }
+  }, [activeSessionId, currentWorkspaceBlocks.length, dslMode, messages])
+
   // Flipped layout mirrors the default: sessions sidebar → right, file
   // browser + preview rail → left. Same panes, swapped sides.
   const sidebarSide = panesFlipped ? 'right' : 'left'
@@ -1069,7 +1190,7 @@ export function DesktopController() {
 
   const previewPane = (
     <Pane
-      disabled={!chatOpen || (!previewTarget && !filePreviewTarget)}
+      disabled={dslMode || !chatOpen || (!previewTarget && !filePreviewTarget)}
       id="preview"
       key="preview"
       maxWidth={PREVIEW_RAIL_MAX_WIDTH}
@@ -1087,7 +1208,7 @@ export function DesktopController() {
   const fileBrowserPane = (
     <Pane
       defaultOpen={false}
-      disabled={!chatOpen}
+      disabled={!chatOpen || dslMode}
       forceCollapsed={narrowViewport}
       hoverReveal
       id="file-browser"
@@ -1132,7 +1253,7 @@ export function DesktopController() {
       mainOverlays={mainOverlays}
       onOpenSettings={openSettings}
       overlays={overlays}
-      previewPaneOpen={chatOpen && Boolean(previewTarget || filePreviewTarget)}
+      previewPaneOpen={!dslMode && chatOpen && Boolean(previewTarget || filePreviewTarget)}
       statusbarItems={statusbarItems}
       terminalPaneOpen={terminalSidebarOpen}
       titlebarTools={titlebarToolGroups.flat.right}
@@ -1154,8 +1275,8 @@ export function DesktopController() {
       )}
       <PaneMain>
         <Routes>
-          <Route element={chatView} index />
-          <Route element={chatView} path=":sessionId" />
+          <Route element={primaryRouteView} index />
+          <Route element={primaryRouteView} path=":sessionId" />
           <Route
             element={
               <Suspense fallback={null}>
