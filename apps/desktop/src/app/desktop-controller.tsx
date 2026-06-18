@@ -1160,7 +1160,6 @@ export function DesktopController() {
       onToggleSelectedPin={toggleSelectedPin}
       onTranscribeAudio={transcribeVoiceAudio}
       onWorkspaceBlockAction={action => void handleWorkspaceBlockAction(action)}
-      primaryViewToggle={<PrimaryViewToggle onChange={setPrimaryView} value={primaryView} />}
       rawWorkspaceEvents={currentRawWorkspaceEvents}
       selectedWorkspaceObjectId={currentSelectedWorkspaceObjectId}
       workspaceBlocks={currentWorkspaceBlocks}
@@ -1256,6 +1255,7 @@ export function DesktopController() {
       previewPaneOpen={!dslMode && chatOpen && Boolean(previewTarget || filePreviewTarget)}
       statusbarItems={statusbarItems}
       terminalPaneOpen={terminalSidebarOpen}
+      titlebarLeadingContent={<PrimaryViewToggle onChange={setPrimaryView} value={primaryView} />}
       titlebarTools={titlebarToolGroups.flat.right}
     >
       {!isSecondaryWindow() && (

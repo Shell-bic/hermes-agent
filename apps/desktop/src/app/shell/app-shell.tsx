@@ -29,6 +29,7 @@ interface AppShellProps {
   children: ReactNode
   leftStatusbarItems?: readonly StatusbarItem[]
   leftTitlebarTools?: readonly TitlebarTool[]
+  titlebarLeadingContent?: ReactNode
   // Fixed-position overlays that must share <main>'s stacking context so pane
   // resize handles (z-20) paint above them. The persistent terminal lives here:
   // hoisting it to the root `overlays` layer (sibling of <main>, z above z-3)
@@ -70,6 +71,7 @@ export function AppShell({
   previewPaneOpen = false,
   statusbarItems,
   terminalPaneOpen = false,
+  titlebarLeadingContent,
   titlebarTools
 }: AppShellProps) {
   const sidebarOpen = useStore($sidebarOpen)
@@ -167,7 +169,12 @@ export function AppShell({
       }
     >
       {!hideTitlebarControls && (
-        <TitlebarControls leftTools={leftTitlebarTools} onOpenSettings={onOpenSettings} tools={titlebarTools} />
+        <TitlebarControls
+          leadingContent={titlebarLeadingContent}
+          leftTools={leftTitlebarTools}
+          onOpenSettings={onOpenSettings}
+          tools={titlebarTools}
+        />
       )}
 
       <main className="relative z-3 flex min-h-0 w-full flex-1 flex-col overflow-hidden transition-none">

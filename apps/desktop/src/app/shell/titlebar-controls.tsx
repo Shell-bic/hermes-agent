@@ -41,11 +41,12 @@ export type SetTitlebarToolGroup = (id: string, tools: readonly TitlebarTool[], 
 
 interface TitlebarControlsProps extends ComponentProps<'div'> {
   leftTools?: readonly TitlebarTool[]
+  leadingContent?: ReactNode
   tools?: readonly TitlebarTool[]
   onOpenSettings: () => void
 }
 
-export function TitlebarControls({ leftTools = [], tools = [], onOpenSettings }: TitlebarControlsProps) {
+export function TitlebarControls({ leadingContent, leftTools = [], tools = [], onOpenSettings }: TitlebarControlsProps) {
   const { t } = useI18n()
   const navigate = useNavigate()
   const location = useLocation()
@@ -161,6 +162,7 @@ export function TitlebarControls({ leftTools = [], tools = [], onOpenSettings }:
           .map(tool => (
             <TitlebarToolButton key={tool.id} navigate={navigate} tool={tool} />
           ))}
+        {leadingContent}
       </div>
 
       {/*
