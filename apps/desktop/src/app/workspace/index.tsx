@@ -1108,65 +1108,23 @@ function projectChatMessagesToWorkspaceBlocks(messages: readonly ChatMessage[]):
 
   const text = chatMessageText(assistant).trim()
   const updatedAt = messageTime(assistant)
-  const sections = splitMessageSections(text)
-  const summaryIsArtifact = !sections.length && sectionRenderer(text) === 'artifact'
-  const blocks: WorkspaceBlock[] = []
 
-  blocks.push({
-    actions: [],
-    body: sections.length ? firstMeaningfulParagraph(text) : text,
-    created_at: updatedAt,
-    debug_refs: [],
-    id: `block:chat:summary:${assistant.id}`,
-    note_kind: summaryIsArtifact ? 'artifact' : 'summary',
-    source_event_ids: [],
-    source_object_ids: [],
-    status: assistant.pending ? 'active' : 'done',
-    title: summaryIsArtifact ? 'Answer' : 'Answer summary',
-    type: 'NOTE',
-    updated_at: updatedAt
-  })
-
-  const sectionBlocks = sections.slice(0, 8).map((section, index): WorkspaceBlock => {
-    const renderer = sectionRenderer(section.content)
-
-    if (renderer === 'artifact') {
-      return {
-        actions: [],
-        body: section.content,
-        created_at: updatedAt,
-        debug_refs: [],
-        id: `block:chat:artifact:${assistant.id}:${index + 1}:${slugForBlockId(section.title)}`,
-        note_kind: 'artifact',
-        source_event_ids: [],
-        source_object_ids: [],
-        status: assistant.pending ? 'active' : 'done',
-        title: section.title,
-        type: 'NOTE',
-        updated_at: updatedAt
-      }
-    }
-
-    return {
+  return [
+    {
       actions: [],
-      bullets: sectionBullets(section.content),
+      body: text,
       created_at: updatedAt,
       debug_refs: [],
-      id: `block:chat:topic:${assistant.id}:${index + 1}:${slugForBlockId(section.title)}`,
+      id: `block:chat:answer:${assistant.id}`,
+      note_kind: sectionRenderer(text) === 'artifact' ? 'artifact' : 'summary',
       source_event_ids: [],
       source_object_ids: [],
-      state: assistant.pending ? 'exploring' : 'decided',
-      thesis: compactText(stripMarkdown(section.content), 180),
-      title: section.title,
-      topic_kind: 'findings',
-      type: 'TOPIC',
+      status: assistant.pending ? 'active' : 'done',
+      title: 'Assistant response',
+      type: 'NOTE',
       updated_at: updatedAt
     }
-  })
-
-  blocks.push(...sectionBlocks)
-
-  return blocks
+  ]
 }
 
 function chatTaskBlock(message: ChatMessage): WorkspaceBlock {
@@ -1193,87 +1151,35 @@ function messageTime(message: ChatMessage): string {
   return message.timestamp ? new Date(message.timestamp).toISOString() : '1970-01-01T00:00:00.000Z'
 }
 
-function splitMessageSections(content: string): { content: string; title: string }[] {
-  if (content.length < 500) {
-    return []
-  }
-
-  const lines = content.split(/\r?\n/)
-  const headings: { lineIndex: number; title: string }[] = []
-  let inFence = false
-
-  lines.forEach((line, lineIndex) => {
-    if (/^\s*```/.test(line)) {
-      inFence = !inFence
-      return
-    }
-
-    if (inFence) {
-      return
-    }
-
-    const match = /^(#{2,4})\s+(.+?)\s*#*\s*$/.exec(line)
-
-    if (match) {
-      headings.push({ lineIndex, title: match[2].trim() })
-    }
-  })
-
-  return headings
-    .map((heading, index) => {
-      const nextHeading = headings[index + 1]
-      const sectionContent = lines.slice(heading.lineIndex, nextHeading?.lineIndex).join('\n').trim()
-
-      return {
-        content: sectionContent,
-        title: heading.title
-      }
-    })
-    .filter(section => section.content.length >= 80)
-}
-
-function firstMeaningfulParagraph(content: string): string {
-  const paragraph =
-    content
-      .split(/\n{2,}/)
-      .map(part => stripMarkdown(part).trim())
-      .find(Boolean) || stripMarkdown(content)
-
-  return compactText(paragraph, 420)
-}
-
 function sectionRenderer(content: string): 'artifact' | 'topic' {
-  return hasMarkdownTable(content) || hasCodeFence(content) ? 'artifact' : 'topic'
-}
-
-function sectionBullets(content: string): WorkspaceBlock extends infer _ ? { id: string; text: string }[] : never {
-  const stripped = stripMarkdown(content)
-  const explicit = content
-    .split(/\r?\n/)
-    .map(line => /^\s*(?:[-*]|\d+[.)])\s+(.+)$/.exec(line)?.[1]?.trim())
-    .filter((line): line is string => Boolean(line))
-
-  const candidates = explicit.length
-    ? explicit
-    : stripped
-        .split(/[。.!?]\s+|\n+/)
-        .map(line => line.trim())
-        .filter(Boolean)
-
-  return candidates.slice(0, 6).map((text, index) => ({
-    id: `bullet:${index + 1}`,
-    text: compactText(text, 180)
-  })) as never
+  return isWholeCodeFence(content) || isStandaloneMarkdownTable(content) ? 'artifact' : 'topic'
 }
 
 function hasCodeFence(content: string): boolean {
   return /(?:^|\n)```[\s\S]*?\n```(?:\n|$)/.test(content.trim())
 }
 
+function isWholeCodeFence(content: string): boolean {
+  return /^```[\s\S]*```$/.test(content.trim())
+}
+
 function hasMarkdownTable(content: string): boolean {
   const tableLines = content.split(/\r?\n/).filter(line => /^\s*\|.+\|\s*$/.test(line))
 
   return tableLines.length >= 2 && tableLines.some(line => /\|\s*:?-{3,}:?\s*\|/.test(line))
+}
+
+function isStandaloneMarkdownTable(content: string): boolean {
+  const meaningfulLines = content
+    .split(/\r?\n/)
+    .map(line => line.trim())
+    .filter(Boolean)
+
+  if (meaningfulLines.length < 2) {
+    return false
+  }
+
+  return meaningfulLines.every(line => /^\|.+\|$/.test(line)) && hasMarkdownTable(content)
 }
 
 function stripMarkdown(content: string): string {
@@ -1286,17 +1192,6 @@ function stripMarkdown(content: string): string {
     .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')
     .replace(/\s+/g, ' ')
     .trim()
-}
-
-function slugForBlockId(value: string): string {
-  const slug = value
-    .toLowerCase()
-    .replace(/`([^`]+)`/g, '$1')
-    .replace(/[^a-z0-9]+/g, '-')
-    .replace(/^-+|-+$/g, '')
-    .slice(0, 48)
-
-  return slug || 'section'
 }
 
 function WorkspaceHeader({ primaryViewToggle }: { primaryViewToggle?: ReactNode }) {

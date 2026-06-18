@@ -206,7 +206,7 @@ describe('workspace artifact projection', () => {
     })
   })
 
-  it('splits long headed markdown assistant replies into section artifacts after the full answer', () => {
+  it('keeps long headed markdown assistant replies as one primary answer artifact', () => {
     const content = [
       'Opening context before the sections remains part of the full Answer artifact.',
       '',
@@ -237,33 +237,17 @@ describe('workspace artifact projection', () => {
 
     const artifacts = projectWorkspaceToCanvasArtifacts([], messages)
 
-    expect(artifacts.map(artifact => artifact.id)).toEqual([
-      'artifact:assistant:m2',
-      'artifact:assistant:m2:section:1:architecture',
-      'artifact:assistant:m2:section:2:implementation',
-      'artifact:assistant:m2:section:3:verification',
-      'artifact:task:m1'
-    ])
+    expect(artifacts.map(artifact => artifact.id)).toEqual(['artifact:assistant:m2', 'artifact:task:m1'])
     expect(artifacts[0]).toMatchObject({
       content,
       kind: 'artifact',
       renderer: 'markdown',
       title: 'Answer'
     })
+    expect(artifacts[0]?.content).toContain('Architecture section ending: ARCHITECTURE_SECTION_TAIL')
+    expect(artifacts[0]?.content).toContain('const headingInsideCode = "## Not a heading"')
+    expect(artifacts[0]?.content).toContain('Verification section ending: VERIFICATION_SECTION_TAIL')
     expect(artifacts[1]).toMatchObject({
-      content: expect.stringContaining('Architecture section ending: ARCHITECTURE_SECTION_TAIL'),
-      kind: 'output',
-      renderer: 'markdown',
-      title: 'Architecture'
-    })
-    expect(artifacts[1]?.content).not.toContain('## Implementation')
-    expect(artifacts[2]).toMatchObject({
-      content: expect.stringContaining('const headingInsideCode = "## Not a heading"'),
-      renderer: 'markdown',
-      title: 'Implementation'
-    })
-    expect(artifacts[3]?.content).toContain('Verification section ending: VERIFICATION_SECTION_TAIL')
-    expect(artifacts[4]).toMatchObject({
       content: 'Summarize the work',
       kind: 'context',
       title: 'User context'

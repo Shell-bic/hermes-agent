@@ -536,15 +536,15 @@ describe('WorkspaceView', () => {
     const selected = container.querySelector('[data-artifact-card-variant="expanded"]') as HTMLElement
     const detail = screen.getAllByText('Detail')[0]?.closest('aside') as HTMLElement
 
-    expect(within(selected).getByText(/Answer/)).toBeTruthy()
+    expect(within(selected).getByText(/Assistant response/)).toBeTruthy()
     expect(selected.getAttribute('data-artifact-card-emphasis')).toBe('answer')
-    expect(within(detail).getByText(/Answer/)).toBeTruthy()
+    expect(within(detail).getByText(/Assistant response/)).toBeTruthy()
     expect(within(detail).getAllByText(assistantAnswer).length).toBeGreaterThan(0)
     expect(within(detail).getByText('User context')).toBeTruthy()
     expect(within(detail).getByText(userPrompt)).toBeTruthy()
 
     expect(screen.queryByText('No workspace blocks yet')).toBeNull()
-    expect(screen.getAllByText('Answer summary').length).toBeGreaterThan(0)
+    expect(screen.getAllByText('Assistant response').length).toBeGreaterThan(0)
   })
 
   it('renders markdown, table, and code assistant answer detail readably', () => {
@@ -578,7 +578,7 @@ describe('WorkspaceView', () => {
       />
     )
 
-    const tableCard = container.querySelector('[data-artifact-card="artifact:block:chat:summary:m2"]') as HTMLElement
+    const tableCard = container.querySelector('[data-artifact-card="artifact:block:chat:answer:m2"]') as HTMLElement
     expect(within(tableCard).getByRole('table')).toBeTruthy()
     detail = screen.getAllByText('Detail')[0]?.closest('aside') as HTMLElement
     expect(detail.textContent).toContain('TABLE_ANSWER_SENTINEL')
@@ -614,7 +614,7 @@ describe('WorkspaceView', () => {
     const { container } = render(<WorkspaceConversationRenderer blocks={[]} messages={messages} objects={[]} />)
 
     const assistantCard = container.querySelector(
-      '[data-artifact-card="artifact:block:chat:summary:assistant-1"]'
+      '[data-artifact-card="artifact:block:chat:answer:assistant-1"]'
     ) as HTMLElement
     const detail = screen.getAllByText('Detail')[0]?.closest('aside') as HTMLElement
 
@@ -655,7 +655,7 @@ describe('WorkspaceView', () => {
       <WorkspaceConversationRenderer blocks={[]} messages={tableMessages} objects={[]} />
     )
     const tableCard = container.querySelector(
-      '[data-artifact-card="artifact:block:chat:summary:assistant-table"]'
+      '[data-artifact-card="artifact:block:chat:answer:assistant-table"]'
     ) as HTMLElement
 
     expect(within(tableCard).getByRole('table')).toBeTruthy()
@@ -665,7 +665,7 @@ describe('WorkspaceView', () => {
 
     rerender(<WorkspaceConversationRenderer blocks={[]} messages={codeMessages} objects={[]} />)
 
-    const codeCard = container.querySelector('[data-artifact-card="artifact:block:chat:summary:assistant-code"]') as HTMLElement
+    const codeCard = container.querySelector('[data-artifact-card="artifact:block:chat:answer:assistant-code"]') as HTMLElement
 
     expect(within(codeCard).getByText(/export const answer = true/)).toBeTruthy()
     expect(within(codeCard).queryByText(/```ts/)).toBeNull()
@@ -683,7 +683,7 @@ describe('WorkspaceView', () => {
 
     const { container } = render(<WorkspaceConversationRenderer blocks={[]} messages={messages} objects={[]} />)
     const assistantCard = container.querySelector(
-      '[data-artifact-card="artifact:block:chat:summary:assistant-answer"]'
+      '[data-artifact-card="artifact:block:chat:answer:assistant-answer"]'
     ) as HTMLElement
 
     fireEvent.click(assistantCard)

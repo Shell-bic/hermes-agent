@@ -361,17 +361,24 @@ function ArtifactCard({
   const renderer = artifactRenderer(artifact)
   const variant = selected ? 'expanded' : 'compact'
   const isTask = renderer === 'task'
+  const isPrimaryArtifact = !isTask && (renderer === 'markdown' || renderer === 'table' || renderer === 'code')
 
   return (
     <article
       aria-label={artifact.title}
       className={cn(
-        'flex h-48 shrink-0 cursor-pointer flex-col rounded-[6px] border border-(--ui-stroke-tertiary) bg-(--ui-editor-surface-background) p-3 text-left shadow-xs transition-colors hover:bg-(--ui-bg-quinary)',
-        isTask ? 'min-w-56 max-w-64 opacity-80' : 'min-w-72 max-w-[24rem]',
+        'flex shrink-0 cursor-pointer flex-col rounded-[6px] border border-(--ui-stroke-tertiary) bg-(--ui-editor-surface-background) p-3 text-left shadow-xs transition-colors hover:bg-(--ui-bg-quinary)',
+        isTask
+          ? 'h-40 min-w-56 max-w-64 opacity-80'
+          : isPrimaryArtifact
+            ? 'h-[clamp(24rem,68vh,44rem)] min-w-[min(44rem,68vw)] max-w-[68vw]'
+            : 'h-48 min-w-72 max-w-[24rem]',
         selected &&
           (isTask
             ? 'h-56 min-w-72 max-w-[22rem] border-(--ui-stroke-secondary) bg-(--ui-bg-quinary) opacity-100'
-            : 'h-[clamp(24rem,68vh,42rem)] min-w-[42rem] max-w-[64rem] border-(--ui-stroke-primary) bg-(--ui-bg-quaternary) shadow-sm')
+            : isPrimaryArtifact
+              ? 'h-[clamp(28rem,74vh,52rem)] min-w-[min(52rem,76vw)] max-w-[76vw] border-(--ui-stroke-primary) bg-(--ui-bg-quaternary) shadow-sm'
+              : 'h-[clamp(24rem,68vh,42rem)] min-w-[42rem] max-w-[64rem] border-(--ui-stroke-primary) bg-(--ui-bg-quaternary) shadow-sm')
       )}
       data-artifact-card={artifact.id}
       data-artifact-card-emphasis={isTask ? 'context' : 'answer'}

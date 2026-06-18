@@ -105,41 +105,7 @@ function latestAssistantArtifacts(messages: readonly ChatMessage[]): CanvasArtif
     updatedAt
   }
 
-  return [
-    baseArtifact,
-    ...assistantSectionArtifacts({
-      content,
-      messageId: message.id,
-      pending: Boolean(message.pending),
-      updatedAt
-    })
-  ]
-}
-
-function assistantSectionArtifacts({
-  content,
-  messageId,
-  pending,
-  updatedAt
-}: {
-  content: string
-  messageId: string
-  pending: boolean
-  updatedAt: string
-}): CanvasArtifact[] {
-  return splitAssistantMarkdownSections(content).map((section, index) => ({
-    actions: [],
-    content: section.content,
-    debugRefs: { blockIds: [], objectIds: [] },
-    id: `artifact:assistant:${messageId}:section:${index + 1}:${slugId(section.title)}`,
-    kind: 'output',
-    renderer: assistantRenderer(section.content),
-    sourceEventIds: [],
-    status: pending ? 'active' : 'done',
-    summary: compactText(section.content, 180),
-    title: section.title,
-    updatedAt
-  }))
+  return [baseArtifact]
 }
 
 function latestTaskArtifact(messages: readonly ChatMessage[], hasAssistantArtifact = false): CanvasArtifact | undefined {
@@ -306,7 +272,7 @@ function baseArtifact(block: WorkspaceBlock): Pick<
   }
 }
 
-function splitAssistantMarkdownSections(content: string): AssistantMarkdownSection[] {
+export function splitAssistantMarkdownSections(content: string): AssistantMarkdownSection[] {
   if (content.length < MIN_ASSISTANT_SPLIT_CHARS) {
     return []
   }
@@ -364,11 +330,11 @@ function splitAssistantMarkdownSections(content: string): AssistantMarkdownSecti
 function artifactRenderer(body: string): CanvasArtifactRenderer {
   const trimmed = body.trim()
 
-  if (hasCodeFence(trimmed) || /^ {4}\S/m.test(body)) {
+  if (isWholeCodeFence(trimmed) || /^ {4}\S/m.test(body)) {
     return 'code'
   }
 
-  if (hasMarkdownTable(body)) {
+  if (isStandaloneMarkdownTable(body)) {
     return 'table'
   }
 
@@ -382,7 +348,7 @@ function assistantRenderer(body: string): CanvasArtifactRenderer {
     return 'code'
   }
 
-  if (hasMarkdownTable(body)) {
+  if (isStandaloneMarkdownTable(body)) {
     return 'table'
   }
 
@@ -401,6 +367,19 @@ function hasMarkdownTable(body: string): boolean {
   const tableLines = body.split(/\r?\n/).filter(line => /^\s*\|.+\|\s*$/.test(line))
 
   return tableLines.length >= 2 && tableLines.some(line => /\|\s*:?-{3,}:?\s*\|/.test(line))
+}
+
+function isStandaloneMarkdownTable(body: string): boolean {
+  const meaningfulLines = body
+    .split(/\r?\n/)
+    .map(line => line.trim())
+    .filter(Boolean)
+
+  if (meaningfulLines.length < 2) {
+    return false
+  }
+
+  return meaningfulLines.every(line => /^\|.+\|$/.test(line)) && hasMarkdownTable(body)
 }
 
 function normalizeStatus(status: WorkspaceBlock['status']): CanvasArtifactStatus {
@@ -469,17 +448,6 @@ function artifactRank(artifact: AnyCanvasArtifact): number {
   }
 
   return 10
-}
-
-function slugId(value: string): string {
-  const slug = value
-    .toLowerCase()
-    .replace(/`([^`]+)`/g, '$1')
-    .replace(/[^a-z0-9]+/g, '-')
-    .replace(/^-+|-+$/g, '')
-    .slice(0, 48)
-
-  return slug || 'section'
 }
 
 function checklistLine(done: boolean, content: string): string {
