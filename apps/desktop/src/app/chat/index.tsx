@@ -66,6 +66,7 @@ import { threadLoadingState } from './thread-loading'
 export interface ChatViewProps extends Omit<React.ComponentProps<'div'>, 'onSubmit'> {
   gateway: HermesGateway | null
   modelMenuContent?: React.ReactNode
+  primaryViewToggle?: React.ReactNode
   onToggleSelectedPin: () => void
   onDeleteSelectedSession: () => void
   onCancel: () => Promise<void> | void
@@ -97,6 +98,7 @@ export interface ChatViewProps extends Omit<React.ComponentProps<'div'>, 'onSubm
 export interface ChatHeaderProps {
   activeSessionId: null | string
   isRoutedSessionView: boolean
+  leadingContent?: React.ReactNode
   onDeleteSelectedSession: () => void
   onToggleSelectedPin: () => void
   selectedSessionId: null | string
@@ -105,6 +107,7 @@ export interface ChatHeaderProps {
 export function ChatHeader({
   activeSessionId,
   isRoutedSessionView,
+  leadingContent,
   onDeleteSelectedSession,
   onToggleSelectedPin,
   selectedSessionId
@@ -135,6 +138,7 @@ export function ChatHeader({
 
   return (
     <header className={cn(titlebarHeaderBaseClass, isRoutedSessionView && titlebarHeaderShadowClass)}>
+      {leadingContent && <div className="pointer-events-auto shrink-0 [-webkit-app-region:no-drag]">{leadingContent}</div>}
       <div
         className={titlebarHeaderTitleClass}
         style={{
@@ -257,6 +261,7 @@ export function ChatView({
   className,
   gateway,
   modelMenuContent,
+  primaryViewToggle,
   onToggleSelectedPin,
   onDeleteSelectedSession,
   onCancel,
@@ -426,6 +431,7 @@ export function ChatView({
       <ChatHeader
         activeSessionId={activeSessionId}
         isRoutedSessionView={isRoutedSessionView}
+        leadingContent={primaryViewToggle}
         onDeleteSelectedSession={onDeleteSelectedSession}
         onToggleSelectedPin={onToggleSelectedPin}
         selectedSessionId={selectedSessionId}

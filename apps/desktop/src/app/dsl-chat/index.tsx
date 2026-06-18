@@ -248,15 +248,11 @@ export function DslChatView({
       <ChatHeader
         activeSessionId={activeSessionId}
         isRoutedSessionView={isRoutedSessionView}
+        leadingContent={primaryViewToggle}
         onDeleteSelectedSession={onDeleteSelectedSession}
         onToggleSelectedPin={onToggleSelectedPin}
         selectedSessionId={selectedSessionId}
       />
-      {primaryViewToggle && (
-        <div className="pointer-events-auto absolute left-2 top-1 z-10 [-webkit-app-region:no-drag]">
-          {primaryViewToggle}
-        </div>
-      )}
       <PromptOverlays />
       <div
         className="relative min-h-0 max-w-full flex-1 overflow-hidden bg-(--ui-chat-surface-background) contain-[layout_paint]"
