@@ -1,6 +1,8 @@
+import { useStore } from '@nanostores/react'
 import { useEffect, useMemo, useState } from 'react'
 
 import { useI18n } from '@/i18n'
+import { $enterprise } from '@/store/enterprise'
 import type { EnvVarInfo } from '@/types/hermes'
 
 import { CredentialKeyCard, credentialPlaceholder, credentialRowLabel } from './credential-key-ui'
@@ -28,6 +30,27 @@ const VIEW_CATEGORIES: Record<KeysView, readonly string[]> = {
 }
 
 export function KeysSettings({ view }: KeysSettingsProps) {
+  const enterprise = useStore($enterprise)
+
+  if (enterprise.enabled && enterprise.authenticated) {
+    return (
+      <SettingsContent>
+        <div className="grid min-h-48 place-items-center px-4 py-8 text-center">
+          <div>
+            <div className="text-sm font-medium">企业受管模式</div>
+            <div className="mt-2 max-w-xl text-xs leading-5 text-muted-foreground">
+              API key、工具凭据和网关令牌由企业管理员统一配置，桌面端普通用户不能查看或修改。
+            </div>
+          </div>
+        </div>
+      </SettingsContent>
+    )
+  }
+
+  return <KeysSettingsInner view={view} />
+}
+
+function KeysSettingsInner({ view }: KeysSettingsProps) {
   const { t } = useI18n()
   const { rowProps, vars } = useEnvCredentials()
   const [openKey, setOpenKey] = useState<null | string>(null)

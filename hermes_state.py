@@ -54,6 +54,23 @@ _COMPRESSION_CHILD_SQL = (
 # compression continuations stay hidden).
 _LISTABLE_CHILD_SQL = f"(s.parent_session_id IS NULL OR {_BRANCH_CHILD_SQL.format(a='s')})"
 
+_EXPORT_REDACTED = "[REDACTED]"
+_EXPORT_SENSITIVE_KEY_RE = re.compile(
+    r"(api[_-]?key|access[_-]?token|refresh[_-]?token|gateway[_-]?token|desktop[_-]?token|"
+    r"authorization|secret|password|credential|ciphertext)",
+    re.IGNORECASE,
+)
+_EXPORT_REASONING_KEY_RE = re.compile(
+    r"^(thinking|reasoning|reasoning_content|reasoning_details|codex_reasoning_items)$",
+    re.IGNORECASE,
+)
+_EXPORT_SECRET_PATTERNS = (
+    re.compile(r"\b(?:gw|dsk|adm)_[A-Za-z0-9_-]{16,}\b"),
+    re.compile(r"\bsk-[A-Za-z0-9][A-Za-z0-9._-]{12,}\b"),
+    re.compile(r"\b(?:Bearer|token)\s+[A-Za-z0-9._~+/-]{16,}\b", re.IGNORECASE),
+    re.compile(r"\b(?:x-api-key|api-key|api_key)\s*[:=]\s*[A-Za-z0-9._~+/-]{12,}\b", re.IGNORECASE),
+)
+
 
 def _ephemeral_child_sql(alias: str = "s") -> str:
     """Subagent runs (cascade-delete targets), not branches or compression tips."""
@@ -64,6 +81,32 @@ def _ephemeral_child_sql(alias: str = "s") -> str:
         f" AND NOT ({branch})"
         f" AND NOT ({compression}))"
     )
+
+
+def _redact_export_text(value: str) -> str:
+    redacted = value
+    for pattern in _EXPORT_SECRET_PATTERNS:
+        redacted = pattern.sub(_EXPORT_REDACTED, redacted)
+    return redacted
+
+
+def _redact_session_export_value(value: Any, key: Optional[str] = None) -> Any:
+    if key and (_EXPORT_SENSITIVE_KEY_RE.search(key) or _EXPORT_REASONING_KEY_RE.search(key)):
+        return _EXPORT_REDACTED
+    if isinstance(value, dict):
+        return {
+            item_key: _redact_session_export_value(item_value, str(item_key))
+            for item_key, item_value in value.items()
+        }
+    if isinstance(value, list):
+        return [_redact_session_export_value(item) for item in value]
+    if isinstance(value, str):
+        return _redact_export_text(value)
+    return value
+
+
+def _redact_session_export(session: Dict[str, Any]) -> Dict[str, Any]:
+    return _redact_session_export_value(session)
 
 
 def _collect_delegate_child_ids(conn, parent_ids: List[str]) -> List[str]:
@@ -3724,7 +3767,7 @@ class SessionDB:
         if not session:
             return None
         messages = self.get_messages(session_id)
-        return {**session, "messages": messages}
+        return _redact_session_export({**session, "messages": messages})
 
     def export_all(self, source: str = None) -> List[Dict[str, Any]]:
         """
@@ -3735,7 +3778,7 @@ class SessionDB:
         results = []
         for session in sessions:
             messages = self.get_messages(session["id"])
-            results.append({**session, "messages": messages})
+            results.append(_redact_session_export({**session, "messages": messages}))
         return results
 
     def clear_messages(self, session_id: str) -> None:

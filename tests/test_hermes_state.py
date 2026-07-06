@@ -1412,6 +1412,31 @@ class TestDeleteAndExport:
         assert export["source"] == "cli"
         assert len(export["messages"]) == 2
 
+    def test_export_session_redacts_sensitive_values(self, db):
+        gateway_token = "gw_abcdefghijklmnopqrstuvwxyz123456"
+        api_key = "sk-testabcdefghijklmnopqrstuvwxyz"
+        bearer = "Bearer abcdefghijklmnopqrstuvwxyz123456"
+        db.create_session(session_id="s1", source="cli", model="test")
+        db.append_message(
+            "s1",
+            role="assistant",
+            content=f"Gateway token {gateway_token}; api key {api_key}; auth {bearer}",
+            reasoning="internal chain of thought",
+            reasoning_content="hidden decision text",
+            tool_calls=[{"name": "terminal", "args": {"gatewayToken": gateway_token}}],
+        )
+
+        export = db.export_session("s1")
+        encoded = json.dumps(export, ensure_ascii=False)
+
+        assert gateway_token not in encoded
+        assert api_key not in encoded
+        assert bearer not in encoded
+        assert "internal chain of thought" not in encoded
+        assert "hidden decision text" not in encoded
+        assert "[REDACTED]" in encoded
+        assert gateway_token in json.dumps(db.get_messages("s1"), ensure_ascii=False)
+
     def test_export_nonexistent(self, db):
         assert db.export_session("nope") is None
 

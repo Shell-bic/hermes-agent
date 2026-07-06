@@ -1,7 +1,8 @@
 import { atom } from 'nanostores'
 
+import type { EnterpriseDesktopState, EnterpriseModelProfileSummary } from '@/global'
 import { persistString, storedString } from '@/lib/storage'
-import type { ModelOptionProvider } from '@/types/hermes'
+import type { ModelCapabilities, ModelOptionProvider, ModelOptionsResponse } from '@/types/hermes'
 
 const STORAGE_KEY = 'hermes.desktop.visible-models'
 
@@ -23,8 +24,7 @@ export const emptyProviderSentinelKey = (provider: string): string =>
   modelVisibilityKey(provider, EMPTY_PROVIDER_SENTINEL)
 
 /** Check whether a stored key is a provider-hidden sentinel. */
-export const isProviderSentinel = (key: string): boolean =>
-  key.endsWith('::')
+export const isProviderSentinel = (key: string): boolean => key.endsWith('::')
 
 /** A model and its optional `…-fast` sibling, collapsed into one logical row.
  *  `id` is the canonical (base) model; `fastId` is the fast variant if present. */
@@ -134,9 +134,7 @@ export function effectiveVisibleKeys(
 
   for (const provider of providers) {
     const providerPrefix = `${provider.slug}::`
-    const hasStoredProvider = [...stored].some(
-      key => key.startsWith(providerPrefix) && !isProviderSentinel(key)
-    )
+    const hasStoredProvider = [...stored].some(key => key.startsWith(providerPrefix) && !isProviderSentinel(key))
     const hasSentinel = stored.has(emptyProviderSentinelKey(provider.slug))
 
     if (hasStoredProvider || hasSentinel) {
@@ -158,4 +156,114 @@ export function effectiveVisibleKeys(
   }
 
   return next
+}
+
+const ENTERPRISE_PROVIDER_SLUG = 'company-gateway'
+const ENTERPRISE_PROVIDER_NAME = '企业模型'
+
+export function isEnterpriseModelManaged(state: EnterpriseDesktopState): boolean {
+  return state.enabled && (state.authenticated || state.status === 'authenticated')
+}
+
+function firstString(...values: unknown[]): string | null {
+  for (const value of values) {
+    if (typeof value === 'string' && value.trim()) {
+      return value.trim()
+    }
+  }
+
+  return null
+}
+
+function enterpriseProfileModel(profile: EnterpriseModelProfileSummary): string | null {
+  const expanded = profile as EnterpriseModelProfileSummary & Record<string, unknown>
+
+  return firstString(
+    expanded.model,
+    expanded.modelId,
+    expanded.model_id,
+    expanded.runtimeModel,
+    expanded.runtime_model,
+    expanded.id,
+    expanded.name
+  )
+}
+
+function enterpriseProfileName(profile: EnterpriseModelProfileSummary, fallback: string): string {
+  const expanded = profile as EnterpriseModelProfileSummary & Record<string, unknown>
+
+  return firstString(expanded.name, expanded.displayName, expanded.display_name, expanded.label, fallback) ?? fallback
+}
+
+function enterpriseCapabilities(profile: EnterpriseModelProfileSummary): ModelCapabilities | undefined {
+  const expanded = profile as EnterpriseModelProfileSummary & Record<string, unknown>
+  const raw = expanded.capabilities
+
+  if (!raw || typeof raw !== 'object') {
+    return undefined
+  }
+
+  const capabilities = raw as Record<string, unknown>
+
+  return {
+    fast: capabilities.fast === true,
+    reasoning: capabilities.reasoning !== false
+  }
+}
+
+export function enterpriseModelOptionsFromState(state: EnterpriseDesktopState): ModelOptionsResponse {
+  const models: string[] = []
+  const capabilities: Record<string, ModelCapabilities> = {}
+  const seen = new Set<string>()
+
+  for (const profile of state.modelProfiles ?? []) {
+    const model = enterpriseProfileModel(profile)
+
+    if (!model || seen.has(model)) {
+      continue
+    }
+
+    seen.add(model)
+    models.push(model)
+
+    const caps = enterpriseCapabilities(profile)
+
+    if (caps) {
+      capabilities[model] = caps
+    }
+  }
+
+  for (const model of state.allowedModels ?? []) {
+    if (model && !seen.has(model)) {
+      seen.add(model)
+      models.push(model)
+    }
+  }
+
+  const provider: ModelOptionProvider = {
+    authenticated: true,
+    capabilities: Object.keys(capabilities).length > 0 ? capabilities : undefined,
+    models,
+    name: ENTERPRISE_PROVIDER_NAME,
+    slug: ENTERPRISE_PROVIDER_SLUG,
+    total_models: models.length
+  }
+
+  return {
+    model: models[0],
+    provider: ENTERPRISE_PROVIDER_SLUG,
+    providers: models.length > 0 ? [provider] : []
+  }
+}
+
+export function enterpriseModelDisplayName(state: EnterpriseDesktopState, model: string): string {
+  for (const profile of state.modelProfiles ?? []) {
+    const profileModel = enterpriseProfileModel(profile)
+
+    if (profileModel === model) {
+      return enterpriseProfileName(profile, model)
+    }
+  }
+
+  return model
 }

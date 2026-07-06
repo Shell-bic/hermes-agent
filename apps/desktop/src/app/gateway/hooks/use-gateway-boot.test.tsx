@@ -114,6 +114,19 @@ function Harness() {
   return null
 }
 
+function DisabledHarness() {
+  useGatewayBoot({
+    enabled: false,
+    handleGatewayEvent: () => undefined,
+    onConnectionReady: () => undefined,
+    onGatewayReady: () => undefined,
+    refreshHermesConfig: async () => undefined,
+    refreshSessions: async () => undefined
+  })
+
+  return null
+}
+
 const originalWebSocket = globalThis.WebSocket
 
 beforeEach(() => {
@@ -159,6 +172,14 @@ async function advanceBackoff() {
 }
 
 describe('useGatewayBoot remote reconnect loop (real hook, fake socket)', () => {
+  it('enterprise sign-in wait dismisses the boot overlay so the login form can render', () => {
+    render(<DisabledHarness />)
+
+    expect($desktopBoot.get().visible).toBe(false)
+    expect($desktopBoot.get().running).toBe(false)
+    expect($desktopBoot.get().progress).toBe(100)
+  })
+
   it('INITIAL boot against a dead VPS: getConnection hangs (waitForHermes) → app sits in the connecting combo, then fails', async () => {
     // The report's actual path: a fresh launch pointed at an unreachable VPS.
     // startHermes()'s remote branch awaits waitForHermes() for 45s before it

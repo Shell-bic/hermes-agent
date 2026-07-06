@@ -21,12 +21,14 @@ const SESSION_WINDOW_MIN_HEIGHT = 620
 // blurred/occluded windows. A streaming chat app must keep painting in the
 // background, so every chat window opts out. The preload path is injected
 // because it depends on the Electron entry's __dirname.
-function chatWindowWebPreferences(preloadPath) {
+function chatWindowWebPreferences(preloadPath, options = {}) {
+  const sandbox = options.sandbox !== false
+
   return {
     preload: preloadPath,
     contextIsolation: true,
     webviewTag: true,
-    sandbox: true,
+    sandbox,
     nodeIntegration: false,
     devTools: true,
     backgroundThrottling: false

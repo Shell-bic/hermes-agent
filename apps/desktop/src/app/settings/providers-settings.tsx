@@ -16,6 +16,7 @@ import { disconnectOAuthProvider, listOAuthProviders } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { Check, ChevronDown, ChevronRight, KeyRound, Loader2, Terminal, Trash2 } from '@/lib/icons'
 import { cn } from '@/lib/utils'
+import { $enterprise } from '@/store/enterprise'
 import { notify, notifyError } from '@/store/notifications'
 import { $desktopOnboarding, startManualProviderOAuth } from '@/store/onboarding'
 import type { EnvVarInfo, OAuthProvider } from '@/types/hermes'
@@ -279,6 +280,27 @@ function NoProviderKeys() {
 }
 
 export function ProvidersSettings({ onClose, onViewChange, view }: ProvidersSettingsProps) {
+  const enterprise = useStore($enterprise)
+
+  if (enterprise.enabled && enterprise.authenticated) {
+    return (
+      <SettingsContent>
+        <div className="grid min-h-48 place-items-center px-4 py-8 text-center">
+          <div>
+            <div className="text-sm font-medium">企业受管模式</div>
+            <div className="mt-2 max-w-xl text-xs leading-5 text-muted-foreground">
+              Provider、账号登录、OAuth 和 API key 由企业管理员统一配置，桌面端普通用户不能修改这些入口。
+            </div>
+          </div>
+        </div>
+      </SettingsContent>
+    )
+  }
+
+  return <ProvidersSettingsInner onClose={onClose} onViewChange={onViewChange} view={view} />
+}
+
+function ProvidersSettingsInner({ onClose, onViewChange, view }: ProvidersSettingsProps) {
   const { t } = useI18n()
   const { rowProps, vars } = useEnvCredentials()
   const [oauthProviders, setOauthProviders] = useState<OAuthProvider[]>([])

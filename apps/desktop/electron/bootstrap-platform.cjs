@@ -34,6 +34,12 @@ function bundledRuntimeImportCheck(platform = process.platform) {
 
 const GPU_OVERRIDE_ON = new Set(['1', 'true', 'yes', 'on'])
 const GPU_OVERRIDE_OFF = new Set(['0', 'false', 'no', 'off'])
+const GPU_IN_PROCESS_ON = new Set(['1', 'true', 'yes', 'on', 'in-process'])
+const GPU_IN_PROCESS_OFF = new Set(['0', 'false', 'no', 'off', 'default'])
+const RENDERER_CODE_INTEGRITY_ON = new Set(['1', 'true', 'yes', 'on', 'enabled'])
+const RENDERER_CODE_INTEGRITY_OFF = new Set(['0', 'false', 'no', 'off', 'disabled'])
+const RENDERER_SANDBOX_ON = new Set(['1', 'true', 'yes', 'on', 'enabled'])
+const RENDERER_SANDBOX_OFF = new Set(['0', 'false', 'no', 'off', 'disabled'])
 
 /**
  * Decide whether the app is being shown over a remote/forwarded display, where
@@ -83,9 +89,83 @@ function detectRemoteDisplay(options = {}) {
   return null
 }
 
+/**
+ * Windows Electron can fail before the first BrowserWindow when Chromium is
+ * unable to spawn the isolated GPU child process. Keep acceleration enabled
+ * and prefer Chromium's normal GPU child process by default; after the Windows
+ * dev renderer sandbox/code-integrity compatibility switches are applied, that
+ * path presents the window reliably. Keep the in-process GPU path as an
+ * explicit escape hatch for machines that still cannot spawn the GPU child.
+ */
+function resolveWindowsGpuLaunchSwitches(options = {}) {
+  const env = options.env ?? process.env
+  const platform = options.platform ?? process.platform
+  const isPackaged = Boolean(options.isPackaged)
+
+  if (platform !== 'win32') return []
+
+  const override = String(env.HERMES_DESKTOP_GPU_PROCESS || '')
+    .trim()
+    .toLowerCase()
+  if (GPU_IN_PROCESS_OFF.has(override)) return []
+
+  const shouldUseInProcessGpu = GPU_IN_PROCESS_ON.has(override)
+  if (!shouldUseInProcessGpu) return []
+
+  return [
+    ['use-angle', 'd3d11'],
+    ['in-process-gpu']
+  ]
+}
+
+/**
+ * Some Windows development machines inject accessibility, security, graphics,
+ * or IME DLLs into Chromium child processes. Electron/Chromium can then fail
+ * the sandboxed renderer launch with `render-process-gone: launch-failed`
+ * before the app paints a window. Keep this compatibility switch scoped to
+ * dev by default; packaged builds can opt in via env if the target fleet needs
+ * it.
+ */
+function resolveWindowsRendererLaunchSwitches(options = {}) {
+  const env = options.env ?? process.env
+  const platform = options.platform ?? process.platform
+  const isPackaged = Boolean(options.isPackaged)
+
+  if (platform !== 'win32') return []
+
+  const override = String(env.HERMES_DESKTOP_RENDERER_CODE_INTEGRITY || '')
+    .trim()
+    .toLowerCase()
+  if (RENDERER_CODE_INTEGRITY_ON.has(override)) return []
+
+  const shouldDisableRendererCodeIntegrity = RENDERER_CODE_INTEGRITY_OFF.has(override) || !isPackaged
+  if (!shouldDisableRendererCodeIntegrity) return []
+
+  return [['disable-features', 'RendererCodeIntegrity']]
+}
+
+function shouldDisableWindowsRendererSandbox(options = {}) {
+  const env = options.env ?? process.env
+  const platform = options.platform ?? process.platform
+  const isPackaged = Boolean(options.isPackaged)
+
+  if (platform !== 'win32') return false
+
+  const override = String(env.HERMES_DESKTOP_RENDERER_SANDBOX || '')
+    .trim()
+    .toLowerCase()
+  if (RENDERER_SANDBOX_ON.has(override)) return false
+  if (RENDERER_SANDBOX_OFF.has(override)) return true
+
+  return !isPackaged
+}
+
 module.exports = {
   bundledRuntimeImportCheck,
   detectRemoteDisplay,
+  resolveWindowsGpuLaunchSwitches,
+  resolveWindowsRendererLaunchSwitches,
+  shouldDisableWindowsRendererSandbox,
   isWindowsBinaryPathInWsl,
   isWslEnvironment
 }

@@ -34,6 +34,13 @@ declare global {
       probeConnectionConfig: (remoteUrl: string) => Promise<DesktopConnectionProbeResult>
       oauthLoginConnectionConfig: (remoteUrl: string) => Promise<DesktopOauthLoginResult>
       oauthLogoutConnectionConfig: (remoteUrl?: string) => Promise<DesktopOauthLogoutResult>
+      enterprise: {
+        login: (payload: EnterpriseDesktopLoginInput) => Promise<EnterpriseDesktopState>
+        logout: () => Promise<EnterpriseDesktopState>
+        refresh: () => Promise<EnterpriseDesktopState>
+        selectModel: (model: string) => Promise<EnterpriseDesktopState>
+        status: () => Promise<EnterpriseDesktopState>
+      }
       profile: {
         get: () => Promise<DesktopActiveProfile>
         // Persists the desktop's profile choice and relaunches the local
@@ -330,6 +337,55 @@ export interface DesktopOauthLoginResult {
 export interface DesktopOauthLogoutResult {
   ok: boolean
   connected: boolean
+}
+
+export interface EnterpriseDesktopLoginInput {
+  password: string
+  username: string
+}
+
+export type EnterpriseDesktopStatus = 'authenticated' | 'disabled' | 'error' | 'loading' | 'unauthenticated'
+
+export interface EnterpriseModelProviderSummary {
+  id: string | null
+  name: string | null
+  type: string | null
+}
+
+export interface EnterpriseModelProfileSummary {
+  apiFormat?: string | null
+  auxiliaryPolicy?: Record<string, unknown>
+  capabilities?: Record<string, unknown>
+  displayName?: string | null
+  id: string | null
+  isDefault?: boolean
+  model: string | null
+  modelProviderId?: string | null
+  name: string | null
+  pricing?: Record<string, unknown>
+  provider?: EnterpriseModelProviderSummary | Record<string, unknown> | null
+  providerName?: string | null
+  providerType?: string | null
+  runtimeDefaults?: Record<string, unknown>
+}
+
+export interface EnterpriseDesktopState {
+  allowedModels: string[]
+  authenticated: boolean
+  auxiliaryPolicy?: Record<string, unknown>
+  capabilities?: Record<string, unknown>
+  currentModel?: null | string
+  currentModelProfileId?: null | string
+  defaultModel?: null | string
+  enabled: boolean
+  error?: string | null
+  lockedSurfaces: string[]
+  modelProfiles: EnterpriseModelProfileSummary[]
+  policyVersion: null | string
+  role: unknown
+  runtimeDefaults?: Record<string, unknown>
+  status: EnterpriseDesktopStatus
+  user: unknown
 }
 
 export interface DesktopBootProgress {

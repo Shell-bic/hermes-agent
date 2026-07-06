@@ -6,6 +6,7 @@ import { Navigate, Route, Routes, useLocation, useNavigate, useParams } from 're
 import { BootFailureOverlay } from '@/components/boot-failure-overlay'
 import { DesktopInstallOverlay } from '@/components/desktop-install-overlay'
 import { DesktopOnboardingOverlay } from '@/components/desktop-onboarding-overlay'
+import { EnterpriseLoginOverlay } from '@/components/enterprise-login-overlay'
 import { GatewayConnectingOverlay } from '@/components/gateway-connecting-overlay'
 import { Pane, PaneMain } from '@/components/pane-shell'
 import { useMediaQuery } from '@/hooks/use-media-query'
@@ -22,6 +23,7 @@ import {
 } from '../lib/session-source'
 import { latestSessionTodos } from '../lib/todos'
 import { setCronFocusJobId, setCronJobs } from '../store/cron'
+import { $enterprise, refreshEnterpriseState } from '../store/enterprise'
 import {
   $panesFlipped,
   $pinnedSessionIds,
@@ -199,6 +201,7 @@ export function DesktopController() {
   const refreshSessionsRequestRef = useRef(0)
 
   const gatewayState = useStore($gatewayState)
+  const enterprise = useStore($enterprise)
   const activeSessionId = useStore($activeSessionId)
   const currentCwd = useStore($currentCwd)
   const freshDraftReady = useStore($freshDraftReady)
@@ -559,6 +562,10 @@ export function DesktopController() {
   })
 
   const openProviderSettings = useCallback(() => {
+    if ($enterprise.get().enabled) {
+      return
+    }
+
     navigate(`${SETTINGS_ROUTE}?tab=providers`)
   }, [navigate])
 
@@ -834,7 +841,14 @@ export function DesktopController() {
     updateSessionState
   })
 
+  const gatewayBootEnabled = enterprise.status !== 'loading' && (!enterprise.enabled || enterprise.authenticated)
+
+  useEffect(() => {
+    void refreshEnterpriseState()
+  }, [])
+
   useGatewayBoot({
+    enabled: gatewayBootEnabled,
     handleGatewayEvent: handleDesktopGatewayEvent,
     onConnectionReady: c => {
       connectionRef.current = c
@@ -953,6 +967,13 @@ export function DesktopController() {
     <>
       {!isSecondaryWindow() && <DesktopInstallOverlay />}
       {!isSecondaryWindow() && (
+        <EnterpriseLoginOverlay
+          onAuthenticated={() => {
+            void refreshEnterpriseState()
+          }}
+        />
+      )}
+      {!isSecondaryWindow() && !enterprise.enabled && (
         <DesktopOnboardingOverlay
           enabled={gatewayState === 'open'}
           onCompleted={() => {
@@ -965,7 +986,9 @@ export function DesktopController() {
       )}
       <ModelPickerOverlay gateway={gatewayRef.current || undefined} onSelect={selectModel} />
       <SessionPickerOverlay onResume={resumeSession} />
-      <ModelVisibilityOverlay gateway={gatewayRef.current || undefined} onOpenProviders={openProviderSettings} />
+      {!enterprise.enabled && (
+        <ModelVisibilityOverlay gateway={gatewayRef.current || undefined} onOpenProviders={openProviderSettings} />
+      )}
       <UpdatesOverlay />
       <GatewayConnectingOverlay />
       <BootFailureOverlay />

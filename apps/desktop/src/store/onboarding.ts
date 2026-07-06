@@ -13,6 +13,7 @@ import {
   validateProviderCredential
 } from '@/hermes'
 import { evaluateRuntimeReadiness, type RuntimeReadinessResult } from '@/lib/runtime-readiness'
+import { $enterprise } from '@/store/enterprise'
 import { notify, notifyError } from '@/store/notifications'
 import type { ModelOptionProvider, OAuthProvider, OAuthStartResponse } from '@/types/hermes'
 
@@ -165,6 +166,38 @@ let pollTimer: number | null = null
 let providersRefreshPromise: null | Promise<void> = null
 
 const errMessage = (e: unknown) => (e instanceof Error ? e.message : String(e))
+
+const isEnterpriseManaged = () => {
+  const enterprise = $enterprise.get()
+
+  return enterprise.enabled && enterprise.authenticated
+}
+
+function notifyManagedOnboarding() {
+  notify({
+    kind: 'info',
+    title: '企业受管模式',
+    message: '模型、Provider、API key、OAuth 和本地端点由企业管理员统一配置，桌面端无需单独设置。'
+  })
+}
+
+function exitManagedOnboarding() {
+  clearPoll()
+  pendingProviderOAuthId = null
+  writeCachedConfigured(true)
+  writeCachedSkipped(false)
+  $desktopOnboarding.set({
+    configured: true,
+    flow: { status: 'idle' },
+    mode: 'oauth',
+    providers: null,
+    reason: null,
+    requested: false,
+    firstRunSkipped: false,
+    manual: false,
+    localEndpoint: false
+  })
+}
 
 const patch = (update: Partial<DesktopOnboardingState>) =>
   $desktopOnboarding.set({ ...$desktopOnboarding.get(), ...update })
@@ -386,6 +419,12 @@ async function refreshProviders() {
 }
 
 export function requestDesktopOnboarding(reason = DEFAULT_ONBOARDING_REASON) {
+  if (isEnterpriseManaged()) {
+    exitManagedOnboarding()
+
+    return
+  }
+
   patch({ reason: reason.trim() || DEFAULT_ONBOARDING_REASON, requested: true })
 }
 
@@ -395,6 +434,13 @@ export function requestDesktopOnboarding(reason = DEFAULT_ONBOARDING_REASON) {
 // duplicating provider UI. Sets manual=true so the overlay shows the picker
 // even though configured===true, and refreshes the provider list.
 export function startManualOnboarding(reason: null | string = DEFAULT_MANUAL_ONBOARDING_REASON) {
+  if (isEnterpriseManaged()) {
+    notifyManagedOnboarding()
+    exitManagedOnboarding()
+
+    return
+  }
+
   patch({
     manual: true,
     requested: true,
@@ -414,6 +460,13 @@ export function startManualOnboarding(reason: null | string = DEFAULT_MANUAL_ONB
 // (`custom` is not an OAuth provider, so the generic manual flow would just
 // re-show the picker — the original "booted back to the first screen" loop).
 export function startManualLocalEndpoint(reason: null | string = null) {
+  if (isEnterpriseManaged()) {
+    notifyManagedOnboarding()
+    exitManagedOnboarding()
+
+    return
+  }
+
   pendingProviderOAuthId = null
   patch({
     manual: true,
@@ -434,6 +487,13 @@ export function startManualLocalEndpoint(reason: null | string = null) {
 let pendingProviderOAuthId: null | string = null
 
 export function startManualProviderOAuth(providerId: string, reason: null | string = null) {
+  if (isEnterpriseManaged()) {
+    notifyManagedOnboarding()
+    exitManagedOnboarding()
+
+    return
+  }
+
   pendingProviderOAuthId = providerId
   startManualOnboarding(reason)
 }
@@ -495,6 +555,13 @@ export function setOnboardingMode(mode: OnboardingMode) {
 }
 
 export async function refreshOnboarding(ctx: OnboardingContext) {
+  if (isEnterpriseManaged()) {
+    exitManagedOnboarding()
+    ctx.onCompleted?.()
+
+    return true
+  }
+
   // Manual mode (user opened the selector from a working app): never
   // auto-dismiss on runtime-ready — the whole point is to let them add /
   // switch a provider while already configured. Just ensure the provider
@@ -550,6 +617,14 @@ async function openSignInUrl(url: string) {
 }
 
 export async function startProviderOAuth(provider: OAuthProvider, ctx: OnboardingContext) {
+  if (isEnterpriseManaged()) {
+    notifyManagedOnboarding()
+    exitManagedOnboarding()
+    ctx.onCompleted?.()
+
+    return
+  }
+
   clearPoll()
 
   if (provider.flow === 'external') {
@@ -737,6 +812,14 @@ export async function saveOnboardingApiKey(
   // providers (their key IS `value`).
   endpointApiKey?: string
 ) {
+  if (isEnterpriseManaged()) {
+    notifyManagedOnboarding()
+    exitManagedOnboarding()
+    ctx.onCompleted?.()
+
+    return { ok: false, message: '企业受管模式下不能在桌面端配置 API key。' }
+  }
+
   const trimmed = value.trim()
 
   if (!trimmed) {
@@ -793,6 +876,14 @@ export async function saveOnboardingApiKey(
 // wipe the base_url we just wrote. We have a concrete model already, so we
 // verify the runtime directly and finish.
 export async function saveOnboardingLocalEndpoint(baseUrl: string, apiKey: string, ctx: OnboardingContext) {
+  if (isEnterpriseManaged()) {
+    notifyManagedOnboarding()
+    exitManagedOnboarding()
+    ctx.onCompleted?.()
+
+    return { ok: false, message: '企业受管模式下不能在桌面端配置本地或自定义端点。' }
+  }
+
   const url = baseUrl.trim()
   const key = apiKey.trim()
 
@@ -855,6 +946,13 @@ export async function saveOnboardingLocalEndpoint(baseUrl: string, apiKey: strin
 // User picked a different model from the dropdown on the confirm card.
 // Persists immediately so the displayed value is always what's on disk.
 export async function setOnboardingModel(model: string) {
+  if (isEnterpriseManaged()) {
+    notifyManagedOnboarding()
+    exitManagedOnboarding()
+
+    return
+  }
+
   const { flow } = $desktopOnboarding.get()
 
   if (flow.status !== 'confirming_model') {

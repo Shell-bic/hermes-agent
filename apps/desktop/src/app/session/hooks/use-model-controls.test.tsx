@@ -3,6 +3,7 @@ import { cleanup, render, renderHook } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { getGlobalModelInfo } from '@/hermes'
+import { $enterprise, INITIAL_ENTERPRISE_STATE } from '@/store/enterprise'
 import {
   $activeSessionId,
   $currentModel,
@@ -59,7 +60,9 @@ function Harness({
 
 describe('useModelControls', () => {
   beforeEach(() => {
+    vi.clearAllMocks()
     $activeSessionId.set(null)
+    $enterprise.set(INITIAL_ENTERPRISE_STATE)
     setCurrentModel('')
     setCurrentProvider('')
   })
@@ -68,6 +71,7 @@ describe('useModelControls', () => {
     cleanup()
     vi.restoreAllMocks()
     $activeSessionId.set(null)
+    $enterprise.set(INITIAL_ENTERPRISE_STATE)
     setCurrentModel('')
     setCurrentProvider('')
   })
@@ -194,5 +198,122 @@ describe('useModelControls', () => {
     // A profile swap forces a reseed to the new profile's default.
     await result.current.refreshCurrentModel(true)
     expect($currentModel.get()).toBe('openai/gpt-5.5')
+  })
+
+  it('seeds enterprise managed drafts from the enterprise model state without reading global model info', async () => {
+    $enterprise.set({
+      ...INITIAL_ENTERPRISE_STATE,
+      allowedModels: ['enterprise/current', 'enterprise/default'],
+      authenticated: true,
+      currentModel: 'enterprise/current',
+      defaultModel: 'enterprise/default',
+      enabled: true,
+      status: 'authenticated'
+    })
+
+    const { result } = renderHook(() =>
+      useModelControls({
+        activeSessionId: null,
+        queryClient: new QueryClient(),
+        requestGateway: vi.fn()
+      })
+    )
+
+    await result.current.refreshCurrentModel()
+
+    expect($currentModel.get()).toBe('enterprise/current')
+    expect($currentProvider.get()).toBe('company-gateway')
+    expect(getGlobalModelInfo).not.toHaveBeenCalled()
+  })
+
+  it('routes enterprise managed picker changes through enterprise.selectModel instead of config.set', async () => {
+    const requestGateway = vi.fn()
+    const selectModel = vi.fn(async () => ({
+      ...INITIAL_ENTERPRISE_STATE,
+      allowedModels: ['enterprise/next'],
+      authenticated: true,
+      currentModel: 'enterprise/next',
+      defaultModel: 'enterprise/next',
+      enabled: true,
+      status: 'authenticated' as const
+    }))
+
+    $enterprise.set({
+      ...INITIAL_ENTERPRISE_STATE,
+      allowedModels: ['enterprise/next'],
+      authenticated: true,
+      currentModel: 'enterprise/current',
+      defaultModel: 'enterprise/next',
+      enabled: true,
+      status: 'authenticated'
+    })
+    window.hermesDesktop = {
+      enterprise: {
+        selectModel
+      }
+    } as unknown as typeof window.hermesDesktop
+
+    let controls!: Controls
+
+    render(
+      <Harness
+        activeSessionId="session-1"
+        onReady={value => (controls = value)}
+        requestGateway={requestGateway}
+      />
+    )
+
+    await expect(
+      controls.selectModel({
+        model: 'enterprise/next',
+        provider: 'company-gateway'
+      })
+    ).resolves.toBe(true)
+
+    expect(selectModel).toHaveBeenCalledWith('enterprise/next')
+    expect(requestGateway).not.toHaveBeenCalledWith('config.set', expect.anything())
+    expect($currentModel.get()).toBe('enterprise/next')
+    expect($currentProvider.get()).toBe('company-gateway')
+  })
+
+  it('rejects enterprise managed picker changes for unauthorized models', async () => {
+    const requestGateway = vi.fn()
+    const selectModel = vi.fn()
+
+    $enterprise.set({
+      ...INITIAL_ENTERPRISE_STATE,
+      allowedModels: ['enterprise/allowed'],
+      authenticated: true,
+      currentModel: 'enterprise/allowed',
+      defaultModel: 'enterprise/allowed',
+      enabled: true,
+      status: 'authenticated'
+    })
+    window.hermesDesktop = {
+      enterprise: {
+        selectModel
+      }
+    } as unknown as typeof window.hermesDesktop
+
+    let controls!: Controls
+
+    render(
+      <Harness
+        activeSessionId="session-1"
+        onReady={value => (controls = value)}
+        requestGateway={requestGateway}
+      />
+    )
+
+    await expect(
+      controls.selectModel({
+        model: 'personal/model',
+        provider: 'openai'
+      })
+    ).resolves.toBe(false)
+
+    expect(selectModel).not.toHaveBeenCalled()
+    expect(requestGateway).not.toHaveBeenCalled()
+    expect(notifyError).toHaveBeenCalledWith(expect.any(Error), 'Model switch failed')
   })
 })

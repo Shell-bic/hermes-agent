@@ -197,3 +197,12 @@ test('chatWindowWebPreferences passes the preload path through and keeps the har
   assert.equal(prefs.sandbox, true)
   assert.equal(prefs.nodeIntegration, false)
 })
+
+test('chatWindowWebPreferences allows a dev sandbox override', () => {
+  const prefs = chatWindowWebPreferences('/some/preload.cjs', { sandbox: false })
+
+  assert.equal(prefs.preload, '/some/preload.cjs')
+  assert.equal(prefs.contextIsolation, true)
+  assert.equal(prefs.sandbox, false)
+  assert.equal(prefs.nodeIntegration, false)
+})

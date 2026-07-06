@@ -3,9 +3,17 @@ import { useCallback, useEffect, useRef } from 'react'
 
 import type { HermesGateway } from '@/hermes'
 import { isGatewayReauthRequired, resolveGatewayWsUrl } from '@/lib/gateway-ws-url'
+import { $enterprise } from '@/store/enterprise'
 import { $gateway, ensureActiveGatewayOpen, isActivePrimary } from '@/store/gateway'
 import { $activeGatewayProfile } from '@/store/profile'
 import { $gatewayState, setConnection } from '@/store/session'
+
+function enterpriseAuthRequiredError() {
+  const error = new Error('Enterprise sign-in is required before starting Hermes.')
+  ;(error as Error & { code?: string }).code = 'enterprise-auth-required'
+
+  return error
+}
 
 export function useGatewayRequest() {
   const gatewayState = useStore($gatewayState)
@@ -95,6 +103,11 @@ export function useGatewayRequest() {
 
   const requestGateway = useCallback(
     async <T>(method: string, params: Record<string, unknown> = {}) => {
+      const enterprise = $enterprise.get()
+      if (enterprise.enabled && !enterprise.authenticated) {
+        throw enterpriseAuthRequiredError()
+      }
+
       const gateway = gatewayRef.current
 
       if (!gateway) {

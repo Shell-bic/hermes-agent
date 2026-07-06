@@ -6,6 +6,9 @@ const test = require('node:test')
 const {
   bundledRuntimeImportCheck,
   detectRemoteDisplay,
+  resolveWindowsGpuLaunchSwitches,
+  resolveWindowsRendererLaunchSwitches,
+  shouldDisableWindowsRendererSandbox,
   isWindowsBinaryPathInWsl,
   isWslEnvironment
 } = require('./bootstrap-platform.cjs')
@@ -83,6 +86,92 @@ test('detectRemoteDisplay honors the HERMES_DESKTOP_DISABLE_GPU override both wa
       platform: 'linux'
     }),
     null
+  )
+})
+
+test('resolveWindowsGpuLaunchSwitches keeps Windows dev on the normal GPU process by default', () => {
+  assert.deepEqual(resolveWindowsGpuLaunchSwitches({ env: {}, platform: 'win32', isPackaged: false }), [])
+})
+
+test('resolveWindowsGpuLaunchSwitches keeps packaged Windows default unless requested', () => {
+  assert.deepEqual(resolveWindowsGpuLaunchSwitches({ env: {}, platform: 'win32', isPackaged: true }), [])
+  assert.deepEqual(
+    resolveWindowsGpuLaunchSwitches({
+      env: { HERMES_DESKTOP_GPU_PROCESS: 'in-process' },
+      platform: 'win32',
+      isPackaged: true
+    }),
+    [
+      ['use-angle', 'd3d11'],
+      ['in-process-gpu']
+    ]
+  )
+})
+
+test('resolveWindowsGpuLaunchSwitches can be disabled explicitly', () => {
+  assert.deepEqual(
+    resolveWindowsGpuLaunchSwitches({
+      env: { HERMES_DESKTOP_GPU_PROCESS: 'default' },
+      platform: 'win32',
+      isPackaged: false
+    }),
+    []
+  )
+  assert.deepEqual(resolveWindowsGpuLaunchSwitches({ env: {}, platform: 'linux', isPackaged: false }), [])
+})
+
+test('resolveWindowsRendererLaunchSwitches disables renderer code integrity in Windows dev', () => {
+  assert.deepEqual(resolveWindowsRendererLaunchSwitches({ env: {}, platform: 'win32', isPackaged: false }), [
+    ['disable-features', 'RendererCodeIntegrity']
+  ])
+})
+
+test('resolveWindowsRendererLaunchSwitches keeps packaged Windows default unless requested', () => {
+  assert.deepEqual(resolveWindowsRendererLaunchSwitches({ env: {}, platform: 'win32', isPackaged: true }), [])
+  assert.deepEqual(
+    resolveWindowsRendererLaunchSwitches({
+      env: { HERMES_DESKTOP_RENDERER_CODE_INTEGRITY: 'disabled' },
+      platform: 'win32',
+      isPackaged: true
+    }),
+    [['disable-features', 'RendererCodeIntegrity']]
+  )
+})
+
+test('resolveWindowsRendererLaunchSwitches can be explicitly kept enabled', () => {
+  assert.deepEqual(
+    resolveWindowsRendererLaunchSwitches({
+      env: { HERMES_DESKTOP_RENDERER_CODE_INTEGRITY: 'enabled' },
+      platform: 'win32',
+      isPackaged: false
+    }),
+    []
+  )
+  assert.deepEqual(resolveWindowsRendererLaunchSwitches({ env: {}, platform: 'linux', isPackaged: false }), [])
+})
+
+test('shouldDisableWindowsRendererSandbox disables sandbox only for Windows dev by default', () => {
+  assert.equal(shouldDisableWindowsRendererSandbox({ env: {}, platform: 'win32', isPackaged: false }), true)
+  assert.equal(shouldDisableWindowsRendererSandbox({ env: {}, platform: 'win32', isPackaged: true }), false)
+  assert.equal(shouldDisableWindowsRendererSandbox({ env: {}, platform: 'linux', isPackaged: false }), false)
+})
+
+test('shouldDisableWindowsRendererSandbox honors explicit overrides', () => {
+  assert.equal(
+    shouldDisableWindowsRendererSandbox({
+      env: { HERMES_DESKTOP_RENDERER_SANDBOX: 'enabled' },
+      platform: 'win32',
+      isPackaged: false
+    }),
+    false
+  )
+  assert.equal(
+    shouldDisableWindowsRendererSandbox({
+      env: { HERMES_DESKTOP_RENDERER_SANDBOX: 'disabled' },
+      platform: 'win32',
+      isPackaged: true
+    }),
+    true
   )
 })
 

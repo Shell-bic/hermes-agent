@@ -2,7 +2,7 @@ import type { Unstable_TriggerAdapter, Unstable_TriggerItem } from '@assistant-u
 import { useCallback } from 'react'
 
 import type { HermesGateway } from '@/hermes'
-import { sessionTitle } from '@/lib/chat-runtime'
+import { enterpriseAllowedModels, ENTERPRISE_MODEL_PROVIDER, sessionTitle } from '@/lib/chat-runtime'
 import {
   type CommandsCatalogLike,
   desktopSkinSlashCompletions,
@@ -12,6 +12,8 @@ import {
   isDesktopSlashExtensionCommand,
   isDesktopSlashSuggestion
 } from '@/lib/desktop-slash-commands'
+import { $enterprise } from '@/store/enterprise'
+import { enterpriseModelDisplayName, isEnterpriseModelManaged } from '@/store/model-visibility'
 import { $sessions } from '@/store/session'
 
 import type { CompletionEntry, CompletionPayload } from './use-live-completion-adapter'
@@ -70,6 +72,46 @@ export function useSlashCompletions(options: {
       }
 
       const text = `/${query}`
+
+      const modelArg = /^\/model\s+(.*)$/is.exec(text)
+
+      if (modelArg) {
+        const enterprise = $enterprise.get()
+
+        if (isEnterpriseModelManaged(enterprise)) {
+          const needle = (modelArg[1] ?? '').trim().toLowerCase()
+          const models = enterpriseAllowedModels(enterprise).filter(
+            model =>
+              !needle ||
+              model.toLowerCase().includes(needle) ||
+              enterpriseModelDisplayName(enterprise, model).toLowerCase().includes(needle)
+          )
+
+          if (!models.length) {
+            return {
+              items: [
+                {
+                  text,
+                  display: 'Model not allowed by enterprise policy',
+                  meta: 'Choose an authorized company-gateway model',
+                  group: 'Models'
+                }
+              ],
+              query
+            }
+          }
+
+          return {
+            items: models.map(model => ({
+              text: `/model ${model}`,
+              display: enterpriseModelDisplayName(enterprise, model),
+              meta: ENTERPRISE_MODEL_PROVIDER,
+              group: 'Models'
+            })),
+            query
+          }
+        }
+      }
 
       // The desktop owns /skin entirely (client-side theme context). Surface its
       // theme list inside this single popover instead of a bespoke one, and skip

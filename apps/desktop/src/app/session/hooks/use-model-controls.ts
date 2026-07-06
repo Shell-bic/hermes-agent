@@ -3,6 +3,9 @@ import { useCallback } from 'react'
 
 import { getGlobalModelInfo } from '@/hermes'
 import { useI18n } from '@/i18n'
+import { enterpriseModelSelection, isEnterpriseModelAllowed } from '@/lib/chat-runtime'
+import { $enterprise, selectEnterpriseModel } from '@/store/enterprise'
+import { isEnterpriseModelManaged } from '@/store/model-visibility'
 import { notifyError } from '@/store/notifications'
 import {
   $activeSessionId,
@@ -52,6 +55,19 @@ export function useModelControls({ activeSessionId, queryClient, requestGateway 
         return
       }
 
+      const enterprise = $enterprise.get()
+
+      if (isEnterpriseModelManaged(enterprise)) {
+        const selection = enterpriseModelSelection(enterprise, force ? null : $currentModel.get())
+
+        if (selection && (force || !$currentModel.get())) {
+          setCurrentModel(selection.model)
+          setCurrentProvider(selection.provider)
+        }
+
+        return
+      }
+
       if (!force && $currentModel.get()) {
         return
       }
@@ -87,10 +103,46 @@ export function useModelControls({ activeSessionId, queryClient, requestGateway 
       // rather than leave the UI showing a model the backend never selected.
       const prevModel = $currentModel.get()
       const prevProvider = $currentProvider.get()
+      const enterprise = $enterprise.get()
+      const enterpriseManaged = isEnterpriseModelManaged(enterprise)
+      const enterpriseSelection = enterpriseManaged ? enterpriseModelSelection(enterprise, selection.model) : null
 
-      setCurrentModel(selection.model)
-      setCurrentProvider(selection.provider)
-      updateModelOptionsCache(selection.provider, selection.model, !activeSessionId)
+      if (enterpriseManaged && (!isEnterpriseModelAllowed(enterprise, selection.model) || !enterpriseSelection)) {
+        notifyError(new Error(`Model "${selection.model}" is not allowed by enterprise policy.`), copy.modelSwitchFailed)
+
+        return false
+      }
+
+      const nextModel = enterpriseSelection?.model ?? selection.model
+      const nextProvider = enterpriseSelection?.provider ?? selection.provider
+
+      setCurrentModel(nextModel)
+      setCurrentProvider(nextProvider)
+      updateModelOptionsCache(nextProvider, nextModel, !activeSessionId)
+
+      if (enterpriseManaged) {
+        try {
+          const nextEnterprise = await selectEnterpriseModel(nextModel)
+          const nextSelection = enterpriseModelSelection(nextEnterprise, nextModel)
+
+          if (nextSelection) {
+            setCurrentModel(nextSelection.model)
+            setCurrentProvider(nextSelection.provider)
+            updateModelOptionsCache(nextSelection.provider, nextSelection.model, !activeSessionId)
+          }
+
+          void queryClient.invalidateQueries({ queryKey: ['model-options'] })
+
+          return true
+        } catch (err) {
+          setCurrentModel(prevModel)
+          setCurrentProvider(prevProvider)
+          updateModelOptionsCache(prevProvider, prevModel, !activeSessionId)
+          notifyError(err, copy.modelSwitchFailed)
+
+          return false
+        }
+      }
 
       // No live session yet: the pick is pure UI state. session.create reads
       // $currentModel/$currentProvider and applies it as that session's override.

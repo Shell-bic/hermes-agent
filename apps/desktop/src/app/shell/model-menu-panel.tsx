@@ -18,14 +18,23 @@ import { Skeleton } from '@/components/ui/skeleton'
 import type { HermesGateway } from '@/hermes'
 import { getGlobalModelOptions } from '@/hermes'
 import { useI18n } from '@/i18n'
-import { currentPickerSelection, displayModelName, modelDisplayParts, reasoningEffortLabel } from '@/lib/model-status-label'
+import {
+  currentPickerSelection,
+  displayModelName,
+  modelDisplayParts,
+  reasoningEffortLabel
+} from '@/lib/model-status-label'
 import { cn } from '@/lib/utils'
+import { $enterprise } from '@/store/enterprise'
 import { $modelPresets, applyModelPreset, modelPresetKey } from '@/store/model-presets'
 import {
   $visibleModels,
   collapseModelFamilies,
   DEFAULT_VISIBLE_PER_PROVIDER,
+  enterpriseModelDisplayName,
+  enterpriseModelOptionsFromState,
   effectiveVisibleKeys,
+  isEnterpriseModelManaged,
   type ModelFamily,
   modelVisibilityKey,
   setModelVisibilityOpen
@@ -70,8 +79,10 @@ export function ModelMenuPanel({ gateway, onSelectModel, requestGateway }: Model
   const currentModel = useStore($currentModel)
   const currentProvider = useStore($currentProvider)
   const currentReasoningEffort = useStore($currentReasoningEffort)
+  const enterprise = useStore($enterprise)
   const modelPresets = useStore($modelPresets)
   const visibleModels = useStore($visibleModels)
+  const enterpriseManaged = isEnterpriseModelManaged(enterprise)
 
   const modelOptions = useQuery({
     queryKey: ['model-options', activeSessionId || 'global'],
@@ -81,28 +92,32 @@ export function ModelMenuPanel({ gateway, onSelectModel, requestGateway }: Model
       }
 
       return getGlobalModelOptions()
-    }
+    },
+    enabled: !enterpriseManaged
   })
+
+  const options = enterpriseManaged ? enterpriseModelOptionsFromState(enterprise) : modelOptions.data
 
   const { model: optionsModel, provider: optionsProvider } = currentPickerSelection(
     !!activeSessionId,
     { model: currentModel, provider: currentProvider },
-    modelOptions.data
+    options
   )
 
-  const loading = modelOptions.isPending && !modelOptions.data
+  const loading = !enterpriseManaged && modelOptions.isPending && !modelOptions.data
 
-  const error = modelOptions.error
-    ? modelOptions.error instanceof Error
-      ? modelOptions.error.message
-      : String(modelOptions.error)
-    : null
+  const error =
+    !enterpriseManaged && modelOptions.error
+      ? modelOptions.error instanceof Error
+        ? modelOptions.error.message
+        : String(modelOptions.error)
+      : null
 
-  const providers = modelOptions.data?.providers
+  const providers = options?.providers
 
   const effectiveVisibleModels = useMemo(
-    () => effectiveVisibleKeys(visibleModels, providers ?? []),
-    [visibleModels, providers]
+    () => effectiveVisibleKeys(enterpriseManaged ? null : visibleModels, providers ?? []),
+    [enterpriseManaged, visibleModels, providers]
   )
 
   // The composer picker never persists the profile default. With a session it
@@ -136,18 +151,20 @@ export function ModelMenuPanel({ gateway, onSelectModel, requestGateway }: Model
   }
 
   const groups = useMemo(
-    () => groupModels(providers ?? [], search, { model: optionsModel, provider: optionsProvider }, effectiveVisibleModels),
-    [providers, search, optionsModel, optionsProvider, effectiveVisibleModels]
+    () =>
+      groupModels(
+        providers ?? [],
+        search,
+        { model: optionsModel, provider: optionsProvider },
+        effectiveVisibleModels,
+        model => (enterpriseManaged ? enterpriseModelDisplayName(enterprise, model) : displayModelName(model))
+      ),
+    [providers, search, optionsModel, optionsProvider, effectiveVisibleModels, enterpriseManaged, enterprise]
   )
 
   return (
     <>
-      <DropdownMenuSearch
-        aria-label={copy.search}
-        onValueChange={setSearch}
-        placeholder={copy.search}
-        value={search}
-      />
+      <DropdownMenuSearch aria-label={copy.search} onValueChange={setSearch} placeholder={copy.search} value={search} />
 
       <DropdownMenuSeparator className="mx-0" />
 
@@ -187,7 +204,9 @@ export function ModelMenuPanel({ gateway, onSelectModel, requestGateway }: Model
                     : null
 
                 const isCurrent = activeId !== null
-                const name = modelDisplayParts(family.id).name
+                const name = enterpriseManaged
+                  ? enterpriseModelDisplayName(enterprise, family.id)
+                  : modelDisplayParts(family.id).name
                 // Capabilities are looked up against the active/base id; the
                 // -fast variant carries the same param support as its base.
                 const caps = group.provider.capabilities?.[family.id]
@@ -197,8 +216,8 @@ export function ModelMenuPanel({ gateway, onSelectModel, requestGateway }: Model
                 // defaults when unset). Row label AND submenu read from these so
                 // they never disagree.
                 const preset = modelPresets[modelPresetKey(group.provider.slug, family.id)] ?? {}
-                const effEffort = isCurrent ? currentReasoningEffort : preset.effort ?? ''
-                const effFast = isCurrent ? currentFastMode : preset.fast ?? false
+                const effEffort = isCurrent ? currentReasoningEffort : (preset.effort ?? '')
+                const effFast = isCurrent ? currentFastMode : (preset.fast ?? false)
 
                 const fastControl = resolveFastControl(
                   activeId ?? family.id,
@@ -266,14 +285,18 @@ export function ModelMenuPanel({ gateway, onSelectModel, requestGateway }: Model
         </div>
       )}
 
-      <DropdownMenuSeparator className="mx-0" />
+      {!enterpriseManaged && (
+        <>
+          <DropdownMenuSeparator className="mx-0" />
 
-      <DropdownMenuItem
-        className={cn(dropdownMenuRow, 'text-(--ui-text-tertiary)')}
-        onSelect={() => setModelVisibilityOpen(true)}
-      >
-        {copy.editModels}
-      </DropdownMenuItem>
+          <DropdownMenuItem
+            className={cn(dropdownMenuRow, 'text-(--ui-text-tertiary)')}
+            onSelect={() => setModelVisibilityOpen(true)}
+          >
+            {copy.editModels}
+          </DropdownMenuItem>
+        </>
+      )}
     </>
   )
 }
@@ -286,7 +309,8 @@ function groupModels(
   providers: ModelOptionProvider[],
   search: string,
   current: { model: string; provider: string },
-  visible: Set<string> | null
+  visible: Set<string> | null,
+  getModelLabel: (model: string) => string
 ): ProviderGroup[] {
   const q = search.trim().toLowerCase()
   const groups: ProviderGroup[] = []
@@ -299,7 +323,7 @@ function groupModels(
     }
 
     const matches = (family: ModelFamily) =>
-      `${family.id} ${family.fastId ?? ''} ${provider.name} ${provider.slug} ${displayModelName(family.id)}`
+      `${family.id} ${family.fastId ?? ''} ${provider.name} ${provider.slug} ${getModelLabel(family.id)}`
         .toLowerCase()
         .includes(q)
 

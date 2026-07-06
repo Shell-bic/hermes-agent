@@ -5,7 +5,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { textPart } from '@/lib/chat-messages'
 import { $composerAttachments, type ComposerAttachment } from '@/store/composer'
-import { $busy, $connection, $messages, $sessions, setSessions } from '@/store/session'
+import { $enterprise, INITIAL_ENTERPRISE_STATE } from '@/store/enterprise'
+import { $busy, $connection, $currentModel, $currentProvider, $messages, $sessions, setSessions } from '@/store/session'
 import type { SessionInfo } from '@/types/hermes'
 
 import { uploadComposerAttachment, usePromptActions } from './use-prompt-actions'
@@ -213,6 +214,9 @@ describe('usePromptActions desktop slash pickers', () => {
   afterEach(() => {
     cleanup()
     vi.useRealTimers()
+    $enterprise.set(INITIAL_ENTERPRISE_STATE)
+    $currentModel.set('')
+    $currentProvider.set('')
     vi.restoreAllMocks()
   })
 
@@ -264,6 +268,55 @@ describe('usePromptActions desktop slash pickers', () => {
         session_id: RUNTIME_SESSION_ID
       }
     })
+  })
+
+  it('handles typed /model arguments through enterprise policy instead of slash.exec', async () => {
+    $enterprise.set({
+      ...INITIAL_ENTERPRISE_STATE,
+      allowedModels: ['enterprise/allowed'],
+      authenticated: true,
+      currentModel: 'enterprise/current',
+      defaultModel: 'enterprise/allowed',
+      enabled: true,
+      modelProfiles: [
+        {
+          id: 'profile-1',
+          model: 'enterprise/allowed',
+          name: '企业授权模型'
+        }
+      ],
+      status: 'authenticated'
+    })
+
+    Object.defineProperty(window, 'hermesDesktop', {
+      configurable: true,
+      value: {
+        enterprise: {
+          selectModel: vi.fn(async () => ({
+            ...$enterprise.get(),
+            currentModel: 'enterprise/allowed',
+            currentModelProfileId: 'profile-1'
+          }))
+        }
+      }
+    })
+
+    const requestGateway = vi.fn(async () => ({}) as never)
+
+    let handle: HarnessHandle | null = null
+    render(<Harness onReady={h => (handle = h)} refreshSessions={async () => undefined} requestGateway={requestGateway} />)
+
+    await handle!.submitText('/model enterprise/allowed')
+
+    expect(window.hermesDesktop.enterprise.selectModel).toHaveBeenCalledWith('enterprise/allowed')
+    expect(requestGateway).not.toHaveBeenCalledWith('slash.exec', expect.anything())
+    expect($currentModel.get()).toBe('enterprise/allowed')
+    expect($currentProvider.get()).toBe('company-gateway')
+
+    await handle!.submitText('/model personal/model')
+
+    expect(requestGateway).not.toHaveBeenCalledWith('slash.exec', expect.anything())
+    expect(window.hermesDesktop.enterprise.selectModel).toHaveBeenCalledTimes(1)
   })
 })
 

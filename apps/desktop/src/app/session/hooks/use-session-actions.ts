@@ -5,11 +5,13 @@ import type { NavigateFunction } from 'react-router-dom'
 import { deleteSession, getSession, getSessionMessages, setSessionArchived } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { type ChatMessage, chatMessageText, preserveLocalAssistantErrors, toChatMessages } from '@/lib/chat-messages'
-import { normalizePersonalityValue } from '@/lib/chat-runtime'
+import { enterpriseModelSelection, normalizePersonalityValue } from '@/lib/chat-runtime'
 import { embeddedImageUrls, textWithoutEmbeddedImages } from '@/lib/embedded-images'
 import { setSessionYolo } from '@/lib/yolo-session'
 import { clearQueuedPrompts } from '@/store/composer-queue'
+import { $enterprise } from '@/store/enterprise'
 import { $pinnedSessionIds } from '@/store/layout'
+import { isEnterpriseModelManaged } from '@/store/model-visibility'
 import { clearNotifications, notify, notifyError } from '@/store/notifications'
 import { requestDesktopOnboarding } from '@/store/onboarding'
 import { $activeGatewayProfile, $newChatProfile, $profiles, ensureGatewayProfile, normalizeProfileKey } from '@/store/profile'
@@ -456,6 +458,9 @@ export function useSessionActions({
         // default (that lives in Settings → Model).
         const uiModel = $currentModel.get().trim()
         const uiProvider = $currentProvider.get().trim()
+        const enterprise = $enterprise.get()
+        const enterpriseManaged = isEnterpriseModelManaged(enterprise)
+        const enterpriseSelection = enterpriseManaged ? enterpriseModelSelection(enterprise, uiModel) : null
         const uiEffort = $currentReasoningEffort.get().trim()
         const uiFast = $currentFastMode.get()
 
@@ -463,7 +468,11 @@ export function useSessionActions({
           cols: 96,
           ...(cwd && { cwd }),
           ...(newChatProfile ? { profile: newChatProfile } : {}),
-          ...(uiModel ? { model: uiModel, ...(uiProvider ? { provider: uiProvider } : {}) } : {}),
+          ...(enterpriseSelection
+            ? { model: enterpriseSelection.model, provider: enterpriseSelection.provider }
+            : uiModel
+              ? { model: uiModel, ...(uiProvider ? { provider: uiProvider } : {}) }
+              : {}),
           ...(uiEffort ? { reasoning_effort: uiEffort } : {}),
           ...(uiFast ? { fast: true } : {})
         })

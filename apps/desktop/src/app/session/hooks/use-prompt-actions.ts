@@ -8,6 +8,8 @@ import { stripAnsi } from '@/lib/ansi'
 import { branchGroupForUser, type ChatMessage, chatMessageText, textPart } from '@/lib/chat-messages'
 import {
   optimisticAttachmentRef,
+  enterpriseModelSelection,
+  isEnterpriseModelAllowed,
   parseCommandDispatch,
   parseSlashCommand,
   pathLabel,
@@ -37,6 +39,7 @@ import {
 } from '@/store/composer'
 import { resetSessionBackground } from '@/store/composer-status'
 import { clearNotifications, notify, notifyError } from '@/store/notifications'
+import { $enterprise, selectEnterpriseModel } from '@/store/enterprise'
 import { requestDesktopOnboarding } from '@/store/onboarding'
 import { $activeGatewayProfile, $newChatProfile, ensureGatewayProfile, normalizeProfileKey } from '@/store/profile'
 import {
@@ -47,6 +50,8 @@ import {
   $yoloActive,
   setAwaitingResponse,
   setBusy,
+  $currentModel,
+  $currentProvider,
   setMessages,
   setModelPickerOpen,
   setSessionPickerOpen,
@@ -55,6 +60,7 @@ import {
 } from '@/store/session'
 import { clearSessionSubagents } from '@/store/subagents'
 import { clearSessionTodos } from '@/store/todos'
+import { isEnterpriseModelManaged } from '@/store/model-visibility'
 
 import type {
   ClientSessionState,
@@ -520,6 +526,7 @@ export function usePromptActions({
   )
 
   const composerAttachments = useStore($composerAttachments)
+  const enterprise = useStore($enterprise)
 
   useEffect(() => {
     if (!activeSessionId) {
@@ -1230,7 +1237,28 @@ export function usePromptActions({
             return
           }
 
-          // Power users can still type `/model <name>` — run it on the backend.
+          if (isEnterpriseModelManaged(enterprise)) {
+            const requestedModel = ctx.arg.trim()
+
+            if (!isEnterpriseModelAllowed(enterprise, requestedModel)) {
+              notify({ kind: 'error', message: '该模型未被企业策略授权。' })
+
+              return
+            }
+
+            const nextEnterprise = await selectEnterpriseModel(requestedModel)
+            const selection = enterpriseModelSelection(nextEnterprise, requestedModel)
+
+            if (selection) {
+              $currentModel.set(selection.model)
+              $currentProvider.set(selection.provider)
+              notify({ kind: 'success', message: `已切换到企业模型：${selection.model}` })
+            }
+
+            return
+          }
+
+          // Power users can still type `/model <name>` — run it on the backend outside enterprise mode.
           await runExec(ctx)
 
           return
@@ -1316,6 +1344,7 @@ export function usePromptActions({
       busyRef,
       copy,
       createBackendSessionForSend,
+      enterprise,
       handleSkinCommand,
       handoffSession,
       refreshSessions,

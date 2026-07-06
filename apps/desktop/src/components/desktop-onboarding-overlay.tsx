@@ -23,6 +23,7 @@ import {
 import { isProviderSetupErrorMessage } from '@/lib/provider-setup-errors'
 import { cn } from '@/lib/utils'
 import { $desktopBoot, type DesktopBootState } from '@/store/boot'
+import { $enterprise } from '@/store/enterprise'
 import {
   $desktopOnboarding,
   cancelOnboardingFlow,
@@ -194,6 +195,7 @@ const ONBOARDING_EXIT_MS = 1180
 export function DesktopOnboardingOverlay({ enabled, onCompleted, requestGateway }: DesktopOnboardingOverlayProps) {
   const { t } = useI18n()
   const onboarding = useStore($desktopOnboarding)
+  const enterprise = useStore($enterprise)
   const boot = useStore($desktopBoot)
   const ctxRef = useRef<OnboardingContext>({ requestGateway, onCompleted })
   ctxRef.current = { requestGateway, onCompleted }
@@ -210,6 +212,7 @@ export function DesktopOnboardingOverlay({ enabled, onCompleted, requestGateway 
   // behind), THEN finalize so the unmount lands after the fade — mirrors the
   // connecting overlay's exit choreography instead of cutting instantly.
   const [leaving, setLeaving] = useState(false)
+  const managed = enterprise.enabled && enterprise.authenticated
 
   const finalizeOnboarding = () => {
     if (leaving) {
@@ -230,10 +233,10 @@ export function DesktopOnboardingOverlay({ enabled, onCompleted, requestGateway 
   }
 
   useEffect(() => {
-    if (enabled || onboarding.requested) {
+    if (managed || enabled || onboarding.requested) {
       void refreshOnboarding(ctx)
     }
-  }, [ctx, enabled, onboarding.requested])
+  }, [ctx, enabled, managed, onboarding.requested])
 
   // When the Providers settings page asked to connect a specific provider, the
   // store stashed its id. Once the provider list has loaded and we're back at
@@ -264,6 +267,10 @@ export function DesktopOnboardingOverlay({ enabled, onCompleted, requestGateway 
       clearPendingProviderOAuth()
     }
   }, [ctx, onboarding.flow.status, onboarding.manual, onboarding.providers])
+
+  if (managed) {
+    return null
+  }
 
   // Mount from frame 1 so we replace the boot overlay seamlessly. The
   // configured field stays null until the runtime check resolves; only then

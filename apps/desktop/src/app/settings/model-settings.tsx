@@ -1,9 +1,11 @@
+import { useStore } from '@nanostores/react'
 import { useCallback, useEffect, useMemo, useState } from 'react'
 
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Switch } from '@/components/ui/switch'
+import type { EnterpriseModelProfileSummary } from '@/global'
 import {
   getAuxiliaryModels,
   getGlobalModelInfo,
@@ -18,7 +20,8 @@ import type { AuxiliaryModelsResponse, ModelOptionProvider, StaleAuxAssignment }
 import { useI18n } from '@/i18n'
 import { AlertTriangle, Cpu, Loader2 } from '@/lib/icons'
 import { cn } from '@/lib/utils'
-import { notifyError } from '@/store/notifications'
+import { $enterprise, logoutEnterprise } from '@/store/enterprise'
+import { notify, notifyError } from '@/store/notifications'
 import { startManualLocalEndpoint, startManualProviderOAuth } from '@/store/onboarding'
 import type { HermesConfigRecord } from '@/types/hermes'
 
@@ -106,6 +109,196 @@ interface ModelSettingsProps {
 }
 
 export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
+  const enterprise = useStore($enterprise)
+  const managed = enterprise.enabled && enterprise.authenticated
+
+  if (managed) {
+    return <EnterpriseModelSettings />
+  }
+
+  return <HermesModelSettings onMainModelChanged={onMainModelChanged} />
+}
+
+function displayModelName(profile: EnterpriseModelProfileSummary): string {
+  return profile.displayName || profile.name || profile.model || profile.id || '未命名模型'
+}
+
+function formatManagedValue(value: unknown): string {
+  if (value === null || value === undefined || value === '') {
+    return '未配置'
+  }
+
+  if (typeof value === 'boolean') {
+    return value ? '是' : '否'
+  }
+
+  if (Array.isArray(value)) {
+    return value.length ? value.map(formatManagedValue).join('、') : '未配置'
+  }
+
+  if (typeof value === 'object') {
+    return JSON.stringify(value)
+  }
+
+  return String(value)
+}
+
+function ManagedRecordRows({ record }: { record?: Record<string, unknown> }) {
+  const entries = Object.entries(record ?? {}).filter(([, value]) => value !== undefined && value !== null && value !== '')
+
+  if (entries.length === 0) {
+    return <span className="text-xs text-muted-foreground">未配置</span>
+  }
+
+  return (
+    <div className="flex flex-wrap gap-1.5">
+      {entries.map(([key, value]) => (
+        <Pill key={key}>
+          <span className="font-mono">{key}</span>: {formatManagedValue(value)}
+        </Pill>
+      ))}
+    </div>
+  )
+}
+
+function enterpriseUserLabel(user: unknown): string {
+  if (!user || typeof user !== 'object') {
+    return '已认证企业账号'
+  }
+
+  const record = user as Record<string, unknown>
+  const candidate = record.displayName ?? record.name ?? record.userName ?? record.username ?? record.email ?? record.id
+
+  return typeof candidate === 'string' && candidate.trim() ? candidate.trim() : '已认证企业账号'
+}
+
+function EnterpriseModelSettings() {
+  const enterprise = useStore($enterprise)
+  const [loggingOut, setLoggingOut] = useState(false)
+  const profiles = enterprise.modelProfiles ?? []
+  const currentProfile = profiles.find(
+    profile =>
+      (enterprise.currentModelProfileId && profile.id === enterprise.currentModelProfileId) ||
+      (enterprise.currentModel && profile.model === enterprise.currentModel)
+  )
+  const defaultProfile = profiles.find(profile => profile.isDefault || profile.model === enterprise.defaultModel)
+  const capabilities = currentProfile?.capabilities ?? enterprise.capabilities
+  const runtimeDefaults = currentProfile?.runtimeDefaults ?? enterprise.runtimeDefaults
+  const auxiliaryPolicy = currentProfile?.auxiliaryPolicy ?? enterprise.auxiliaryPolicy
+
+  async function handleLogout() {
+    if (loggingOut) {
+      return
+    }
+
+    if (!window.confirm('退出企业账号后，本机将停止当前企业受管运行环境，并回到企业登录界面。确定退出吗？')) {
+      return
+    }
+
+    setLoggingOut(true)
+
+    try {
+      await logoutEnterprise()
+      notify({ durationMs: 3_000, kind: 'success', message: '已退出企业账号。' })
+    } catch (error) {
+      notifyError(error, '退出企业账号失败')
+    } finally {
+      setLoggingOut(false)
+    }
+  }
+
+  return (
+    <div className="grid gap-6">
+      <section className="rounded-lg border border-(--ui-stroke-tertiary) bg-(--ui-bg-tertiary)/40 px-4 py-3">
+        <div className="flex flex-wrap items-center gap-2">
+          <SectionHeading icon={Cpu} title="企业模型配置" />
+          <Pill tone="primary">受管</Pill>
+          {enterprise.policyVersion ? <Pill>策略版本 {enterprise.policyVersion}</Pill> : null}
+        </div>
+        <p className="text-sm leading-6 text-muted-foreground">
+          当前模型、授权范围、运行默认值和辅助模型策略由企业管理员统一配置。普通用户不能在桌面端修改
+          provider、API key、OAuth、local/custom endpoint、模型可见性或网关凭据。
+        </p>
+      </section>
+
+      <section>
+        <div className="grid gap-1">
+          <ListRow
+            action={<span className="font-mono text-xs">{enterprise.currentModel ?? '未配置'}</span>}
+            description={currentProfile ? displayModelName(currentProfile) : '由企业策略下发'}
+            title="当前模型"
+          />
+          <ListRow
+            action={<span className="font-mono text-xs">{enterprise.defaultModel ?? '未配置'}</span>}
+            description={defaultProfile ? displayModelName(defaultProfile) : '由企业策略下发'}
+            title="默认模型"
+          />
+          <ListRow
+            action={<ManagedRecordRows record={capabilities} />}
+            description="包含上下文、reasoning、fast、vision 等模型能力；字段不存在时按后端默认策略执行。"
+            title="模型能力"
+          />
+          <ListRow
+            action={<ManagedRecordRows record={runtimeDefaults} />}
+            description="新会话运行参数默认值由企业网关下发。"
+            title="运行默认值"
+          />
+          <ListRow
+            action={<ManagedRecordRows record={auxiliaryPolicy} />}
+            description="辅助任务模型策略由企业统一控制，未指定时跟随主模型。"
+            title="辅助模型策略"
+          />
+        </div>
+      </section>
+
+      <section>
+        <SectionHeading icon={Cpu} meta={`${profiles.length}`} title="授权模型" />
+        {profiles.length > 0 ? (
+          <div className="grid gap-1">
+            {profiles.map(profile => (
+              <ListRow
+                action={
+                  <div className="flex flex-wrap justify-end gap-1.5">
+                    {profile.model === enterprise.currentModel ? <Pill tone="primary">当前</Pill> : null}
+                    {(profile.isDefault || profile.model === enterprise.defaultModel) ? <Pill>默认</Pill> : null}
+                    {profile.apiFormat ? <Pill>{profile.apiFormat}</Pill> : null}
+                  </div>
+                }
+                description={
+                  <span className="font-mono text-[0.68rem]">
+                    {profile.model ?? '未配置'}
+                  </span>
+                }
+                key={profile.id ?? profile.model ?? profile.name}
+                title={displayModelName(profile)}
+              />
+            ))}
+          </div>
+        ) : (
+          <div className="rounded-lg border border-dashed border-(--ui-stroke-tertiary) px-4 py-8 text-center text-sm text-muted-foreground">
+            暂无授权模型，请联系企业管理员配置模型授权。
+          </div>
+        )}
+      </section>
+
+      <section className="rounded-lg border border-destructive/35 bg-destructive/5 px-4 py-3">
+        <SectionHeading icon={AlertTriangle} title="企业账号" />
+        <ListRow
+          action={
+            <Button disabled={loggingOut} onClick={() => void handleLogout()} type="button" variant="destructive">
+              {loggingOut ? <Loader2 className="animate-spin" /> : null}
+              {loggingOut ? '退出中...' : '退出企业账号'}
+            </Button>
+          }
+          description="退出会撤销当前桌面会话和网关令牌，之后需要重新登录才能使用企业模型。"
+          title={enterpriseUserLabel(enterprise.user)}
+        />
+      </section>
+    </div>
+  )
+}
+
+function HermesModelSettings({ onMainModelChanged }: ModelSettingsProps) {
   const { t } = useI18n()
   const m = t.settings.model
   const [loading, setLoading] = useState(true)

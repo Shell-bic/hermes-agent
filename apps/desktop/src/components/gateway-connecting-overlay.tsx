@@ -149,6 +149,15 @@ export function GatewayConnectingOverlay() {
     return null
   }
 
+  // If boot is no longer active but the gateway did not open, we are in a
+  // deliberate wait state such as enterprise sign-in. The initial connecting
+  // overlay may have latched for a frame before the enterprise status resolved;
+  // do not keep the black CONNECTING layer around behind the login surface.
+  if (!previewing && !connecting && gatewayState !== 'open') {
+    shownRef.current = false
+    return null
+  }
+
   // Real connect: once the fade finishes, get out of the way for good.
   if (phase === 'gone' && !previewing) {
     return null

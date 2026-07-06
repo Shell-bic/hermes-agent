@@ -24,7 +24,14 @@ const net = require('node:net')
 const path = require('node:path')
 const { pathToFileURL } = require('node:url')
 const { execFileSync, spawn } = require('node:child_process')
-const { detectRemoteDisplay, isWindowsBinaryPathInWsl, isWslEnvironment } = require('./bootstrap-platform.cjs')
+const {
+  detectRemoteDisplay,
+  isWindowsBinaryPathInWsl,
+  isWslEnvironment,
+  resolveWindowsGpuLaunchSwitches,
+  resolveWindowsRendererLaunchSwitches,
+  shouldDisableWindowsRendererSandbox
+} = require('./bootstrap-platform.cjs')
 const { runBootstrap } = require('./bootstrap-runner.cjs')
 const {
   buildSessionWindowUrl,
@@ -80,6 +87,9 @@ const {
   resolveRequestedPathForIpc,
   resolveTimeoutMs
 } = require('./hardening.cjs')
+const { createEnterpriseAuthStore } = require('./enterprise-auth-store.cjs')
+const { createEnterpriseGatewayClient } = require('./enterprise-gateway-client.cjs')
+const { createEnterpriseRuntime, resolveEnterpriseRuntimeOptions } = require('./enterprise-runtime.cjs')
 
 let nodePty = null
 let nodePtyDir = null
@@ -122,6 +132,11 @@ const IS_MAC = process.platform === 'darwin'
 const IS_WINDOWS = process.platform === 'win32'
 const IS_WSL = isWslEnvironment()
 const APP_ROOT = app.getAppPath()
+const DISABLE_RENDERER_SANDBOX = shouldDisableWindowsRendererSandbox({
+  env: process.env,
+  platform: process.platform,
+  isPackaged: app.isPackaged
+})
 
 function hiddenWindowsChildOptions(options = {}) {
   if (!IS_WINDOWS || Object.prototype.hasOwnProperty.call(options, 'windowsHide')) {
@@ -148,6 +163,34 @@ if (REMOTE_DISPLAY_REASON) {
   console.log(
     `[hermes] remote display detected (${REMOTE_DISPLAY_REASON}); disabling GPU hardware acceleration to prevent flicker`
   )
+}
+
+for (const [name, value] of resolveWindowsGpuLaunchSwitches({
+  env: process.env,
+  platform: process.platform,
+  isPackaged: IS_PACKAGED
+})) {
+  if (value === undefined) {
+    app.commandLine.appendSwitch(name)
+  } else {
+    app.commandLine.appendSwitch(name, value)
+  }
+}
+
+for (const [name, value] of resolveWindowsRendererLaunchSwitches({
+  env: process.env,
+  platform: process.platform,
+  isPackaged: IS_PACKAGED
+})) {
+  if (value === undefined) {
+    app.commandLine.appendSwitch(name)
+  } else {
+    app.commandLine.appendSwitch(name, value)
+  }
+}
+
+if (DISABLE_RENDERER_SANDBOX) {
+  app.commandLine.appendSwitch('no-sandbox')
 }
 
 // Keep the renderer running at full speed while the window is in the background
@@ -297,6 +340,133 @@ const DESKTOP_UPDATE_CONFIG_PATH = path.join(app.getPath('userData'), 'updates.j
 // ~/.hermes/active_profile file. Unset (null) preserves the legacy behavior:
 // no --profile flag, so the backend honors active_profile / default.
 const DESKTOP_PROFILE_CONFIG_PATH = path.join(app.getPath('userData'), 'active-profile.json')
+const ENTERPRISE_AUTH_STORE_PATH = path.join(app.getPath('userData'), 'enterprise', 'desktop-auth.json')
+const ENTERPRISE_RUNTIME_OPTIONS = resolveEnterpriseRuntimeOptions(process.env)
+const enterpriseRuntime = createEnterpriseRuntime({
+  authStore: createEnterpriseAuthStore({
+    filePath: ENTERPRISE_AUTH_STORE_PATH,
+    safeStorage
+  }),
+  client: ENTERPRISE_RUNTIME_OPTIONS.gatewayUrl
+    ? createEnterpriseGatewayClient({ baseUrl: ENTERPRISE_RUNTIME_OPTIONS.gatewayUrl })
+    : null,
+  enabled: ENTERPRISE_RUNTIME_OPTIONS.enabled,
+  gatewayUrl: ENTERPRISE_RUNTIME_OPTIONS.gatewayUrl,
+  rememberLog,
+  userDataPath: app.getPath('userData')
+})
+
+function enterpriseAuthRequiredError() {
+  const error = new Error('Enterprise sign-in is required before starting Hermes.')
+  error.code = 'enterprise-auth-required'
+  error.authRequired = true
+  return error
+}
+
+function enterpriseAuthPending() {
+  return enterpriseRuntime.isEnabled() && !enterpriseRuntime.hasStoredSession()
+}
+
+function enterprisePendingApiResponse(request) {
+  if (!enterpriseAuthPending() || typeof request?.path !== 'string') {
+    return undefined
+  }
+
+  const method = String(request.method || 'GET').toUpperCase()
+  if (method !== 'GET') {
+    return { code: 'enterprise-auth-required', ok: false, authRequired: true }
+  }
+
+  let parsed
+  try {
+    parsed = new URL(request.path, 'http://enterprise-auth-pending.local')
+  } catch {
+    return { code: 'enterprise-auth-required', ok: false, authRequired: true }
+  }
+
+  const { pathname, searchParams } = parsed
+  const limit = Math.max(1, Number(searchParams.get('limit')) || 40)
+  const offset = Math.max(0, Number(searchParams.get('offset')) || 0)
+
+  if (pathname === '/api/sessions' || pathname === '/api/profiles/sessions') {
+    return { sessions: [], total: 0, offset, limit, profile_totals: {} }
+  }
+
+  if (pathname === '/api/sessions/search') {
+    return { results: [] }
+  }
+
+  if (pathname === '/api/status') {
+    const now = new Date().toISOString()
+    return {
+      active_sessions: 0,
+      config_path: '',
+      config_version: 0,
+      env_path: '',
+      gateway_exit_reason: null,
+      gateway_health_url: null,
+      gateway_pid: null,
+      gateway_platforms: {},
+      gateway_running: false,
+      gateway_state: 'enterprise-auth-required',
+      gateway_updated_at: now,
+      hermes_home: HERMES_HOME,
+      latest_config_version: 0,
+      release_date: '',
+      version: ''
+    }
+  }
+
+  if (pathname === '/api/config' || pathname === '/api/config/defaults') {
+    return {}
+  }
+
+  if (pathname === '/api/config/schema') {
+    return { fields: {} }
+  }
+
+  if (pathname === '/api/model/info') {
+    return { model: '', provider: '' }
+  }
+
+  if (pathname === '/api/model/options') {
+    return { providers: [] }
+  }
+
+  if (pathname === '/api/model/auxiliary') {
+    return { main: { model: '', provider: '' }, tasks: [] }
+  }
+
+  if (pathname === '/api/logs') {
+    return { file: '', lines: [] }
+  }
+
+  if (pathname === '/api/profiles') {
+    return { profiles: [] }
+  }
+
+  if (pathname === '/api/cron/jobs') {
+    return []
+  }
+
+  if (pathname === '/api/skills') {
+    return []
+  }
+
+  if (pathname === '/api/tools/toolsets') {
+    return []
+  }
+
+  if (pathname === '/api/messaging/platforms') {
+    return { platforms: [] }
+  }
+
+  if (pathname === '/api/env') {
+    return {}
+  }
+
+  return { code: 'enterprise-auth-required', ok: false, authRequired: true }
+}
 // Mirrors hermes_cli.profiles._PROFILE_ID_RE so we never hand the backend a
 // value its profile resolver would reject and exit on.
 const PROFILE_NAME_RE = /^[a-z0-9][a-z0-9_-]{0,63}$/
@@ -4610,6 +4780,10 @@ function primaryProfileKey() {
 // mode), and any OTHER profile to a lazily-spawned pool backend. An empty /
 // unknown profile resolves to the primary, so all legacy callers are unchanged.
 async function ensureBackend(profile) {
+  if (enterpriseAuthPending()) {
+    throw enterpriseAuthRequiredError()
+  }
+
   const key = profile && String(profile).trim() ? String(profile).trim() : primaryProfileKey()
 
   if (key === primaryProfileKey()) {
@@ -4880,9 +5054,17 @@ async function startHermes() {
 
   connectionPromise = (async () => {
     await advanceBootProgress('backend.resolve', 'Resolving Hermes backend', 8)
+    const enterpriseManaged = enterpriseRuntime.isEnabled()
+    let enterpriseLaunch = { enabled: false }
+
+    if (enterpriseManaged) {
+      await advanceBootProgress('enterprise.runtime', 'Preparing enterprise managed runtime', 18)
+      enterpriseLaunch = await enterpriseRuntime.prepareLaunch()
+    }
+
     // Resolve for the desktop's primary profile so a per-profile remote
     // override on the active profile is honored (falls back to env / global).
-    const remote = await resolveRemoteBackend(primaryProfileKey())
+    const remote = enterpriseManaged ? null : await resolveRemoteBackend(primaryProfileKey())
     if (remote) {
       await advanceBootProgress('backend.remote', `Connecting to remote Hermes backend at ${remote.baseUrl}`, 24)
       await waitForHermes(remote.baseUrl, remote.token)
@@ -4914,7 +5096,7 @@ async function startHermes() {
     // unset preference keeps the legacy launch so existing installs are
     // unaffected.
     const activeProfile = readActiveDesktopProfile()
-    if (activeProfile) {
+    if (!enterpriseManaged && activeProfile) {
       dashboardArgs.unshift('--profile', activeProfile)
     }
     await advanceBootProgress('backend.runtime', 'Resolving Hermes runtime', 28)
@@ -4932,6 +5114,7 @@ async function startHermes() {
         cwd: hermesCwd,
         env: {
           ...process.env,
+          ...backend.env,
           // Explicitly pin HERMES_HOME for the child so Python's get_hermes_home()
           // resolves to the SAME location our resolveHermesHome() picked. Without
           // this pin, Python falls back to ~/.hermes on every platform — fine on
@@ -4940,8 +5123,8 @@ async function startHermes() {
           // Mismatch would split config / sessions / .env / logs across two
           // directories. install.ps1 sets HERMES_HOME via setx; the desktop
           // can't reliably do that, so we set it inline for every spawn.
-          HERMES_HOME,
-          ...backend.env,
+          HERMES_HOME: enterpriseLaunch.hermesHome || HERMES_HOME,
+          ...(enterpriseLaunch.env || {}),
           TERMINAL_CWD: hermesCwd,
           HERMES_DASHBOARD_SESSION_TOKEN: token,
           // Marks this dashboard backend as desktop-spawned so it runs the cron
@@ -5033,6 +5216,11 @@ async function startHermes() {
       ...getWindowState()
     }
   })().catch(error => {
+    if (error?.authRequired || error?.code === 'enterprise-auth-required') {
+      connectionPromise = null
+      throw error
+    }
+
     const message = error instanceof Error ? error.message : String(error)
     updateBootProgress(
       {
@@ -5112,7 +5300,9 @@ function spawnSecondaryWindow({ sessionId, watch, newSession } = {}) {
     // themes/context.tsx, so the window appears already themed.
     show: false,
     backgroundColor: getWindowBackgroundColor(),
-    webPreferences: chatWindowWebPreferences(path.join(__dirname, 'preload.cjs'))
+    webPreferences: chatWindowWebPreferences(path.join(__dirname, 'preload.cjs'), {
+      sandbox: !DISABLE_RENDERER_SANDBOX
+    })
   })
 
   if (IS_MAC) {
@@ -5183,7 +5373,9 @@ function createWindow() {
     // both keep `backgroundThrottling: false` — the chat transcript streams via
     // a requestAnimationFrame-gated flush that Chromium pauses for blurred
     // windows, stalling the live answer until refocus. See session-windows.cjs.
-    webPreferences: chatWindowWebPreferences(path.join(__dirname, 'preload.cjs'))
+    webPreferences: chatWindowWebPreferences(path.join(__dirname, 'preload.cjs'), {
+      sandbox: !DISABLE_RENDERER_SANDBOX
+    })
   })
 
   if (IS_MAC) {
@@ -5268,9 +5460,26 @@ function createWindow() {
     restorePersistedZoomLevel(mainWindow)
     broadcastBootProgress()
     sendWindowStateChanged()
-    startHermes().catch(error => rememberLog(error.stack || error.message))
+    if (!enterpriseRuntime.isEnabled() || enterpriseRuntime.hasStoredSession()) {
+      startHermes().catch(error => rememberLog(error.stack || error.message))
+    }
   })
 }
+
+ipcMain.handle('hermes:enterprise:status', async () => enterpriseRuntime.getPublicState())
+ipcMain.handle('hermes:enterprise:refresh', async () => enterpriseRuntime.refreshPublicState())
+ipcMain.handle('hermes:enterprise:login', async (_event, payload) => {
+  const state = await enterpriseRuntime.login(payload || {})
+  bootstrapFailure = null
+  resetHermesConnection()
+  return state
+})
+ipcMain.handle('hermes:enterprise:selectModel', async (_event, model) => enterpriseRuntime.selectModel(model))
+ipcMain.handle('hermes:enterprise:logout', async () => {
+  const state = await enterpriseRuntime.logout()
+  await teardownPrimaryBackendAndWait()
+  return state
+})
 
 ipcMain.handle('hermes:connection', async (_event, profile) => ensureBackend(profile))
 // Reconnect-after-wake recovery. A REMOTE primary backend has no child process,
@@ -5406,12 +5615,20 @@ ipcMain.handle('hermes:connection-config:oauth-logout', async (_event, rawUrl) =
   return { ok: true, connected: baseUrl ? await hasLiveOauthSession(baseUrl) : false }
 })
 ipcMain.handle('hermes:connection-config:save', async (_event, payload) => {
+  if (enterpriseRuntime.isEnabled()) {
+    throw new Error('Gateway connection settings are locked by enterprise policy.')
+  }
+
   const config = coerceDesktopConnectionConfig(payload)
   writeDesktopConnectionConfig(config)
 
   return sanitizeDesktopConnectionConfig(config, payload?.profile)
 })
 ipcMain.handle('hermes:connection-config:apply', async (_event, payload) => {
+  if (enterpriseRuntime.isEnabled()) {
+    throw new Error('Gateway connection settings are locked by enterprise policy.')
+  }
+
   const config = coerceDesktopConnectionConfig(payload)
   writeDesktopConnectionConfig(config)
 
@@ -5589,6 +5806,11 @@ async function mergeRemoteProfileSessions(searchParams, remoteProfiles) {
 }
 
 ipcMain.handle('hermes:api', async (_event, request) => {
+  const pendingEnterpriseResponse = enterprisePendingApiResponse(request)
+  if (pendingEnterpriseResponse !== undefined) {
+    return pendingEnterpriseResponse
+  }
+
   // Remote-profile session requests would otherwise hit the local primary off
   // each profile's on-disk state.db — fine for local profiles, but a remote
   // profile's sessions live on its remote host, so the UI's IDs 404 (or mutations

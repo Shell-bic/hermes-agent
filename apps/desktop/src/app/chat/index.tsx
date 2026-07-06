@@ -23,7 +23,9 @@ import { quickModelOptions, sessionTitle, toRuntimeMessage } from '@/lib/chat-ru
 import { useIncrementalExternalStoreRuntime } from '@/lib/incremental-external-store-runtime'
 import { cn } from '@/lib/utils'
 import type { ComposerAttachment } from '@/store/composer'
+import { $enterprise } from '@/store/enterprise'
 import { $pinnedSessionIds } from '@/store/layout'
+import { enterpriseModelOptionsFromState, isEnterpriseModelManaged } from '@/store/model-visibility'
 import { $gatewaySwapTarget } from '@/store/profile'
 import {
   $activeSessionId,
@@ -290,6 +292,7 @@ export function ChatView({
   const currentCwd = useStore($currentCwd)
   const currentModel = useStore($currentModel)
   const currentProvider = useStore($currentProvider)
+  const enterprise = useStore($enterprise)
   const freshDraftReady = useStore($freshDraftReady)
   const gatewayState = useStore($gatewayState)
   const gatewaySwapTarget = useStore($gatewaySwapTarget)
@@ -307,6 +310,7 @@ export function ChatView({
   const resumeExhaustedSessionId = useStore($resumeExhaustedSessionId)
   const routedSessionId = routeSessionId(location.pathname)
   const isRoutedSessionView = Boolean(routedSessionId)
+  const enterpriseManaged = isEnterpriseModelManaged(enterprise)
 
   // The URL points at a session the store hasn't loaded yet (sidebar / cmd-K /
   // direct nav). Derived in render so the swap reads instantly: the same frame
@@ -354,12 +358,17 @@ export function ChatView({
 
       return gateway.request<ModelOptionsResponse>('model.options', { session_id: activeSessionId })
     },
-    enabled: gatewayOpen
+    enabled: gatewayOpen && !enterpriseManaged
   })
 
+  const modelOptions = useMemo(
+    () => (enterpriseManaged ? enterpriseModelOptionsFromState(enterprise) : modelOptionsQuery.data),
+    [enterprise, enterpriseManaged, modelOptionsQuery.data]
+  )
+
   const quickModels = useMemo(
-    () => quickModelOptions(modelOptionsQuery.data, currentProvider, currentModel),
-    [currentModel, currentProvider, modelOptionsQuery.data]
+    () => quickModelOptions(modelOptions, currentProvider, currentModel),
+    [currentModel, currentProvider, modelOptions]
   )
 
   const chatBarState = useMemo<ChatBarState>(

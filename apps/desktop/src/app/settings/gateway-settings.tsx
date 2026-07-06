@@ -7,6 +7,7 @@ import type { DesktopAuthProvider, DesktopConnectionProbeResult } from '@/global
 import { useI18n } from '@/i18n'
 import { AlertCircle, Check, FileText, Globe, Loader2, LogIn, Monitor } from '@/lib/icons'
 import { cn } from '@/lib/utils'
+import { $enterprise } from '@/store/enterprise'
 import { notify, notifyError } from '@/store/notifications'
 import { $profiles, refreshActiveProfile } from '@/store/profile'
 
@@ -95,6 +96,27 @@ function ScopeChip({ active, label, onSelect }: { active: boolean; label: string
 }
 
 export function GatewaySettings() {
+  const enterprise = useStore($enterprise)
+
+  if (enterprise.enabled && enterprise.authenticated) {
+    return (
+      <SettingsContent>
+        <div className="grid min-h-48 place-items-center px-4 py-8 text-center">
+          <div>
+            <div className="text-sm font-medium">企业受管模式</div>
+            <div className="mt-2 max-w-xl text-xs leading-5 text-muted-foreground">
+              网关连接、远程地址、登录方式和 token 由企业策略统一下发，桌面端普通用户不能改写或绕过。
+            </div>
+          </div>
+        </div>
+      </SettingsContent>
+    )
+  }
+
+  return <GatewaySettingsInner />
+}
+
+function GatewaySettingsInner() {
   const { t } = useI18n()
   const g = t.settings.gateway
   const [loading, setLoading] = useState(true)

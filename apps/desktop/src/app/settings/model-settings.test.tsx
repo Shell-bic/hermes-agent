@@ -1,6 +1,9 @@
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 
+import { $enterprise, INITIAL_ENTERPRISE_STATE } from '@/store/enterprise'
+import { $sessions, setSessions } from '@/store/session'
+
 // Radix Select calls scrollIntoView on its items when the content opens; jsdom
 // doesn't implement it (nor hasPointerCapture / releasePointerCapture), so stub
 // them to let the dropdown open in tests.
@@ -19,6 +22,7 @@ const setEnvVar = vi.fn()
 const getHermesConfigRecord = vi.fn()
 const saveHermesConfig = vi.fn()
 const startManualProviderOAuth = vi.fn()
+const enterpriseLogout = vi.fn()
 
 vi.mock('@/hermes', () => ({
   getGlobalModelInfo: () => getGlobalModelInfo(),
@@ -36,6 +40,13 @@ vi.mock('@/store/onboarding', () => ({
 }))
 
 beforeEach(() => {
+  $enterprise.set(INITIAL_ENTERPRISE_STATE)
+  setSessions([])
+  ;(window as { hermesDesktop?: unknown }).hermesDesktop = {
+    enterprise: {
+      logout: enterpriseLogout
+    }
+  }
   getGlobalModelInfo.mockResolvedValue({ provider: 'nous', model: 'hermes-4' })
   getGlobalModelOptions.mockResolvedValue({
     providers: [
@@ -59,10 +70,12 @@ beforeEach(() => {
   setEnvVar.mockResolvedValue({ ok: true })
   getHermesConfigRecord.mockResolvedValue({ agent: { reasoning_effort: 'medium', service_tier: 'normal' } })
   saveHermesConfig.mockResolvedValue({ ok: true })
+  enterpriseLogout.mockResolvedValue({ ...INITIAL_ENTERPRISE_STATE, enabled: true, status: 'unauthenticated' })
 })
 
 afterEach(() => {
   cleanup()
+  delete (window as { hermesDesktop?: unknown }).hermesDesktop
   vi.clearAllMocks()
 })
 
@@ -85,10 +98,102 @@ describe('ModelSettings', () => {
     fireEvent.click(triggers[0])
 
     // "Nous" shows in both the trigger and the open list; the unconfigured
-    // provider + its setup hint are the unique signal of the full universe.
+    // provider is the unique signal of the full universe.
     expect((await screen.findAllByText('Nous')).length).toBeGreaterThan(0)
     expect(await screen.findByText(/DeepSeek/)).toBeTruthy()
-    expect(await screen.findByText(/set up/)).toBeTruthy()
+  })
+
+  it('shows enterprise model policy as read-only without loading Hermes model APIs', async () => {
+    $enterprise.set({
+      ...INITIAL_ENTERPRISE_STATE,
+      authenticated: true,
+      enabled: true,
+      status: 'authenticated',
+      allowedModels: ['kimi-k2'],
+      currentModel: 'kimi-k2',
+      defaultModel: 'kimi-k2',
+      policyVersion: 'v1',
+      capabilities: { reasoning: true, context: 128000 },
+      runtimeDefaults: { serviceTier: 'fast' },
+      auxiliaryPolicy: { compression: 'follow-main' },
+      modelProfiles: [
+        {
+          id: 'profile-1',
+          name: 'Kimi K2',
+          displayName: '企业 Kimi K2',
+          model: 'kimi-k2',
+          apiFormat: 'openai-chat',
+          isDefault: true
+        }
+      ],
+      currentModelProfileId: 'profile-1'
+    })
+
+    await renderModelSettings()
+
+    expect(await screen.findByText('企业模型配置')).toBeTruthy()
+    expect((await screen.findAllByText('企业 Kimi K2')).length).toBeGreaterThan(0)
+    expect(screen.queryByRole('button', { name: 'Apply' })).toBeNull()
+    expect(getGlobalModelInfo).not.toHaveBeenCalled()
+    expect(getGlobalModelOptions).not.toHaveBeenCalled()
+    expect(getAuxiliaryModels).not.toHaveBeenCalled()
+  })
+
+  it('logs out from the enterprise account after confirmation', async () => {
+    let resolveLogout: (value: unknown) => void = () => undefined
+    enterpriseLogout.mockReturnValueOnce(
+      new Promise(resolve => {
+        resolveLogout = resolve
+      })
+    )
+    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(true)
+    $enterprise.set({
+      ...INITIAL_ENTERPRISE_STATE,
+      authenticated: true,
+      enabled: true,
+      status: 'authenticated',
+      currentModel: 'kimi-k2',
+      defaultModel: 'kimi-k2',
+      lockedSurfaces: ['models'],
+      modelProfiles: [],
+      user: { userName: 'view' }
+    })
+
+    await renderModelSettings()
+    setSessions(() => [{ id: 'other-user-session', title: 'Other user session' } as never])
+
+    expect(await screen.findByText('view')).toBeTruthy()
+    const logoutButton = await screen.findByRole('button', { name: '退出企业账号' })
+    fireEvent.click(logoutButton)
+
+    expect(confirm).toHaveBeenCalledWith(expect.stringContaining('确定退出吗'))
+    expect(enterpriseLogout).toHaveBeenCalledTimes(1)
+    expect((await screen.findByRole('button', { name: /退出中/ }) as HTMLButtonElement).disabled).toBe(true)
+
+    resolveLogout({ ...INITIAL_ENTERPRISE_STATE, enabled: true, status: 'unauthenticated' })
+    await waitFor(() => expect($enterprise.get().authenticated).toBe(false))
+    expect($sessions.get()).toEqual([])
+  })
+
+  it('does not log out when the enterprise sign-out confirmation is cancelled', async () => {
+    vi.spyOn(window, 'confirm').mockReturnValue(false)
+    $enterprise.set({
+      ...INITIAL_ENTERPRISE_STATE,
+      authenticated: true,
+      enabled: true,
+      status: 'authenticated',
+      currentModel: 'kimi-k2',
+      defaultModel: 'kimi-k2',
+      lockedSurfaces: ['models'],
+      modelProfiles: [],
+      user: { userName: 'view' }
+    })
+
+    await renderModelSettings()
+    fireEvent.click(await screen.findByRole('button', { name: '退出企业账号' }))
+
+    expect(enterpriseLogout).not.toHaveBeenCalled()
+    expect($enterprise.get().authenticated).toBe(true)
   })
 
   it('activates an unconfigured api_key provider inline by saving its key', async () => {

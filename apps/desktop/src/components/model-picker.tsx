@@ -1,3 +1,4 @@
+import { useStore } from '@nanostores/react'
 import { useQuery } from '@tanstack/react-query'
 import { useState } from 'react'
 
@@ -8,6 +9,12 @@ import type { ModelOptionProvider, ModelOptionsResponse, ModelPricing } from '@/
 import type { HermesGateway } from '../hermes'
 import { getGlobalModelOptions } from '../hermes'
 import { cn } from '../lib/utils'
+import { $enterprise } from '../store/enterprise'
+import {
+  enterpriseModelDisplayName,
+  enterpriseModelOptionsFromState,
+  isEnterpriseModelManaged
+} from '../store/model-visibility'
 import { startManualOnboarding } from '../store/onboarding'
 
 import { InlineNotice } from './notifications'
@@ -45,6 +52,8 @@ export function ModelPickerDialog({
 }: ModelPickerDialogProps) {
   const { t } = useI18n()
   const copy = t.modelPicker
+  const enterprise = useStore($enterprise)
+  const enterpriseManaged = isEnterpriseModelManaged(enterprise)
   // Own the search term so we can filter manually. cmdk's built-in
   // shouldFilter reorders items by its fuzzy-match score (≈alphabetical with
   // an empty query), which destroys the backend's curated order. We disable
@@ -63,24 +72,26 @@ export function ModelPickerDialog({
 
       return getGlobalModelOptions()
     },
-    enabled: open
+    enabled: open && !enterpriseManaged
   })
 
-  const providers = modelOptions.data?.providers ?? []
+  const options = enterpriseManaged ? enterpriseModelOptionsFromState(enterprise) : modelOptions.data
+  const providers = options?.providers ?? []
 
   const { model: optionsModel, provider: optionsProvider } = currentPickerSelection(
     !!sessionId,
     { model: currentModel, provider: currentProvider },
-    modelOptions.data
+    options
   )
 
-  const loading = modelOptions.isPending && !modelOptions.data
+  const loading = !enterpriseManaged && modelOptions.isPending && !modelOptions.data
 
-  const error = modelOptions.error
-    ? modelOptions.error instanceof Error
-      ? modelOptions.error.message
-      : String(modelOptions.error)
-    : null
+  const error =
+    !enterpriseManaged && modelOptions.error
+      ? modelOptions.error instanceof Error
+        ? modelOptions.error.message
+        : String(modelOptions.error)
+      : null
 
   const selectModel = (provider: ModelOptionProvider, model: string) => {
     onSelect({ provider: provider.slug, model })
@@ -108,18 +119,14 @@ export function ModelPickerDialog({
         </DialogHeader>
 
         <Command className="rounded-none bg-card" shouldFilter={false}>
-          <CommandInput
-            autoFocus
-            onValueChange={setSearch}
-            placeholder={copy.search}
-            value={search}
-          />
+          <CommandInput autoFocus onValueChange={setSearch} placeholder={copy.search} value={search} />
           <CommandList className="max-h-96">
             {!loading && !error && <CommandEmpty>{copy.noModels}</CommandEmpty>}
             <ModelResults
               currentModel={optionsModel || currentModel}
               currentProvider={optionsProvider || currentProvider}
               error={error}
+              getModelLabel={model => enterpriseModelDisplayName(enterprise, model)}
               loading={loading}
               onSelectModel={selectModel}
               providers={providers}
@@ -129,9 +136,11 @@ export function ModelPickerDialog({
         </Command>
 
         <DialogFooter className="flex-row items-center justify-end gap-2 bg-card p-3">
-          <Button onClick={addProvider} variant="ghost">
-            {copy.addProvider}
-          </Button>
+          {!enterpriseManaged && (
+            <Button onClick={addProvider} variant="ghost">
+              {copy.addProvider}
+            </Button>
+          )}
           <Button onClick={() => onOpenChange(false)} variant="outline">
             {t.common.cancel}
           </Button>
@@ -147,6 +156,7 @@ function ModelResults({
   providers,
   currentModel,
   currentProvider,
+  getModelLabel,
   onSelectModel,
   search
 }: {
@@ -155,6 +165,7 @@ function ModelResults({
   providers: ModelOptionProvider[]
   currentModel: string
   currentProvider: string
+  getModelLabel: (model: string) => string
   onSelectModel: (provider: ModelOptionProvider, model: string) => void
   search: string
 }) {
@@ -184,6 +195,7 @@ function ModelResults({
   const matches = (provider: ModelOptionProvider, model: string) =>
     !q ||
     model.toLowerCase().includes(q) ||
+    getModelLabel(model).toLowerCase().includes(q) ||
     provider.name.toLowerCase().includes(q) ||
     provider.slug.toLowerCase().includes(q)
 
@@ -235,8 +247,10 @@ function ModelResults({
                   }}
                   value={`${provider.slug}:${model}`}
                 >
-                  <span className="min-w-0 flex-1 truncate">{model}</span>
-                  {locked && <span className="shrink-0 text-[0.62rem] uppercase tracking-wide opacity-80">{copy.pro}</span>}
+                  <span className="min-w-0 flex-1 truncate">{getModelLabel(model)}</span>
+                  {locked && (
+                    <span className="shrink-0 text-[0.62rem] uppercase tracking-wide opacity-80">{copy.pro}</span>
+                  )}
                   <ModelPrice isCurrent={isCurrent} price={price} />
                 </CommandItem>
               )

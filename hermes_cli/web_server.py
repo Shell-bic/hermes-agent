@@ -62,6 +62,24 @@ from hermes_cli.config import (
     recommended_update_command_for_method,
     redact_key,
 )
+from hermes_cli.enterprise_policy import (
+    ENTERPRISE_PROVIDER,
+    EnterprisePolicyDenied,
+    allowed_model_profiles,
+    auxiliary_policy as enterprise_auxiliary_policy,
+    capabilities as enterprise_capabilities,
+    current_model as enterprise_current_model,
+    default_model as enterprise_default_model,
+    is_enterprise_managed,
+    load_enterprise_policy,
+    managed_model_option_provider,
+    model_display_name as enterprise_model_display_name,
+    runtime_defaults as enterprise_runtime_defaults,
+    require_env_write_allowed,
+    require_model_allowed,
+    require_model_config_write_allowed,
+    require_surface_allowed,
+)
 from gateway.status import (
     get_running_pid,
     get_runtime_status_running_pid,
@@ -201,6 +219,48 @@ _DASHBOARD_EMBEDDED_CHAT_ENABLED = True
 _reveal_timestamps: List[float] = []
 _REVEAL_MAX_PER_WINDOW = 5
 _REVEAL_WINDOW_SECONDS = 30
+
+
+def _enterprise_forbidden(exc: EnterprisePolicyDenied) -> HTTPException:
+    return HTTPException(status_code=403, detail=str(exc))
+
+
+def _require_enterprise_surface(
+    surface: str,
+    *,
+    action: Optional[str] = None,
+    capability: Optional[str] = None,
+) -> None:
+    try:
+        require_surface_allowed(surface, action=action, capability=capability)
+    except EnterprisePolicyDenied as exc:
+        raise _enterprise_forbidden(exc) from exc
+
+
+def _require_enterprise_model(model: str, action: str = "model selection") -> None:
+    try:
+        require_model_allowed(model, action=action)
+    except EnterprisePolicyDenied as exc:
+        raise _enterprise_forbidden(exc) from exc
+
+
+def _require_enterprise_env_write(key: str) -> None:
+    try:
+        require_env_write_allowed(key, OPTIONAL_ENV_VARS.get(str(key or "").strip()))
+    except EnterprisePolicyDenied as exc:
+        raise _enterprise_forbidden(exc) from exc
+
+
+def _require_enterprise_model_config_write(
+    current: Dict[str, Any],
+    proposed: Dict[str, Any],
+    *,
+    action: str,
+) -> None:
+    try:
+        require_model_config_write_allowed(current, proposed, action=action)
+    except EnterprisePolicyDenied as exc:
+        raise _enterprise_forbidden(exc) from exc
 
 # CORS: restrict to localhost origins only.  The web UI is intended to run
 # locally; binding to 0.0.0.0 with allow_origins=["*"] would let any website
@@ -788,6 +848,8 @@ def _normalize_main_model_assignment(provider: str, model: str) -> tuple[str, st
 
     prov_in = (provider or "").strip()
     model_in = (model or "").strip()
+    if prov_in.lower() == "company-gateway":
+        return prov_in, model_in
     canonical = normalize_provider(prov_in)
 
     if canonical not in _KNOWN_PROVIDER_NAMES and "/" in model_in:
@@ -3117,6 +3179,95 @@ _EMPTY_MODEL_INFO: dict = {
 }
 
 
+def _enterprise_context_length(caps: Dict[str, Any], defaults: Dict[str, Any]) -> int:
+    for source in (caps, defaults):
+        for key in ("context_window", "contextWindow", "context_length", "contextLength"):
+            value = source.get(key)
+            if isinstance(value, int) and value > 0:
+                return value
+            if isinstance(value, str) and value.isdigit():
+                return int(value)
+    return 0
+
+
+def _enterprise_model_info_payload() -> Dict[str, Any]:
+    policy = load_enterprise_policy()
+    model = enterprise_current_model(policy) or enterprise_default_model(policy)
+    default = enterprise_default_model(policy)
+    caps = enterprise_capabilities(policy, model)
+    defaults = enterprise_runtime_defaults(policy, model)
+    context_length = _enterprise_context_length(caps, defaults)
+    return {
+        "model": model,
+        "provider": ENTERPRISE_PROVIDER,
+        "default_model": default,
+        "current_model": model,
+        "display_name": enterprise_model_display_name(model, policy),
+        "auto_context_length": context_length,
+        "config_context_length": 0,
+        "effective_context_length": context_length,
+        "capabilities": caps,
+        "runtimeDefaults": defaults,
+        "auxiliaryPolicy": enterprise_auxiliary_policy(policy, model),
+        "modelProfiles": allowed_model_profiles(policy),
+        "managed": True,
+    }
+
+
+def _enterprise_model_options_payload() -> Dict[str, Any]:
+    policy = load_enterprise_policy()
+    current = enterprise_current_model(policy) or enterprise_default_model(policy)
+    provider = managed_model_option_provider(policy)
+    return {
+        "model": current,
+        "provider": ENTERPRISE_PROVIDER,
+        "providers": [provider] if provider.get("models") else [],
+        "modelProfiles": allowed_model_profiles(policy),
+        "managed": True,
+    }
+
+
+def _reject_enterprise_model_set(reason: str) -> None:
+    raise HTTPException(
+        status_code=403,
+        detail=f"Enterprise managed policy denied /api/model/set: {reason}",
+    )
+
+
+def _apply_enterprise_model_assignment(scope: str, provider: str, model: str, task: str, base_url: str, api_key: str) -> Dict[str, Any]:
+    provider_norm = provider.strip().lower()
+    if provider_norm != ENTERPRISE_PROVIDER:
+        _reject_enterprise_model_set("provider is controlled by enterprise policy")
+    if base_url or api_key:
+        _reject_enterprise_model_set("custom endpoints and API keys are controlled by enterprise policy")
+    if scope != "main":
+        _reject_enterprise_model_set("auxiliary models are controlled by enterprise auxiliaryPolicy")
+    if task:
+        _reject_enterprise_model_set("task-specific model assignment is controlled by enterprise auxiliaryPolicy")
+    if not model:
+        raise HTTPException(status_code=400, detail="model required for main")
+
+    _require_enterprise_model(model, action="/api/model/set")
+    cfg = load_config()
+    model_cfg = cfg.get("model", {})
+    if not isinstance(model_cfg, dict):
+        model_cfg = {}
+    model_cfg["provider"] = ENTERPRISE_PROVIDER
+    model_cfg["default"] = model
+    model_cfg.pop("base_url", None)
+    model_cfg.pop("api_key", None)
+    model_cfg.pop("api", None)
+    cfg["model"] = model_cfg
+    save_config(cfg)
+    return {
+        "ok": True,
+        "scope": "main",
+        "provider": ENTERPRISE_PROVIDER,
+        "model": model,
+        "managed": True,
+    }
+
+
 @app.get("/api/model/info")
 def get_model_info(profile: Optional[str] = None):
     """Return resolved model metadata for the currently configured model.
@@ -3126,6 +3277,9 @@ def get_model_info(profile: Optional[str] = None):
     Also returns model capabilities (vision, reasoning, tools) when available.
     """
     try:
+        if is_enterprise_managed():
+            return _enterprise_model_info_payload()
+
         with _profile_scope(profile):
             cfg = load_config()
         model_cfg = cfg.get("model", "")
@@ -3236,6 +3390,9 @@ def get_model_options(profile: Optional[str] = None):
     reads the SAME profile /api/model/set writes.
     """
     try:
+        if is_enterprise_managed():
+            return _enterprise_model_options_payload()
+
         from hermes_cli.inventory import build_models_payload, load_picker_context
 
         # include_unconfigured + picker_hints + canonical_order mirror the
@@ -3278,6 +3435,15 @@ def get_recommended_default_model(provider: str = ""):
     empty if nothing could be resolved (caller degrades gracefully).
     """
     slug = (provider or "").strip().lower()
+
+    if is_enterprise_managed():
+        policy = load_enterprise_policy()
+        return {
+            "provider": ENTERPRISE_PROVIDER,
+            "model": enterprise_default_model(policy),
+            "free_tier": None,
+            "managed": True,
+        }
 
     if slug == "nous":
         try:
@@ -3353,6 +3519,20 @@ def get_auxiliary_models(profile: Optional[str] = None):
     selected profile's (read/write asymmetry).
     """
     try:
+        if is_enterprise_managed():
+            policy = load_enterprise_policy()
+            model = enterprise_current_model(policy) or enterprise_default_model(policy)
+            aux_policy = enterprise_auxiliary_policy(policy, model)
+            return {
+                "policy": aux_policy,
+                "auxiliaryPolicy": aux_policy,
+                "tasks": [],
+                "main": {"provider": ENTERPRISE_PROVIDER, "model": model},
+                "provider": ENTERPRISE_PROVIDER,
+                "model": model,
+                "managed": True,
+            }
+
         with _profile_scope(profile):
             cfg = load_config()
         aux_cfg = cfg.get("auxiliary", {})
@@ -3403,6 +3583,20 @@ async def set_model_assignment(body: ModelAssignment, profile: Optional[str] = N
 
     if scope not in {"main", "auxiliary"}:
         raise HTTPException(status_code=400, detail="scope must be 'main' or 'auxiliary'")
+
+    if is_enterprise_managed():
+        return await asyncio.to_thread(
+            _apply_enterprise_model_assignment,
+            scope,
+            provider,
+            model,
+            task,
+            base_url,
+            api_key,
+        )
+
+    if model:
+        _require_enterprise_model(model, action="/api/model/set")
 
     try:
         # Expensive-model warning runs BEFORE the profile scope is entered:
@@ -3462,6 +3656,7 @@ def _apply_model_assignment_sync(
         if not provider or not model:
             raise HTTPException(status_code=400, detail="provider and model required for main")
         provider, model = _normalize_main_model_assignment(provider, model)
+        _require_enterprise_model(model, action="/api/model/set")
         model_cfg = _apply_main_model_assignment(
             cfg.get("model", {}), provider, model, base_url, api_key
         )
@@ -3659,7 +3854,14 @@ def _denormalize_config_from_web(config: Dict[str, Any]) -> Dict[str, Any]:
 async def update_config(body: ConfigUpdate, profile: Optional[str] = None):
     try:
         with _profile_scope(body.profile or profile):
-            save_config(_denormalize_config_from_web(body.config))
+            current = load_config()
+            proposed = _denormalize_config_from_web(body.config)
+            _require_enterprise_model_config_write(
+                current,
+                proposed,
+                action="/api/config",
+            )
+            save_config(proposed)
         return {"ok": True}
     except HTTPException:
         raise
@@ -3696,9 +3898,12 @@ async def get_env_vars(profile: Optional[str] = None):
 @app.put("/api/env")
 async def set_env_var(body: EnvVarUpdate, profile: Optional[str] = None):
     try:
+        _require_enterprise_env_write(body.key)
         with _profile_scope(body.profile or profile):
             save_env_value(body.key, body.value)
         return {"ok": True, "key": body.key}
+    except HTTPException:
+        raise
     except ValueError as exc:
         # save_env_value raises ValueError for invalid names and for keys
         # on the denylist (LD_PRELOAD, PATH, PYTHONPATH, …). Surface the
@@ -3815,6 +4020,7 @@ async def validate_provider_credential(body: EnvVarUpdate, request: Request):
 @app.delete("/api/env")
 async def remove_env_var(body: EnvVarDelete, profile: Optional[str] = None):
     try:
+        _require_enterprise_env_write(body.key)
         with _profile_scope(body.profile or profile):
             removed = remove_env_value(body.key)
         if not removed:
@@ -7135,6 +7341,7 @@ async def list_cron_job_runs(job_id: str, profile: Optional[str] = None, limit: 
 
 @app.post("/api/cron/jobs")
 async def create_cron_job(body: CronJobCreate, profile: str = "default"):
+    _require_enterprise_surface("cron", action="/api/cron/jobs", capability="cron.manage")
     try:
         return _call_cron_for_profile(
             profile,
@@ -7180,6 +7387,7 @@ async def get_cron_delivery_targets():
 
 @app.put("/api/cron/jobs/{job_id}")
 async def update_cron_job(job_id: str, body: CronJobUpdate, profile: Optional[str] = None):
+    _require_enterprise_surface("cron", action="/api/cron/jobs", capability="cron.manage")
     selected = profile or _find_cron_job_profile(job_id)
     if not selected:
         raise HTTPException(status_code=404, detail="Job not found")
@@ -7194,6 +7402,7 @@ async def update_cron_job(job_id: str, body: CronJobUpdate, profile: Optional[st
 
 @app.post("/api/cron/jobs/{job_id}/pause")
 async def pause_cron_job(job_id: str, profile: Optional[str] = None):
+    _require_enterprise_surface("cron", action="/api/cron/jobs/pause", capability="cron.manage")
     selected = profile or _find_cron_job_profile(job_id)
     if not selected:
         raise HTTPException(status_code=404, detail="Job not found")
@@ -7205,6 +7414,7 @@ async def pause_cron_job(job_id: str, profile: Optional[str] = None):
 
 @app.post("/api/cron/jobs/{job_id}/resume")
 async def resume_cron_job(job_id: str, profile: Optional[str] = None):
+    _require_enterprise_surface("cron", action="/api/cron/jobs/resume", capability="cron.manage")
     selected = profile or _find_cron_job_profile(job_id)
     if not selected:
         raise HTTPException(status_code=404, detail="Job not found")
@@ -7216,6 +7426,7 @@ async def resume_cron_job(job_id: str, profile: Optional[str] = None):
 
 @app.post("/api/cron/jobs/{job_id}/trigger")
 async def trigger_cron_job(job_id: str, profile: Optional[str] = None):
+    _require_enterprise_surface("cron", action="/api/cron/jobs/trigger", capability="cron.manage")
     selected = profile or _find_cron_job_profile(job_id)
     if not selected:
         raise HTTPException(status_code=404, detail="Job not found")
@@ -7227,6 +7438,7 @@ async def trigger_cron_job(job_id: str, profile: Optional[str] = None):
 
 @app.delete("/api/cron/jobs/{job_id}")
 async def delete_cron_job(job_id: str, profile: Optional[str] = None):
+    _require_enterprise_surface("cron", action="/api/cron/jobs", capability="cron.manage")
     selected = profile or _find_cron_job_profile(job_id)
     if not selected:
         raise HTTPException(status_code=404, detail="Job not found")
@@ -7286,6 +7498,7 @@ async def list_cron_blueprints():
 @app.post("/api/cron/blueprints/instantiate")
 async def instantiate_blueprint(body: AutomationBlueprintInstantiate, profile: str = "default"):
     """Fill a blueprint's slots and create the cron job (form-submit path)."""
+    _require_enterprise_surface("cron", action="/api/cron/blueprints/instantiate", capability="cron.manage")
     try:
         from cron.blueprint_catalog import fill_blueprint, get_blueprint, BlueprintFillError
 
@@ -7372,6 +7585,7 @@ async def list_mcp_servers(profile: Optional[str] = None):
 
 @app.post("/api/mcp/servers")
 async def add_mcp_server(body: MCPServerCreate, profile: Optional[str] = None):
+    _require_enterprise_surface("mcp", action="/api/mcp/servers", capability="mcp.manage")
     from hermes_cli.mcp_config import _get_mcp_servers, _save_mcp_server
 
     name = (body.name or "").strip()
@@ -7417,6 +7631,7 @@ async def add_mcp_server(body: MCPServerCreate, profile: Optional[str] = None):
 
 @app.delete("/api/mcp/servers/{name}")
 async def remove_mcp_server(name: str, profile: Optional[str] = None):
+    _require_enterprise_surface("mcp", action="/api/mcp/servers", capability="mcp.manage")
     from hermes_cli.mcp_config import _remove_mcp_server
 
     with _profile_scope(profile):
@@ -7481,6 +7696,7 @@ async def set_mcp_server_enabled(
     flag the agent reads at startup.  Disabled servers stay in config so they
     can be re-enabled without re-entering their settings.
     """
+    _require_enterprise_surface("mcp", action="/api/mcp/servers/enabled", capability="mcp.manage")
     with _profile_scope(body.profile or profile):
         cfg = load_config()
         servers = cfg.get("mcp_servers")
@@ -7569,6 +7785,7 @@ async def install_mcp_catalog_entry(body: MCPCatalogInstall, profile: Optional[s
     Entries that need a git bootstrap (``needs_install``) are installed via
     the CLI action path because the clone can take time.
     """
+    _require_enterprise_surface("mcp", action="/api/mcp/catalog/install", capability="mcp.manage")
     from hermes_cli import mcp_catalog
 
     name = (body.name or "").strip()
@@ -7758,6 +7975,7 @@ async def list_webhooks():
 
 @app.post("/api/webhooks/enable")
 async def enable_webhooks():
+    _require_enterprise_surface("webhooks", action="/api/webhooks/enable", capability="webhooks.manage")
     try:
         _write_platform_enabled("webhook", True)
     except Exception as exc:
@@ -7779,6 +7997,7 @@ async def enable_webhooks():
 
 @app.post("/api/webhooks")
 async def create_webhook(body: WebhookCreate):
+    _require_enterprise_surface("webhooks", action="/api/webhooks", capability="webhooks.manage")
     import re as _re
     import secrets as _secrets
     import time as _time
@@ -7831,6 +8050,7 @@ async def create_webhook(body: WebhookCreate):
 
 @app.delete("/api/webhooks/{name}")
 async def delete_webhook(name: str):
+    _require_enterprise_surface("webhooks", action="/api/webhooks", capability="webhooks.manage")
     import hermes_cli.webhook as wh
 
     key = (name or "").strip().lower()
@@ -7855,6 +8075,7 @@ async def set_webhook_enabled(name: str, body: WebhookEnabledToggle):
     gateway hot-reloads the subscriptions file, so this takes effect on the
     next event without a restart.
     """
+    _require_enterprise_surface("webhooks", action="/api/webhooks/enabled", capability="webhooks.manage")
     import hermes_cli.webhook as wh
 
     key = (name or "").strip().lower()
@@ -7966,6 +8187,7 @@ async def list_credential_pool():
 
 @app.post("/api/credentials/pool")
 async def add_credential_pool_entry(body: CredentialPoolAdd):
+    _require_enterprise_surface("credentials", action="/api/credentials/pool", capability="credentials.manage")
     import uuid as _uuid
     from agent.credential_pool import (
         load_pool,
@@ -8001,6 +8223,7 @@ async def add_credential_pool_entry(body: CredentialPoolAdd):
 @app.delete("/api/credentials/pool/{provider}/{index}")
 async def remove_credential_pool_entry(provider: str, index: int):
     """Remove a pool entry.  ``index`` is 1-based (matches the list response)."""
+    _require_enterprise_surface("credentials", action="/api/credentials/pool", capability="credentials.manage")
     from agent.credential_pool import load_pool
 
     provider = (provider or "").strip().lower()
@@ -8073,6 +8296,7 @@ async def get_memory_status():
 
 @app.put("/api/memory/provider")
 async def set_memory_provider(body: MemoryProviderSelect):
+    _require_enterprise_surface("memory", action="/api/memory/provider", capability="memory.manage")
     provider = (body.provider or "").strip()
     if provider.lower() in {"built-in", "builtin", "none"}:
         provider = ""
@@ -8097,6 +8321,7 @@ async def set_memory_provider(body: MemoryProviderSelect):
 
 @app.post("/api/memory/reset")
 async def reset_memory(body: MemoryReset):
+    _require_enterprise_surface("memory", action="/api/memory/reset", capability="memory.manage")
     target = (body.target or "all").strip().lower()
     if target not in {"all", "memory", "user"}:
         raise HTTPException(status_code=400, detail="target must be all, memory, or user")
@@ -8434,6 +8659,7 @@ def _profile_cli_args(profile: Optional[str]) -> List[str]:
 
 @app.post("/api/skills/hub/install")
 async def install_skill_hub(body: SkillInstallRequest, profile: Optional[str] = None):
+    _require_enterprise_surface("skills", action="/api/skills/hub/install", capability="skills.manage")
     identifier = (body.identifier or "").strip()
     if not identifier:
         raise HTTPException(status_code=400, detail="identifier is required")
@@ -8458,6 +8684,7 @@ class SkillUninstallRequest(BaseModel):
 
 @app.post("/api/skills/hub/uninstall")
 async def uninstall_skill_hub(body: SkillUninstallRequest, profile: Optional[str] = None):
+    _require_enterprise_surface("skills", action="/api/skills/hub/uninstall", capability="skills.manage")
     name = (body.name or "").strip()
     if not name:
         raise HTTPException(status_code=400, detail="name is required")
@@ -8482,6 +8709,7 @@ class SkillsUpdateRequest(BaseModel):
 async def update_skills_hub(
     body: Optional[SkillsUpdateRequest] = None, profile: Optional[str] = None
 ):
+    _require_enterprise_surface("skills", action="/api/skills/hub/update", capability="skills.manage")
     try:
         effective = (body.profile if body else None) or profile
         proc = _spawn_hermes_action(
@@ -9566,6 +9794,7 @@ async def get_skills(profile: Optional[str] = None):
 
 @app.put("/api/skills/toggle")
 async def toggle_skill(body: SkillToggle, profile: Optional[str] = None):
+    _require_enterprise_surface("skills", action="/api/skills/toggle", capability="skills.manage")
     from hermes_cli.skills_config import get_disabled_skills, save_disabled_skills
     with _profile_scope(body.profile or profile):
         config = load_config()
@@ -9632,6 +9861,7 @@ async def create_skill(body: SkillCreate):
     optional security scan) — but bypasses the agent write-approval gate:
     a write from the authenticated dashboard IS the user acting directly.
     """
+    _require_enterprise_surface("skills", action="/api/skills", capability="skills.manage")
     from tools.skill_manager_tool import _create_skill
 
     with _profile_scope(body.profile):
@@ -9645,6 +9875,7 @@ async def create_skill(body: SkillCreate):
 @app.put("/api/skills/content")
 async def update_skill_content(body: SkillContentUpdate):
     """Replace the SKILL.md of an existing skill (full rewrite) from the editor."""
+    _require_enterprise_surface("skills", action="/api/skills/content", capability="skills.manage")
     from tools.skill_manager_tool import _edit_skill
 
     with _profile_scope(body.profile):
@@ -9707,6 +9938,7 @@ async def toggle_toolset(name: str, body: ToolsetToggle, profile: Optional[str] 
     lockstep. Scoped to ``body.profile`` when provided. Returns 400 for
     unknown toolset keys.
     """
+    _require_enterprise_surface("toolsets", action="/api/tools/toolsets", capability="toolsets.manage")
     from hermes_cli.tools_config import (
         _get_effective_configurable_toolsets,
         _get_platform_tools,
@@ -9810,6 +10042,7 @@ async def select_toolset_provider(
     API keys and post-setup flows are handled by separate endpoints. Returns
     400 for unknown toolset or provider names.
     """
+    _require_enterprise_surface("toolsets", action="/api/tools/toolsets/provider", capability="toolsets.manage")
     from hermes_cli.tools_config import (
         apply_provider_selection,
         _get_effective_configurable_toolsets,
@@ -9846,6 +10079,7 @@ async def save_toolset_env(name: str, body: ToolsetEnvUpdate, profile: Optional[
     "leave unchanged" and skipped. Returns the saved/skipped key lists and the
     refreshed ``is_set`` status. Returns 400 for unknown toolset or env keys.
     """
+    _require_enterprise_surface("toolsets", action="/api/tools/toolsets/env", capability="toolsets.manage")
     from hermes_cli.tools_config import (
         TOOL_CATEGORIES,
         _get_effective_configurable_toolsets,
@@ -9914,6 +10148,7 @@ async def run_toolset_post_setup(
     write per-profile state must see the same HERMES_HOME the rest of the
     drawer's writes targeted — so the scope is threaded for consistency.
     """
+    _require_enterprise_surface("toolsets", action="/api/tools/toolsets/post-setup", capability="toolsets.manage")
     from hermes_cli.tools_config import (
         _get_effective_configurable_toolsets,
         valid_post_setup_keys,
@@ -9977,6 +10212,12 @@ async def update_config_raw(body: RawConfigUpdate, profile: Optional[str] = None
         if not isinstance(parsed, dict):
             raise HTTPException(status_code=400, detail="YAML must be a mapping")
         with _profile_scope(body.profile or profile):
+            current = load_config()
+            _require_enterprise_model_config_write(
+                current,
+                parsed,
+                action="/api/config/raw",
+            )
             save_config(parsed)
         return {"ok": True}
     except yaml.YAMLError as e:

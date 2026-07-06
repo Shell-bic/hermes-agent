@@ -31,6 +31,16 @@ from hermes_cli.auth import (
     has_usable_secret,
 )
 from hermes_cli.config import get_compatible_custom_providers, load_config
+from hermes_cli.enterprise_policy import (
+    ENTERPRISE_GATEWAY_TOKEN_ENV,
+    ENTERPRISE_PROVIDER,
+    EnterprisePolicyDenied,
+    current_model_profile,
+    is_enterprise_managed,
+    load_enterprise_policy,
+    require_model_allowed,
+    require_runtime_provider_allowed,
+)
 from hermes_constants import OPENROUTER_BASE_URL
 from utils import base_url_host_matches, base_url_hostname, env_int
 
@@ -202,6 +212,57 @@ def _get_model_config() -> Dict[str, Any]:
     if isinstance(model_cfg, str) and model_cfg.strip():
         return {"default": model_cfg.strip()}
     return {}
+
+
+def _enterprise_api_mode(raw: Any) -> str:
+    normalized = str(raw or "").strip().lower().replace("-", "_")
+    if normalized in {"anthropic_messages", "anthropic"}:
+        return "anthropic_messages"
+    if normalized in {"openai_chat", "chat", "chat_completions", "openai"}:
+        return "chat_completions"
+    if normalized in {"codex_responses", "responses"}:
+        return "codex_responses"
+    return "chat_completions"
+
+
+def _resolve_enterprise_gateway_runtime(
+    *,
+    explicit_api_key: Optional[str] = None,
+    explicit_base_url: Optional[str] = None,
+) -> Dict[str, Any]:
+    if str(explicit_api_key or "").strip() or str(explicit_base_url or "").strip():
+        raise AuthError(
+            "Enterprise managed policy denied runtime provider resolution: "
+            "custom endpoints and API keys are controlled by enterprise policy",
+            code="enterprise_managed_policy_denied",
+        )
+
+    config = load_config()
+    providers = config.get("providers")
+    provider_cfg = providers.get(ENTERPRISE_PROVIDER) if isinstance(providers, dict) else {}
+    if not isinstance(provider_cfg, dict):
+        provider_cfg = {}
+    base_url = str(
+        provider_cfg.get("base_url")
+        or provider_cfg.get("api")
+        or provider_cfg.get("url")
+        or ""
+    ).strip().rstrip("/")
+    key_env = str(provider_cfg.get("key_env") or ENTERPRISE_GATEWAY_TOKEN_ENV).strip()
+    policy = load_enterprise_policy()
+    profile = current_model_profile(policy)
+    api_format = profile.get("apiFormat") if isinstance(profile, dict) else None
+    if not api_format:
+        api_format = provider_cfg.get("transport") or provider_cfg.get("api_mode")
+
+    return {
+        "provider": ENTERPRISE_PROVIDER,
+        "api_mode": _enterprise_api_mode(api_format),
+        "base_url": base_url,
+        "api_key": os.getenv(key_env, "").strip(),
+        "source": "enterprise-policy",
+        "requested_provider": ENTERPRISE_PROVIDER,
+    }
 
 
 def _provider_supports_explicit_api_mode(provider: Optional[str], configured_provider: Optional[str] = None) -> bool:
@@ -1326,6 +1387,23 @@ def resolve_runtime_provider(
     behavior (api_mode derived from config).
     """
     requested_provider = resolve_requested_provider(requested)
+    if is_enterprise_managed() and requested_provider == "auto":
+        model_cfg = _get_model_config()
+        cfg_provider = str(model_cfg.get("provider") or "").strip().lower()
+        if cfg_provider:
+            requested_provider = cfg_provider
+    try:
+        require_runtime_provider_allowed(requested_provider)
+        if is_enterprise_managed() and target_model:
+            require_model_allowed(target_model, action="runtime model selection")
+    except EnterprisePolicyDenied as exc:
+        raise AuthError(str(exc), code="enterprise_managed_policy_denied") from exc
+
+    if is_enterprise_managed():
+        return _resolve_enterprise_gateway_runtime(
+            explicit_api_key=explicit_api_key,
+            explicit_base_url=explicit_base_url,
+        )
 
     # Azure Anthropic short-circuit: when explicitly targeting an Azure endpoint
     # with provider="anthropic", bypass _resolve_named_custom_runtime (which would

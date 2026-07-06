@@ -5,9 +5,11 @@ import type { ClientSessionState, CommandDispatchResponse } from '@/app/types'
 import { formatRefValue } from '@/components/assistant-ui/directive-text'
 import { type ChatMessage, type ChatMessagePart, chatMessageText, textPart } from '@/lib/chat-messages'
 import type { ComposerAttachment } from '@/store/composer'
+import type { EnterpriseDesktopState } from '@/global'
 import type { ModelOptionsResponse, SessionInfo } from '@/types/hermes'
 
 export const SLASH_COMMAND_RE = /^\/[^\s/]*(?:\s|$)/
+export const ENTERPRISE_MODEL_PROVIDER = 'company-gateway'
 export const BUILTIN_PERSONALITIES = [
   'helpful',
   'concise',
@@ -311,6 +313,59 @@ export function quickModelOptions(
   }
 
   return options.slice(0, 8)
+}
+
+export function enterpriseAllowedModels(state: EnterpriseDesktopState): string[] {
+  const seen = new Set<string>()
+  const models: string[] = []
+  const add = (model: unknown) => {
+    if (typeof model !== 'string') {
+      return
+    }
+
+    const trimmed = model.trim()
+
+    if (!trimmed || seen.has(trimmed)) {
+      return
+    }
+
+    seen.add(trimmed)
+    models.push(trimmed)
+  }
+
+  for (const profile of state.modelProfiles ?? []) {
+    const expanded = profile as typeof profile & Record<string, unknown>
+
+    add(expanded.model)
+    add(expanded.modelId)
+    add(expanded.model_id)
+    add(expanded.runtimeModel)
+    add(expanded.runtime_model)
+  }
+
+  for (const model of state.allowedModels ?? []) {
+    add(model)
+  }
+
+  return models
+}
+
+export function enterpriseModelSelection(
+  state: EnterpriseDesktopState,
+  preferred?: string | null
+): { model: string; provider: string } | null {
+  const allowed = enterpriseAllowedModels(state)
+  const candidates = [preferred, state.currentModel, state.defaultModel, ...allowed]
+    .filter((model): model is string => typeof model === 'string' && Boolean(model.trim()))
+    .map(model => model.trim())
+
+  const model = candidates.find(candidate => allowed.includes(candidate)) ?? null
+
+  return model ? { model, provider: ENTERPRISE_MODEL_PROVIDER } : null
+}
+
+export function isEnterpriseModelAllowed(state: EnterpriseDesktopState, model: string): boolean {
+  return enterpriseAllowedModels(state).includes(model.trim())
 }
 
 export function toRuntimeMessage(message: ChatMessage): ThreadMessage {

@@ -10,12 +10,14 @@ import type { HermesGateway } from '@/hermes'
 import { getGlobalModelOptions } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { displayModelName, modelDisplayParts } from '@/lib/model-status-label'
+import { $enterprise } from '@/store/enterprise'
 import {
   $visibleModels,
   collapseModelFamilies,
   effectiveVisibleKeys,
   emptyProviderSentinelKey,
   isProviderSentinel,
+  isEnterpriseModelManaged,
   modelVisibilityKey,
   setVisibleModels
 } from '@/store/model-visibility'
@@ -39,6 +41,8 @@ export function ModelVisibilityDialog({
   const { t } = useI18n()
   const copy = t.modelVisibility
   const [search, setSearch] = useState('')
+  const enterprise = useStore($enterprise)
+  const enterpriseManaged = isEnterpriseModelManaged(enterprise)
   const stored = useStore($visibleModels)
 
   const modelOptions = useQuery({
@@ -50,7 +54,7 @@ export function ModelVisibilityDialog({
 
       return getGlobalModelOptions()
     },
-    enabled: open
+    enabled: open && !enterpriseManaged
   })
 
   const providers = useMemo(
@@ -94,72 +98,86 @@ export function ModelVisibilityDialog({
           <DialogTitle className="text-[0.8125rem]">{copy.title}</DialogTitle>
         </DialogHeader>
 
-        <div className="px-3 py-1.5">
-          <input
-            autoFocus
-            className="h-5 w-full bg-transparent text-xs text-foreground placeholder:text-(--ui-text-tertiary) focus:outline-none"
-            onChange={event => setSearch(event.target.value)}
-            placeholder={copy.search}
-            type="text"
-            value={search}
-          />
-        </div>
-
-        <div className="max-h-[55vh] overflow-y-auto pb-1">
-          {providers.length === 0 ? (
-            <div className="px-3 py-5 text-center text-xs text-muted-foreground">
-              {modelOptions.isPending ? <GlyphSpinner className="mx-auto text-sm" /> : copy.noAuthenticatedProviders}
+        {enterpriseManaged ? (
+          <div className="px-3 py-5 text-xs leading-relaxed text-muted-foreground">
+            企业模型可见性由管理员统一管理。
+          </div>
+        ) : (
+          <>
+            <div className="px-3 py-1.5">
+              <input
+                autoFocus
+                className="h-5 w-full bg-transparent text-xs text-foreground placeholder:text-(--ui-text-tertiary) focus:outline-none"
+                onChange={event => setSearch(event.target.value)}
+                placeholder={copy.search}
+                type="text"
+                value={search}
+              />
             </div>
-          ) : (
-            providers.map(provider => {
-              const models = collapseModelFamilies(provider.models ?? []).filter(family => matches(provider, family.id))
 
-              if (models.length === 0) {
-                return null
-              }
-
-              return (
-                <div className="py-0.5" key={provider.slug}>
-                  <div className="px-3 pb-0.5 pt-1 text-[0.625rem] font-medium uppercase tracking-wide text-(--ui-text-tertiary)">
-                    {provider.name}
-                  </div>
-                  {models.map(family => {
-                    const { name, tag } = modelDisplayParts(family.id)
-                    const key = modelVisibilityKey(provider.slug, family.id)
-
-                    return (
-                      <label
-                        className="flex cursor-pointer items-center gap-2 px-3 py-1 text-xs hover:bg-accent/50"
-                        key={key}
-                      >
-                        <span className="min-w-0 flex-1 truncate">
-                          {name}
-                          {tag ? <span className="text-(--ui-text-tertiary)"> {tag}</span> : null}
-                        </span>
-                        <Switch checked={visible.has(key)} onCheckedChange={() => toggle(provider, family.id)} />
-                      </label>
-                    )
-                  })}
+            <div className="max-h-[55vh] overflow-y-auto pb-1">
+              {providers.length === 0 ? (
+                <div className="px-3 py-5 text-center text-xs text-muted-foreground">
+                  {modelOptions.isPending ? (
+                    <GlyphSpinner className="mx-auto text-sm" />
+                  ) : (
+                    copy.noAuthenticatedProviders
+                  )}
                 </div>
-              )
-            })
-          )}
-        </div>
+              ) : (
+                providers.map(provider => {
+                  const models = collapseModelFamilies(provider.models ?? []).filter(family =>
+                    matches(provider, family.id)
+                  )
 
-        <div className="px-3 py-2">
-          <Button
-            className="-ml-2 text-(--ui-text-tertiary)"
-            onClick={() => {
-              onOpenChange(false)
-              onOpenProviders()
-            }}
-            size="xs"
-            type="button"
-            variant="text"
-          >
-            {copy.addProvider}
-          </Button>
-        </div>
+                  if (models.length === 0) {
+                    return null
+                  }
+
+                  return (
+                    <div className="py-0.5" key={provider.slug}>
+                      <div className="px-3 pb-0.5 pt-1 text-[0.625rem] font-medium uppercase tracking-wide text-(--ui-text-tertiary)">
+                        {provider.name}
+                      </div>
+                      {models.map(family => {
+                        const { name, tag } = modelDisplayParts(family.id)
+                        const key = modelVisibilityKey(provider.slug, family.id)
+
+                        return (
+                          <label
+                            className="flex cursor-pointer items-center gap-2 px-3 py-1 text-xs hover:bg-accent/50"
+                            key={key}
+                          >
+                            <span className="min-w-0 flex-1 truncate">
+                              {name}
+                              {tag ? <span className="text-(--ui-text-tertiary)"> {tag}</span> : null}
+                            </span>
+                            <Switch checked={visible.has(key)} onCheckedChange={() => toggle(provider, family.id)} />
+                          </label>
+                        )
+                      })}
+                    </div>
+                  )
+                })
+              )}
+            </div>
+
+            <div className="px-3 py-2">
+              <Button
+                className="-ml-2 text-(--ui-text-tertiary)"
+                onClick={() => {
+                  onOpenChange(false)
+                  onOpenProviders()
+                }}
+                size="xs"
+                type="button"
+                variant="text"
+              >
+                {copy.addProvider}
+              </Button>
+            </div>
+          </>
+        )}
       </DialogContent>
     </Dialog>
   )
