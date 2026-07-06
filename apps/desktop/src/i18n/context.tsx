@@ -51,6 +51,16 @@ export function withConfigDisplayLanguage(config: HermesConfigRecord, locale: Lo
   }
 }
 
+function localeFromConfigOrFallback(config: HermesConfigRecord, fallback: unknown): Locale {
+  const configured = getConfigDisplayLanguage(config)
+
+  if (configured === undefined || configured === null || (typeof configured === 'string' && !configured.trim())) {
+    return normalizeLocale(fallback)
+  }
+
+  return normalizeLocale(configured)
+}
+
 function toError(error: unknown): Error {
   return error instanceof Error ? error : new Error(String(error))
 }
@@ -108,13 +118,13 @@ export function I18nProvider({ children, configClient = defaultConfigClient, ini
       .getConfig()
       .then(config => {
         if (!cancelled) {
-          setLocaleState(normalizeLocale(getConfigDisplayLanguage(config)))
+          setLocaleState(localeFromConfigOrFallback(config, initialLocale))
         }
       })
       .catch(error => {
         if (!cancelled) {
           setConfigLoadError(toError(error))
-          setLocaleState(DEFAULT_LOCALE)
+          setLocaleState(normalizeLocale(initialLocale))
         }
       })
       .finally(() => {

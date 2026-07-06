@@ -87,6 +87,29 @@ export const ja = defineLocale({
     }
   },
 
+  enterpriseLogin: {
+    title: 'エンタープライズ サインイン',
+    description: 'エンタープライズ アカウントでサインインして、管理対象の Hermes ランタイムを開始します。',
+    usernamePlaceholder: 'ユーザー名',
+    passwordPlaceholder: 'パスワード',
+    cachedAccount: account => `キャッシュ済みアカウント: ${account}`,
+    refresh: '更新',
+    signIn: 'サインイン',
+    serviceUnavailable: 'エンタープライズ サービスを利用できません。'
+  },
+
+  chatIntro: {
+    neutralBodies: [
+      'タスク、質問、またはコード片を送ってください。セッションを覚え、根拠を示し、不明な点は先に確認します。',
+      'やりたいことをそのまま書いてください。まず文脈を読み、次の具体的な一歩に分けます。',
+      'ファイルパス、エラー、または粗いアイデアを貼ってください。先に調べて、戻しやすい進め方を出します。',
+      '目標を教えてください。リポジトリの確認、ファイル編集、テスト実行まで手を動かします。',
+      'どこから始めても大丈夫です。手元の手がかりを、計画または修正に整理します。'
+    ],
+    personalityBody: label =>
+      `タスク、ファイル、またはアイデアを送ってください。${label} モードで応答し、このリポジトリに沿って進めます。`
+  },
+
   notifications: {
     region: '通知',
     hide: '非表示',

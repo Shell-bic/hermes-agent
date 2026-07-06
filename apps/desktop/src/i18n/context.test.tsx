@@ -7,7 +7,7 @@ import { type I18nConfigClient, I18nProvider, useI18n } from './context'
 import type { Locale } from './types'
 
 function LanguageProbe({ target = 'zh' }: { target?: Locale }) {
-  const { isLoadingConfig, isSavingLocale, locale, saveError, setLocale, t } = useI18n()
+  const { configLoadError, isLoadingConfig, isSavingLocale, locale, saveError, setLocale, t } = useI18n()
 
   return (
     <div>
@@ -16,6 +16,7 @@ function LanguageProbe({ target = 'zh' }: { target?: Locale }) {
       <p data-testid="save">{t.common.save}</p>
       <p data-testid="loading">{String(isLoadingConfig)}</p>
       <p data-testid="saving">{String(isSavingLocale)}</p>
+      <p data-testid="load-error">{configLoadError?.message ?? ''}</p>
       <p data-testid="save-error">{saveError?.message ?? ''}</p>
       <button onClick={() => void setLocale(target).catch(() => undefined)} type="button">
         switch
@@ -76,7 +77,7 @@ describe('I18nProvider', () => {
     expect(configClient.saveConfig).not.toHaveBeenCalled()
   })
 
-  it('keeps English usable when config loading fails', async () => {
+  it('falls back to the initial locale when config loading fails', async () => {
     const configClient: I18nConfigClient = {
       getConfig: vi.fn().mockRejectedValue(new Error('config unavailable')),
       saveConfig: vi.fn()
@@ -90,8 +91,28 @@ describe('I18nProvider', () => {
 
     await waitFor(() => expect(screen.getByTestId('loading').textContent).toBe('false'))
 
+    expect(screen.getByTestId('locale').textContent).toBe('zh')
+    expect(screen.getByTestId('load-error').textContent).toBe('config unavailable')
+    expect(configClient.saveConfig).not.toHaveBeenCalled()
+  })
+
+  it('keeps English usable when config loading fails without an initial locale', async () => {
+    const configClient: I18nConfigClient = {
+      getConfig: vi.fn().mockRejectedValue(new Error('config unavailable')),
+      saveConfig: vi.fn()
+    }
+
+    render(
+      <I18nProvider configClient={configClient}>
+        <LanguageProbe />
+      </I18nProvider>
+    )
+
+    await waitFor(() => expect(screen.getByTestId('loading').textContent).toBe('false'))
+
     expect(screen.getByTestId('locale').textContent).toBe('en')
     expect(screen.getByTestId('label').textContent).toBe('Language')
+    expect(screen.getByTestId('load-error').textContent).toBe('config unavailable')
     expect(configClient.saveConfig).not.toHaveBeenCalled()
   })
 

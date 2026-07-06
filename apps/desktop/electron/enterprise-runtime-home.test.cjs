@@ -65,6 +65,7 @@ test('managed runtime home writes company-gateway config and token env only in p
 
   assert.match(config, /provider: "company-gateway"/)
   assert.match(config, /base_url: "https:\/\/gateway\.example\.com\/v1"/)
+  assert.match(config, /display:\n  language: "zh"/)
   assert.match(config, /api_mode: "chat_completions"/)
   assert.match(env, /COMPANY_GATEWAY_TOKEN="gateway-secret"/)
   assert.equal(result.env[GATEWAY_TOKEN_ENV], 'gateway-secret')
@@ -97,6 +98,8 @@ test('managed runtime home writes company-gateway config and token env only in p
   assert.equal(result.publicState.currentModel, 'gpt-4.1')
   assert.equal(result.publicState.currentModelProfileId, 'profile-1')
   assert.deepEqual(result.publicState.lockedSurfaces, ['providers', 'env'])
+  assert.deepEqual(result.publicState.uiPolicy, { defaultLocale: 'zh', allowLanguageChange: true, lockedLocale: false })
+  assert.deepEqual(policy.uiPolicy, { defaultLocale: 'zh', allowLanguageChange: true, lockedLocale: false })
 })
 
 test('public enterprise state accepts runtime manifest roles before legacy role', () => {
@@ -117,6 +120,32 @@ test('public enterprise state accepts runtime manifest roles before legacy role'
       manifest: manifest({ role: { name: 'LegacyRole' }, roles: undefined })
     }).role,
     { name: 'LegacyRole' }
+  )
+})
+
+test('public enterprise state accepts manifest ui policy before bootstrap policy', () => {
+  assert.deepEqual(
+    publicEnterpriseState({
+      bootstrap: {
+        uiPolicy: { defaultLocale: 'en', allowLanguageChange: true, lockedLocale: false },
+        user: { displayName: 'Ada' }
+      },
+      manifest: manifest({
+        uiPolicy: { defaultLocale: 'zh-hant', allowLanguageChange: false, lockedLocale: true }
+      })
+    }).uiPolicy,
+    { defaultLocale: 'zh-hant', allowLanguageChange: false, lockedLocale: true }
+  )
+
+  assert.deepEqual(
+    publicEnterpriseState({
+      bootstrap: {
+        uiPolicy: { defaultLocale: 'ja', allowLanguageChange: true, lockedLocale: false },
+        user: { displayName: 'Ada' }
+      },
+      manifest: manifest({ uiPolicy: undefined })
+    }).uiPolicy,
+    { defaultLocale: 'ja', allowLanguageChange: true, lockedLocale: false }
   )
 })
 
@@ -146,6 +175,40 @@ test('managed config derives api mode from selected enterprise model profile', (
 
   assert.match(config, /api_mode: "anthropic_messages"/)
   assert.match(config, /transport: "anthropic_messages"/)
+})
+
+test('managed config preserves an existing supported explicit display language', () => {
+  const hermesHome = fs.mkdtempSync(path.join(os.tmpdir(), 'hermes-enterprise-home-'))
+  fs.mkdirSync(hermesHome, { recursive: true })
+  fs.writeFileSync(
+    path.join(hermesHome, 'config.yaml'),
+    ['display:', '  language: "ja"', 'model:', '  provider: "old"'].join('\n'),
+    'utf8'
+  )
+
+  writeManagedRuntimeHome({
+    bootstrap: { user: { displayName: 'Ada' } },
+    hermesHome,
+    manifest: manifest()
+  })
+
+  const config = fs.readFileSync(path.join(hermesHome, 'config.yaml'), 'utf8')
+  assert.match(config, /display:\n  language: "ja"/)
+})
+
+test('managed config falls back to zh when existing display language is unsupported', () => {
+  const hermesHome = fs.mkdtempSync(path.join(os.tmpdir(), 'hermes-enterprise-home-'))
+  fs.mkdirSync(hermesHome, { recursive: true })
+  fs.writeFileSync(path.join(hermesHome, 'config.yaml'), ['display:', '  language: "de"'].join('\n'), 'utf8')
+
+  writeManagedRuntimeHome({
+    bootstrap: { user: { displayName: 'Ada' } },
+    hermesHome,
+    manifest: manifest()
+  })
+
+  const config = fs.readFileSync(path.join(hermesHome, 'config.yaml'), 'utf8')
+  assert.match(config, /display:\n  language: "zh"/)
 })
 
 test('managed runtime home is scoped by enterprise user identity', () => {

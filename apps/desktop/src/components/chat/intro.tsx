@@ -1,5 +1,7 @@
 import { type CSSProperties, useState } from 'react'
 
+import { type Translations, useI18n } from '@/i18n'
+
 import introCopyJsonl from './intro-copy.jsonl?raw'
 
 type IntroCopy = {
@@ -142,6 +144,10 @@ function pickCopy(copies: IntroCopy[], seed = 0): IntroCopy {
   return copies[Math.abs(seed) % copies.length] || FALLBACK_COPY[0]
 }
 
+function pickLocalizedBody(bodies: readonly string[], seed = 0, fallback: string): string {
+  return bodies[Math.abs(seed) % bodies.length] || fallback
+}
+
 const WORDMARK = 'HERMES AGENT'
 
 function resolveCopy(personality?: string, seed?: number): IntroCopy {
@@ -154,9 +160,28 @@ function resolveCopy(personality?: string, seed?: number): IntroCopy {
   return pickCopy(copies, seed)
 }
 
+function resolveLocalizedCopy(copy: Translations['chatIntro'], personality?: string, seed?: number): IntroCopy {
+  const personalityKey = normalizeKey(personality)
+  const fallback = resolveCopy(personality, seed)
+
+  if (NEUTRAL_PERSONALITIES.has(personalityKey)) {
+    return {
+      headline: fallback.headline,
+      body: pickLocalizedBody(copy.neutralBodies, seed, fallback.body)
+    }
+  }
+
+  return {
+    headline: fallback.headline,
+    body: copy.personalityBody(titleize(personalityKey))
+  }
+}
+
 export function Intro({ personality, seed }: IntroProps) {
+  const { locale, t } = useI18n()
   const [mountSeed] = useState(() => Math.floor(Math.random() * 100000))
-  const copy = resolveCopy(personality, mountSeed + (seed ?? 0))
+  const copySeed = mountSeed + (seed ?? 0)
+  const copy = locale === 'en' ? resolveCopy(personality, copySeed) : resolveLocalizedCopy(t.chatIntro, personality, copySeed)
 
   return (
     <div

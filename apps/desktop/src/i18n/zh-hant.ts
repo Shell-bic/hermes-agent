@@ -84,6 +84,28 @@ export const zhHant = defineLocale({
     }
   },
 
+  enterpriseLogin: {
+    title: '企業帳號登入',
+    description: '登入企業帳號後即可啟動受管理的 Hermes 執行環境。',
+    usernamePlaceholder: '使用者名稱',
+    passwordPlaceholder: '密碼',
+    cachedAccount: account => `已快取帳號：${account}`,
+    refresh: '重新整理',
+    signIn: '登入',
+    serviceUnavailable: '企業服務暫不可用。'
+  },
+
+  chatIntro: {
+    neutralBodies: [
+      '傳送任務、問題或程式碼片段。我會記住目前工作階段、說明依據，並在不確定時先問清楚。',
+      '描述你想處理的事。我會先看上下文，再把它拆成可執行的下一步。',
+      '貼一個檔案路徑、錯誤或粗略想法。我會先排查，再給出穩妥的改法。',
+      '告訴我目標。我可以查倉庫、改檔案、跑測試，把機械步驟接過去。',
+      '從任何地方開始都可以。給我現有線索，我會幫你整理成計畫或修復。'
+    ],
+    personalityBody: label => `傳送任務、檔案或想法。我會按 ${label} 模式回應，並把工作落在目前倉庫裡。`
+  },
+
   notifications: {
     region: '通知',
     hide: '隱藏',

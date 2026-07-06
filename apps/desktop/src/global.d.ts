@@ -346,6 +346,12 @@ export interface EnterpriseDesktopLoginInput {
 
 export type EnterpriseDesktopStatus = 'authenticated' | 'disabled' | 'error' | 'loading' | 'unauthenticated'
 
+export interface EnterpriseUiPolicy {
+  defaultLocale: string
+  allowLanguageChange: boolean
+  lockedLocale: boolean
+}
+
 export interface EnterpriseModelProviderSummary {
   id: string | null
   name: string | null
@@ -385,6 +391,7 @@ export interface EnterpriseDesktopState {
   role: unknown
   runtimeDefaults?: Record<string, unknown>
   status: EnterpriseDesktopStatus
+  uiPolicy?: EnterpriseUiPolicy
   user: unknown
 }
 

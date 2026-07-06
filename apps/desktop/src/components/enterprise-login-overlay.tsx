@@ -4,6 +4,7 @@ import type { FormEvent } from 'react'
 
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
+import { useI18n } from '@/i18n'
 import { Loader2, Lock, LogIn, RefreshCw } from '@/lib/icons'
 import { cn } from '@/lib/utils'
 import { $enterprise, loginEnterprise, refreshEnterpriseState } from '@/store/enterprise'
@@ -24,6 +25,8 @@ function displayName(value: unknown): string {
 
 export function EnterpriseLoginOverlay({ onAuthenticated }: EnterpriseLoginOverlayProps) {
   const enterprise = useStore($enterprise)
+  const { t } = useI18n()
+  const copy = t.enterpriseLogin
   const [username, setUsername] = useState('')
   const [password, setPassword] = useState('')
   const [busy, setBusy] = useState(false)
@@ -58,9 +61,8 @@ export function EnterpriseLoginOverlay({ onAuthenticated }: EnterpriseLoginOverl
   }
 
   const message =
-    enterprise.status === 'error'
-      ? enterprise.error || 'Enterprise service is unavailable.'
-      : 'Sign in with your enterprise account to start the managed Hermes runtime.'
+    enterprise.status === 'error' ? enterprise.error || copy.serviceUnavailable : copy.description
+  const cachedAccount = displayName(enterprise.user)
 
   return (
     <div className="fixed inset-0 z-[1300] flex items-center justify-center bg-(--ui-chat-surface-background) px-6">
@@ -73,7 +75,7 @@ export function EnterpriseLoginOverlay({ onAuthenticated }: EnterpriseLoginOverl
             <Lock className="size-4" />
           </div>
           <div className="min-w-0">
-            <h1 className="text-sm font-semibold text-(--ui-text-primary)">Enterprise sign in</h1>
+            <h1 className="text-sm font-semibold text-(--ui-text-primary)">{copy.title}</h1>
             <p className="mt-1 text-xs leading-5 text-(--ui-text-secondary)">{message}</p>
           </div>
         </div>
@@ -84,14 +86,14 @@ export function EnterpriseLoginOverlay({ onAuthenticated }: EnterpriseLoginOverl
             autoFocus
             disabled={busy}
             onChange={event => setUsername(event.target.value)}
-            placeholder="Username"
+            placeholder={copy.usernamePlaceholder}
             value={username}
           />
           <Input
             autoComplete="current-password"
             disabled={busy}
             onChange={event => setPassword(event.target.value)}
-            placeholder="Password"
+            placeholder={copy.passwordPlaceholder}
             type="password"
             value={password}
           />
@@ -103,18 +105,18 @@ export function EnterpriseLoginOverlay({ onAuthenticated }: EnterpriseLoginOverl
           </div>
         )}
 
-        {displayName(enterprise.user) && (
-          <div className="text-xs text-(--ui-text-secondary)">Cached account: {displayName(enterprise.user)}</div>
+        {cachedAccount && (
+          <div className="text-xs text-(--ui-text-secondary)">{copy.cachedAccount(cachedAccount)}</div>
         )}
 
         <div className="flex items-center justify-end gap-2">
           <Button disabled={busy} onClick={retry} size="sm" type="button" variant="ghost">
             <RefreshCw className={cn('size-3.5', enterprise.status === 'loading' && 'animate-spin')} />
-            Refresh
+            {copy.refresh}
           </Button>
           <Button disabled={busy || !username.trim() || !password} size="sm" type="submit">
             {busy ? <Loader2 className="size-3.5 animate-spin" /> : <LogIn className="size-3.5" />}
-            Sign in
+            {copy.signIn}
           </Button>
         </div>
       </form>

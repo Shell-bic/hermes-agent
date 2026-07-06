@@ -1,5 +1,9 @@
 const { createEnterpriseGatewayClient, normalizeEnterpriseGatewayBaseUrl } = require('./enterprise-gateway-client.cjs')
-const { resolveManagedHermesHome, writeManagedRuntimeHome } = require('./enterprise-runtime-home.cjs')
+const {
+  ENTERPRISE_UI_POLICY_DEFAULT,
+  resolveManagedHermesHome,
+  writeManagedRuntimeHome
+} = require('./enterprise-runtime-home.cjs')
 
 function resolveEnterpriseRuntimeOptions(env = process.env) {
   const gatewayUrl = String(env.HERMES_ENTERPRISE_GATEWAY_URL || env.HERMES_DESKTOP_ENTERPRISE_GATEWAY_URL || '').trim()
@@ -36,7 +40,8 @@ function unauthenticatedState(error = null) {
     ...disabledState(),
     enabled: true,
     error,
-    status: error ? 'error' : 'unauthenticated'
+    status: error ? 'error' : 'unauthenticated',
+    uiPolicy: ENTERPRISE_UI_POLICY_DEFAULT
   }
 }
 

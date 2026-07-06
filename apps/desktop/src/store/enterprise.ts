@@ -1,6 +1,6 @@
 import { atom } from 'nanostores'
 
-import type { EnterpriseDesktopLoginInput, EnterpriseDesktopState } from '@/global'
+import type { EnterpriseDesktopLoginInput, EnterpriseDesktopState, EnterpriseUiPolicy } from '@/global'
 import {
   setActiveSessionId,
   setAwaitingResponse,
@@ -41,13 +41,25 @@ export const INITIAL_ENTERPRISE_STATE: EnterpriseDesktopState = {
   user: null
 }
 
+export const ENTERPRISE_UI_POLICY_DEFAULT: EnterpriseUiPolicy = {
+  defaultLocale: 'zh',
+  allowLanguageChange: true,
+  lockedLocale: false
+}
+
 export const $enterprise = atom<EnterpriseDesktopState>(INITIAL_ENTERPRISE_STATE)
 
 function applyEnterpriseState(state: EnterpriseDesktopState | null | undefined): EnterpriseDesktopState {
-  const next = state || {
+  const base = state || {
     ...INITIAL_ENTERPRISE_STATE,
     status: 'disabled' as const
   }
+  const next = base.enabled && !base.uiPolicy
+    ? {
+        ...base,
+        uiPolicy: ENTERPRISE_UI_POLICY_DEFAULT
+      }
+    : base
 
   $enterprise.set(next)
 

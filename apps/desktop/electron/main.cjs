@@ -418,7 +418,7 @@ function enterprisePendingApiResponse(request) {
   }
 
   if (pathname === '/api/config' || pathname === '/api/config/defaults') {
-    return {}
+    return { display: { language: 'zh' } }
   }
 
   if (pathname === '/api/config/schema') {

@@ -99,6 +99,22 @@ export interface Translations {
     }
   }
 
+  enterpriseLogin: {
+    title: string
+    description: string
+    usernamePlaceholder: string
+    passwordPlaceholder: string
+    cachedAccount: (account: string) => string
+    refresh: string
+    signIn: string
+    serviceUnavailable: string
+  }
+
+  chatIntro: {
+    neutralBodies: readonly string[]
+    personalityBody: (label: string) => string
+  }
+
   notifications: {
     region: string
     hide: string

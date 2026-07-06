@@ -84,6 +84,28 @@ export const zh: Translations = {
     }
   },
 
+  enterpriseLogin: {
+    title: '企业账号登录',
+    description: '登录企业账号后即可启动受管 Hermes 运行时。',
+    usernamePlaceholder: '用户名',
+    passwordPlaceholder: '密码',
+    cachedAccount: account => `已缓存账号：${account}`,
+    refresh: '刷新',
+    signIn: '登录',
+    serviceUnavailable: '企业服务暂不可用。'
+  },
+
+  chatIntro: {
+    neutralBodies: [
+      '发送任务、问题或代码片段。我会记住当前会话、说明依据，并在不确定时先问清楚。',
+      '描述你想处理的事。我会先看上下文，再把它拆成可执行的下一步。',
+      '贴一个文件路径、报错或粗略想法。我会先排查，再给出稳妥的改法。',
+      '告诉我目标。我可以查仓库、改文件、跑测试，把机械步骤接过去。',
+      '从任何地方开始都可以。给我现有线索，我会帮你整理成计划或修复。'
+    ],
+    personalityBody: label => `发送任务、文件或想法。我会按 ${label} 模式回应，并把工作落在当前仓库里。`
+  },
+
   notifications: {
     region: '通知',
     hide: '隐藏',

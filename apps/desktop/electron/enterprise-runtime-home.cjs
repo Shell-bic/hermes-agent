@@ -3,6 +3,12 @@ const path = require('node:path')
 
 const MANAGED_PROVIDER = 'company-gateway'
 const GATEWAY_TOKEN_ENV = 'COMPANY_GATEWAY_TOKEN'
+const ENTERPRISE_UI_POLICY_DEFAULT = Object.freeze({
+  defaultLocale: 'zh',
+  allowLanguageChange: true,
+  lockedLocale: false
+})
+const SUPPORTED_DISPLAY_LANGUAGES = new Set(['en', 'zh', 'zh-hant', 'ja'])
 
 function asArray(value) {
   return Array.isArray(value) ? value : []
@@ -48,6 +54,26 @@ function yamlBlock(value, indent = 0) {
   }
 
   return `${pad}${scalarYaml(value)}`
+}
+
+function normalizeEnterpriseUiPolicy({ bootstrap = null, manifest = null } = {}) {
+  const source = manifest?.uiPolicy && typeof manifest.uiPolicy === 'object'
+    ? manifest.uiPolicy
+    : bootstrap?.uiPolicy && typeof bootstrap.uiPolicy === 'object'
+      ? bootstrap.uiPolicy
+      : null
+
+  return {
+    defaultLocale: typeof source?.defaultLocale === 'string' && source.defaultLocale.trim()
+      ? source.defaultLocale.trim()
+      : ENTERPRISE_UI_POLICY_DEFAULT.defaultLocale,
+    allowLanguageChange: typeof source?.allowLanguageChange === 'boolean'
+      ? source.allowLanguageChange
+      : ENTERPRISE_UI_POLICY_DEFAULT.allowLanguageChange,
+    lockedLocale: typeof source?.lockedLocale === 'boolean'
+      ? source.lockedLocale
+      : ENTERPRISE_UI_POLICY_DEFAULT.lockedLocale
+  }
 }
 
 function dotenvLine(key, value) {
@@ -173,6 +199,68 @@ function scrubSecretFields(value) {
   return result
 }
 
+function unquoteYamlScalar(value) {
+  const trimmed = String(value || '').trim()
+  const withoutComment = trimmed.replace(/\s+#.*$/, '').trim()
+
+  if (!withoutComment) {
+    return ''
+  }
+
+  if ((withoutComment.startsWith('"') && withoutComment.endsWith('"')) || (withoutComment.startsWith("'") && withoutComment.endsWith("'"))) {
+    try {
+      return JSON.parse(withoutComment)
+    } catch {
+      return withoutComment.slice(1, -1)
+    }
+  }
+
+  return withoutComment
+}
+
+function supportedDisplayLanguage(value) {
+  const language = String(value || '').trim().toLowerCase()
+
+  return SUPPORTED_DISPLAY_LANGUAGES.has(language) ? language : null
+}
+
+function readManagedConfigDisplayLanguage({ configPath, fsImpl = fs }) {
+  let contents = ''
+  try {
+    contents = fsImpl.readFileSync(configPath, 'utf8')
+  } catch {
+    return null
+  }
+
+  const lines = String(contents || '').split(/\r?\n/)
+  for (let index = 0; index < lines.length; index += 1) {
+    const displayMatch = lines[index].match(/^(\s*)display\s*:\s*(?:#.*)?$/)
+    if (!displayMatch) {
+      continue
+    }
+
+    const displayIndent = displayMatch[1].length
+    for (let next = index + 1; next < lines.length; next += 1) {
+      const line = lines[next]
+      if (!line.trim() || line.trim().startsWith('#')) {
+        continue
+      }
+
+      const indent = line.match(/^\s*/)[0].length
+      if (indent <= displayIndent) {
+        break
+      }
+
+      const languageMatch = line.match(/^\s*language\s*:\s*(.+?)\s*$/)
+      if (languageMatch) {
+        return supportedDisplayLanguage(unquoteYamlScalar(languageMatch[1]))
+      }
+    }
+  }
+
+  return null
+}
+
 function resolveRole({ bootstrap = null, manifest = null } = {}) {
   return manifest?.roles || manifest?.role || bootstrap?.roles || bootstrap?.role || null
 }
@@ -203,15 +291,19 @@ function publicEnterpriseState({ bootstrap = null, manifest = null, modelProfile
     role: resolveRole({ bootstrap, manifest }),
     runtimeDefaults: scrubSecretFields(manifest?.runtimeDefaults || {}),
     status: 'authenticated',
+    uiPolicy: normalizeEnterpriseUiPolicy({ bootstrap, manifest }),
     user: bootstrap?.user || bootstrap?.account || null
   }
 }
 
-function buildManagedConfigYaml({ manifest }) {
+function buildManagedConfigYaml({ manifest, displayLanguage = ENTERPRISE_UI_POLICY_DEFAULT.defaultLocale }) {
   const gatewayBaseUrl = normalizeGatewayApiBaseUrl(manifest.gatewayApiBaseUrl || manifest.gatewayBaseUrl)
   const defaultModel = manifest.defaultModel || asArray(manifest.allowedModels)[0] || ''
   const apiMode = resolveManifestApiMode(manifest)
   const config = {
+    display: {
+      language: supportedDisplayLanguage(displayLanguage) || ENTERPRISE_UI_POLICY_DEFAULT.defaultLocale
+    },
     model: {
       provider: MANAGED_PROVIDER,
       default: defaultModel,
@@ -253,6 +345,7 @@ function buildPolicySnapshot({ bootstrap = null, manifest = null, modelProfiles 
     role: resolveRole({ bootstrap, manifest }),
     runtimeDefaults: publicState.runtimeDefaults,
     sessionId: manifest?.sessionId || null,
+    uiPolicy: publicState.uiPolicy,
     user: bootstrap?.user || bootstrap?.account || null
   }
 }
@@ -277,7 +370,14 @@ function writeManagedRuntimeHome({ bootstrap, fsImpl = fs, hermesHome, manifest,
 
   fsImpl.mkdirSync(hermesHome, { recursive: true })
   fsImpl.mkdirSync(path.join(hermesHome, 'logs'), { recursive: true })
-  fsImpl.writeFileSync(configPath, buildManagedConfigYaml({ manifest }), 'utf8')
+  fsImpl.writeFileSync(
+    configPath,
+    buildManagedConfigYaml({
+      manifest,
+      displayLanguage: readManagedConfigDisplayLanguage({ configPath, fsImpl })
+    }),
+    'utf8'
+  )
   fsImpl.writeFileSync(policyPath, JSON.stringify(buildPolicySnapshot({ bootstrap, manifest, modelProfiles }), null, 2), 'utf8')
   fsImpl.writeFileSync(
     envPath,
@@ -312,12 +412,15 @@ function resolveManagedHermesHome(userDataPath, user = null) {
 
 module.exports = {
   GATEWAY_TOKEN_ENV,
+  ENTERPRISE_UI_POLICY_DEFAULT,
   MANAGED_PROVIDER,
   buildManagedConfigYaml,
   buildPolicySnapshot,
   enterpriseUserPathSegment,
   normalizeGatewayApiBaseUrl,
+  normalizeEnterpriseUiPolicy,
   publicEnterpriseState,
+  readManagedConfigDisplayLanguage,
   resolveRole,
   resolveManagedHermesHome,
   scrubSecretFields,

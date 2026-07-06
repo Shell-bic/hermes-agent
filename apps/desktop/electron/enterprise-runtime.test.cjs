@@ -5,7 +5,8 @@ const path = require('node:path')
 const {
   createEnterpriseRuntime,
   resolveEnterpriseRuntimeOptions,
-  runtimeManifestRequestBody
+  runtimeManifestRequestBody,
+  unauthenticatedState
 } = require('./enterprise-runtime.cjs')
 
 test('resolveEnterpriseRuntimeOptions enables managed mode from gateway url env', () => {
@@ -14,6 +15,14 @@ test('resolveEnterpriseRuntimeOptions enables managed mode from gateway url env'
     gatewayUrl: 'https://gw.example.com'
   })
   assert.deepEqual(resolveEnterpriseRuntimeOptions({}), { enabled: false, gatewayUrl: '' })
+})
+
+test('enterprise unauthenticated state carries the default ui policy', () => {
+  assert.deepEqual(unauthenticatedState().uiPolicy, {
+    defaultLocale: 'zh',
+    allowLanguageChange: true,
+    lockedLocale: false
+  })
 })
 
 test('enterprise runtime prepares managed launch without exposing gateway token publicly', async () => {
