@@ -1,9 +1,11 @@
 const test = require('node:test')
 const assert = require('node:assert/strict')
+const fs = require('node:fs')
 const path = require('node:path')
 
 const {
   createEnterpriseRuntime,
+  extractModelProfilesResponse,
   resolveEnterpriseRuntimeOptions,
   runtimeManifestRequestBody,
   unauthenticatedState
@@ -18,11 +20,29 @@ test('resolveEnterpriseRuntimeOptions enables managed mode from gateway url env'
 })
 
 test('enterprise unauthenticated state carries the default ui policy', () => {
-  assert.deepEqual(unauthenticatedState().uiPolicy, {
+  const state = unauthenticatedState()
+
+  assert.deepEqual(state.uiPolicy, {
     defaultLocale: 'zh',
     allowLanguageChange: true,
     lockedLocale: false
   })
+  assert.equal(state.toolPolicySnapshot, null)
+  assert.equal(state.policyHash, null)
+  assert.equal(state.generatedAt, null)
+})
+
+test('enterprise runtime extracts model profiles from common gateway response shapes', () => {
+  const profiles = [{ id: 'm1', model: 'm1', name: 'Model 1' }]
+
+  assert.deepEqual(extractModelProfilesResponse(profiles), profiles)
+  assert.deepEqual(extractModelProfilesResponse({ modelProfiles: profiles }), profiles)
+  assert.deepEqual(extractModelProfilesResponse({ profiles }), profiles)
+  assert.deepEqual(extractModelProfilesResponse({ items: profiles }), profiles)
+  assert.deepEqual(extractModelProfilesResponse({ models: profiles }), profiles)
+  assert.deepEqual(extractModelProfilesResponse({ results: profiles }), profiles)
+  assert.deepEqual(extractModelProfilesResponse({ data: { modelProfiles: profiles } }), profiles)
+  assert.deepEqual(extractModelProfilesResponse(null), [])
 })
 
 test('enterprise runtime prepares managed launch without exposing gateway token publicly', async () => {
@@ -81,7 +101,7 @@ test('enterprise runtime prepares managed launch without exposing gateway token 
   assert.deepEqual(calls, [
     ['bootstrap', 'desktop-token'],
     ['profiles', 'desktop-token'],
-    ['manifest', 'desktop-token', { preferredModel: 'm1' }]
+    ['manifest', 'desktop-token', { preferredModel: 'm1', preferredModelProfileId: 'm1' }]
   ])
 })
 
@@ -89,9 +109,31 @@ test('enterprise runtime manifest body sends preferredModel only when selected',
   assert.deepEqual(runtimeManifestRequestBody({ preferredModel: '  claude-sonnet  ' }), {
     preferredModel: 'claude-sonnet'
   })
+  assert.deepEqual(
+    runtimeManifestRequestBody({
+      modelProfiles: [{ id: 'profile-1', model: 'kimi-for-coding', name: 'Kimi' }],
+      preferredModel: 'enterprise-profile:profile-1'
+    }),
+    {
+      preferredModel: 'kimi-for-coding',
+      preferredModelProfileId: 'profile-1'
+    }
+  )
   assert.deepEqual(runtimeManifestRequestBody({ preferredModel: '' }), {})
   assert.deepEqual(runtimeManifestRequestBody({ profile: 'default' }), {})
   assert.deepEqual(runtimeManifestRequestBody(), {})
+})
+
+test('enterprise selectModel IPC refreshes manifest state without tearing down the backend', () => {
+  const source = fs.readFileSync(path.join(__dirname, 'main.cjs'), 'utf8').replace(/\r\n/g, '\n')
+  const start = source.indexOf("ipcMain.handle('hermes:enterprise:selectModel'")
+  assert.notEqual(start, -1, 'missing hermes:enterprise:selectModel IPC handler')
+  const end = source.indexOf("ipcMain.handle('hermes:enterprise:logout'", start)
+  assert.notEqual(end, -1, 'missing following enterprise logout IPC handler')
+  const handler = source.slice(start, end)
+
+  assert.match(handler, /enterpriseRuntime\.selectModel\(model\)/)
+  assert.doesNotMatch(handler, /teardownPrimaryBackendAndWait\(/)
 })
 
 test('enterprise runtime scopes managed Hermes home by desktop user when userDataPath is used', async () => {
@@ -236,9 +278,11 @@ test('enterprise runtime selectModel validates policy and rewrites managed home 
 
   await runtime.prepareLaunch({ preferredModel: 'm1' })
   const state = await runtime.selectModel('m2')
+  await runtime.prepareLaunch()
 
-  assert.equal(writes.length, 2)
+  assert.equal(writes.length, 3)
   assert.equal(writes[1].manifest.defaultModel, 'm2')
+  assert.equal(writes[2].manifest.defaultModel, 'm2')
   assert.equal(writes[1].hermesHome, 'managed-home')
   assert.equal(state.currentModel, 'm2')
   assert.equal(JSON.stringify(state).includes('gateway-token'), false)
@@ -246,10 +290,13 @@ test('enterprise runtime selectModel validates policy and rewrites managed home 
   assert.deepEqual(calls, [
     ['bootstrap', 'desktop-token'],
     ['profiles', 'desktop-token'],
-    ['manifest', 'desktop-token', { preferredModel: 'm1' }],
+    ['manifest', 'desktop-token', { preferredModel: 'm1', preferredModelProfileId: 'profile-1' }],
     ['bootstrap', 'desktop-token'],
     ['profiles', 'desktop-token'],
-    ['manifest', 'desktop-token', { preferredModel: 'm2' }]
+    ['manifest', 'desktop-token', { preferredModel: 'm2', preferredModelProfileId: 'profile-2' }],
+    ['bootstrap', 'desktop-token'],
+    ['profiles', 'desktop-token'],
+    ['manifest', 'desktop-token', { preferredModel: 'm2', preferredModelProfileId: 'profile-2' }]
   ])
   await assert.rejects(() => runtime.selectModel('not-allowed'), /not allowed by enterprise policy/)
 })

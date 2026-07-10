@@ -8,8 +8,10 @@ import {
   $activeSessionId,
   $currentModel,
   $currentProvider,
+  $sessions,
   setCurrentModel,
-  setCurrentProvider
+  setCurrentProvider,
+  setSessions
 } from '@/store/session'
 
 import { useModelControls } from './use-model-controls'
@@ -63,6 +65,7 @@ describe('useModelControls', () => {
     vi.clearAllMocks()
     $activeSessionId.set(null)
     $enterprise.set(INITIAL_ENTERPRISE_STATE)
+    setSessions([])
     setCurrentModel('')
     setCurrentProvider('')
   })
@@ -70,8 +73,10 @@ describe('useModelControls', () => {
   afterEach(() => {
     cleanup()
     vi.restoreAllMocks()
+    Reflect.deleteProperty(window, 'hermesDesktop')
     $activeSessionId.set(null)
     $enterprise.set(INITIAL_ENTERPRISE_STATE)
+    setSessions([])
     setCurrentModel('')
     setCurrentProvider('')
   })
@@ -226,17 +231,9 @@ describe('useModelControls', () => {
     expect(getGlobalModelInfo).not.toHaveBeenCalled()
   })
 
-  it('routes enterprise managed picker changes through enterprise.selectModel instead of config.set', async () => {
+  it('stores enterprise managed no-session picker changes as UI state without manifest refresh or session clearing', async () => {
     const requestGateway = vi.fn()
-    const selectModel = vi.fn(async () => ({
-      ...INITIAL_ENTERPRISE_STATE,
-      allowedModels: ['enterprise/next'],
-      authenticated: true,
-      currentModel: 'enterprise/next',
-      defaultModel: 'enterprise/next',
-      enabled: true,
-      status: 'authenticated' as const
-    }))
+    const selectModel = vi.fn()
 
     $enterprise.set({
       ...INITIAL_ENTERPRISE_STATE,
@@ -247,6 +244,52 @@ describe('useModelControls', () => {
       enabled: true,
       status: 'authenticated'
     })
+    setSessions([{ id: 'stored-session' } as never])
+    window.hermesDesktop = {
+      enterprise: {
+        selectModel
+      }
+    } as unknown as typeof window.hermesDesktop
+
+    let controls!: Controls
+
+    render(
+      <Harness
+        activeSessionId={null}
+        onReady={value => (controls = value)}
+        requestGateway={requestGateway}
+      />
+    )
+
+    await expect(
+      controls.selectModel({
+        model: 'enterprise/next',
+        provider: 'company-gateway'
+      })
+    ).resolves.toBe(true)
+
+    expect(selectModel).not.toHaveBeenCalled()
+    expect(requestGateway).not.toHaveBeenCalled()
+    expect($sessions.get()).toHaveLength(1)
+    expect($currentModel.get()).toBe('enterprise/next')
+    expect($currentProvider.get()).toBe('company-gateway')
+  })
+
+  it('routes enterprise managed active-session picker changes through config.set only', async () => {
+    const requestGateway = vi.fn(async () => ({ key: 'model', value: 'enterprise/next' }) as never)
+    const selectModel = vi.fn()
+
+    $enterprise.set({
+      ...INITIAL_ENTERPRISE_STATE,
+      allowedModels: ['enterprise/next'],
+      authenticated: true,
+      currentModel: 'enterprise/current',
+      defaultModel: 'enterprise/next',
+      enabled: true,
+      status: 'authenticated'
+    })
+    $activeSessionId.set('session-1')
+    setSessions([{ id: 'stored-session' } as never])
     window.hermesDesktop = {
       enterprise: {
         selectModel
@@ -270,10 +313,62 @@ describe('useModelControls', () => {
       })
     ).resolves.toBe(true)
 
-    expect(selectModel).toHaveBeenCalledWith('enterprise/next')
-    expect(requestGateway).not.toHaveBeenCalledWith('config.set', expect.anything())
+    expect(selectModel).not.toHaveBeenCalled()
+    expect(requestGateway).toHaveBeenCalledWith('config.set', {
+      session_id: 'session-1',
+      key: 'model',
+      value: 'enterprise/next --provider company-gateway'
+    })
+    expect($activeSessionId.get()).toBe('session-1')
+    expect($sessions.get()).toHaveLength(1)
     expect($currentModel.get()).toBe('enterprise/next')
     expect($currentProvider.get()).toBe('company-gateway')
+  })
+
+  it('routes enterprise managed profile picks with the selected profile token', async () => {
+    const requestGateway = vi.fn(async () => ({ key: 'model', value: 'glm-5.2' }) as never)
+
+    $enterprise.set({
+      ...INITIAL_ENTERPRISE_STATE,
+      allowedModels: ['glm-5.2'],
+      authenticated: true,
+      currentModel: 'glm-5.2',
+      currentModelProfileId: 'profile-a',
+      defaultModel: 'glm-5.2',
+      enabled: true,
+      modelProfiles: [
+        { id: 'profile-a', model: 'glm-5.2', name: 'GLM Anthropic' },
+        { id: 'profile-b', model: 'glm-5.2', name: 'GLM OpenAI Compatible' }
+      ],
+      status: 'authenticated'
+    })
+    $activeSessionId.set('session-1')
+
+    let controls!: Controls
+
+    render(
+      <Harness
+        activeSessionId="session-1"
+        onReady={value => (controls = value)}
+        requestGateway={requestGateway}
+      />
+    )
+
+    await expect(
+      controls.selectModel({
+        model: 'enterprise-profile:profile-b',
+        provider: 'company-gateway'
+      })
+    ).resolves.toBe(true)
+
+    expect(requestGateway).toHaveBeenCalledWith('config.set', {
+      session_id: 'session-1',
+      key: 'model',
+      value: 'enterprise-profile:profile-b --provider company-gateway'
+    })
+    expect($currentModel.get()).toBe('glm-5.2')
+    expect($currentProvider.get()).toBe('company-gateway')
+    expect($enterprise.get().currentModelProfileId).toBe('profile-b')
   })
 
   it('rejects enterprise managed picker changes for unauthorized models', async () => {

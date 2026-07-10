@@ -36,6 +36,7 @@ import type {
   SessionInfo,
   SessionMessagesResponse,
   SessionSearchResponse,
+  SkillContentResponse,
   SkillInfo,
   StatusResponse,
   ToolsetConfig,
@@ -438,6 +439,13 @@ export function getSkills(): Promise<SkillInfo[]> {
   return window.hermesDesktop.api<SkillInfo[]>({
     ...profileScoped(),
     path: '/api/skills'
+  })
+}
+
+export function getSkillContent(name: string): Promise<SkillContentResponse> {
+  return window.hermesDesktop.api<SkillContentResponse>({
+    ...profileScoped(),
+    path: `/api/skills/content?name=${encodeURIComponent(name)}`
   })
 }
 

@@ -64,3 +64,28 @@ describe('buildToolView terminal exit-code status', () => {
     )
   })
 })
+
+describe('buildToolView browser snapshots', () => {
+  const snapshot = [
+    '- document "JD item"',
+    '  - heading "HDMI cable 2.0 4K"',
+    '  - link "Add to cart" [ref=e12]',
+    '  - button "Buy now" [ref=e13]'
+  ].join('\n')
+
+  it('surfaces browser_navigate snapshot content as readable detail', () => {
+    const view = buildToolView(
+      part({
+        args: { url: 'https://item.jd.com/1233290.html' },
+        result: { success: true, snapshot },
+        toolName: 'browser_navigate'
+      }),
+      ''
+    )
+
+    expect(view.detailLabel).toBe('Page snapshot')
+    expect(view.detail).toContain('Visible snapshot')
+    expect(view.detail).toContain('HDMI cable 2.0 4K')
+    expect(view.detail).toContain('Buy now')
+  })
+})

@@ -5,6 +5,8 @@ const {
   writeManagedRuntimeHome
 } = require('./enterprise-runtime-home.cjs')
 
+const ENTERPRISE_PROFILE_PREFIX = 'enterprise-profile:'
+
 function resolveEnterpriseRuntimeOptions(env = process.env) {
   const gatewayUrl = String(env.HERMES_ENTERPRISE_GATEWAY_URL || env.HERMES_DESKTOP_ENTERPRISE_GATEWAY_URL || '').trim()
   const enabled = gatewayUrl.length > 0 || env.HERMES_ENTERPRISE_DESKTOP === '1'
@@ -19,18 +21,25 @@ function disabledState() {
   return {
     allowedModels: [],
     authenticated: false,
+    apiMode: null,
     auxiliaryPolicy: {},
     capabilities: {},
     currentModel: null,
     currentModelProfileId: null,
     defaultModel: null,
     enabled: false,
+    generatedAt: null,
     lockedSurfaces: [],
+    modelRuntimeHash: null,
     modelProfiles: [],
+    policyHash: null,
     policyVersion: null,
+    protocolSnapshot: null,
     role: null,
     runtimeDefaults: {},
+    runtimeLimits: {},
     status: 'disabled',
+    toolPolicySnapshot: null,
     user: null
   }
 }
@@ -45,18 +54,100 @@ function unauthenticatedState(error = null) {
   }
 }
 
-function runtimeManifestRequestBody({ preferredModel } = {}) {
-  const model = String(preferredModel || '').trim()
+function enterpriseProfileIdFromSelection(selection) {
+  const value = String(selection || '').trim()
 
-  return model ? { preferredModel: model } : {}
+  return value.startsWith(ENTERPRISE_PROFILE_PREFIX) ? value.slice(ENTERPRISE_PROFILE_PREFIX.length).trim() : ''
 }
 
-function modelProfileValues(profile) {
+function profileValues(profile) {
   if (!profile || typeof profile !== 'object') {
     return []
   }
 
-  return [profile.id, profile.model, profile.name].map(value => String(value || '').trim()).filter(Boolean)
+  return [profile.id, profile.model, profile.name, `${ENTERPRISE_PROFILE_PREFIX}${profile.id || ''}`]
+    .map(value => String(value || '').trim())
+    .filter(Boolean)
+}
+
+function findProfileForSelection(modelProfiles, selection) {
+  const value = String(selection || '').trim()
+  if (!value) {
+    return null
+  }
+
+  const profileId = enterpriseProfileIdFromSelection(value)
+
+  for (const profile of modelProfiles || []) {
+    if (profileId && String(profile?.id || '').trim() === profileId) {
+      return profile
+    }
+
+    if (profileValues(profile).includes(value)) {
+      return profile
+    }
+  }
+
+  return null
+}
+
+function runtimeManifestRequestBody({ modelProfiles = [], preferredModel } = {}) {
+  const model = String(preferredModel || '').trim()
+
+  if (!model) {
+    return {}
+  }
+
+  const profile = findProfileForSelection(modelProfiles, model)
+  if (profile?.id) {
+    return {
+      preferredModel: String(profile.model || '').trim() || model,
+      preferredModelProfileId: String(profile.id).trim()
+    }
+  }
+
+  const profileId = enterpriseProfileIdFromSelection(model)
+
+  return profileId ? { preferredModelProfileId: profileId } : { preferredModel: model }
+}
+
+function preferredModelFromPublicState(state) {
+  const profileId = String(state?.currentModelProfileId || '').trim()
+  if (profileId) {
+    return `${ENTERPRISE_PROFILE_PREFIX}${profileId}`
+  }
+
+  return String(state?.currentModel || '').trim()
+}
+
+function modelProfileValues(profile) {
+  return profileValues(profile)
+}
+
+function extractModelProfilesResponse(payload, seen = new Set()) {
+  if (Array.isArray(payload)) {
+    return payload
+  }
+
+  if (!payload || typeof payload !== 'object' || seen.has(payload)) {
+    return []
+  }
+
+  seen.add(payload)
+
+  for (const key of ['modelProfiles', 'profiles', 'items', 'models', 'results', 'data']) {
+    const value = payload[key]
+    if (Array.isArray(value)) {
+      return value
+    }
+
+    const nested = extractModelProfilesResponse(value, seen)
+    if (nested.length > 0) {
+      return nested
+    }
+  }
+
+  return []
 }
 
 function publicStateAllowsModel(state, model) {
@@ -214,21 +305,23 @@ class EnterpriseRuntime {
       throw new Error('Enterprise sign-in is required before starting Hermes.')
     }
 
-    const [bootstrap, modelProfiles] = await Promise.all([
+    const [bootstrap, modelProfilesPayload] = await Promise.all([
       this.client.bootstrap(session.desktopToken),
       this.client.modelProfiles(session.desktopToken)
     ])
+    const modelProfiles = extractModelProfilesResponse(modelProfilesPayload)
+    const effectivePreferredModel = preferredModel || preferredModelFromPublicState(this.lastPublicState)
 
     const manifest = await this.client.runtimeManifest(
       session.desktopToken,
-      runtimeManifestRequestBody({ preferredModel })
+      runtimeManifestRequestBody({ modelProfiles, preferredModel: effectivePreferredModel })
     )
 
     const launch = this.homeWriter({
       bootstrap,
       hermesHome: this.managedHomeFor({ bootstrap, session }),
       manifest,
-      modelProfiles: Array.isArray(modelProfiles) ? modelProfiles : modelProfiles?.modelProfiles || modelProfiles?.profiles || []
+      modelProfiles
     })
 
     this.lastLaunch = launch
@@ -266,10 +359,10 @@ class EnterpriseRuntime {
       this.client.bootstrap(session.desktopToken),
       this.client.modelProfiles(session.desktopToken)
     ])
-    const profiles = Array.isArray(modelProfiles) ? modelProfiles : modelProfiles?.modelProfiles || modelProfiles?.profiles || []
+    const profiles = extractModelProfilesResponse(modelProfiles)
     const manifest = await this.client.runtimeManifest(
       session.desktopToken,
-      runtimeManifestRequestBody({ preferredModel: model })
+      runtimeManifestRequestBody({ modelProfiles: profiles, preferredModel: model })
     )
 
     const launch = this.homeWriter({
@@ -294,6 +387,7 @@ module.exports = {
   EnterpriseRuntime,
   createEnterpriseRuntime,
   disabledState,
+  extractModelProfilesResponse,
   publicStateAllowsModel,
   resolveEnterpriseRuntimeOptions,
   runtimeManifestRequestBody,

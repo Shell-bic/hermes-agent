@@ -100,6 +100,7 @@ import { ChatSidebar } from './chat/sidebar'
 import { CommandPalette } from './command-palette'
 import { useGatewayBoot } from './gateway/hooks/use-gateway-boot'
 import { useGatewayRequest } from './gateway/hooks/use-gateway-request'
+import { useEnterpriseStateRefresh } from './hooks/use-enterprise-state-refresh'
 import { useKeybinds } from './hooks/use-keybinds'
 import { SIDEBAR_COLLAPSE_MEDIA_QUERY } from './layout-constants'
 import { ModelPickerOverlay } from './model-picker-overlay'
@@ -843,9 +844,7 @@ export function DesktopController() {
 
   const gatewayBootEnabled = enterprise.status !== 'loading' && (!enterprise.enabled || enterprise.authenticated)
 
-  useEffect(() => {
-    void refreshEnterpriseState()
-  }, [])
+  useEnterpriseStateRefresh(gatewayState)
 
   useGatewayBoot({
     enabled: gatewayBootEnabled,

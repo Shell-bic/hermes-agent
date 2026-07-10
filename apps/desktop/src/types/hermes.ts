@@ -355,6 +355,7 @@ export interface SessionRuntimeInfo {
   desktop_contract?: number
   fast?: boolean
   model?: string
+  model_profile_id?: string
   personality?: string
   provider?: string
   reasoning_effort?: string
@@ -509,6 +510,12 @@ export interface SkillInfo {
   description: string
   enabled: boolean
   name: string
+}
+
+export interface SkillContentResponse {
+  content: string
+  name: string
+  path?: string
 }
 
 export interface ToolsetInfo {

@@ -7,6 +7,7 @@ import { translateNow, type Translations, useI18n } from '@/i18n'
 import { stripAnsi } from '@/lib/ansi'
 import { branchGroupForUser, type ChatMessage, chatMessageText, textPart } from '@/lib/chat-messages'
 import {
+  enterpriseModelConfigValue,
   optimisticAttachmentRef,
   enterpriseModelSelection,
   isEnterpriseModelAllowed,
@@ -39,7 +40,7 @@ import {
 } from '@/store/composer'
 import { resetSessionBackground } from '@/store/composer-status'
 import { clearNotifications, notify, notifyError } from '@/store/notifications'
-import { $enterprise, selectEnterpriseModel } from '@/store/enterprise'
+import { $enterprise, setEnterpriseRuntimeModelSelection } from '@/store/enterprise'
 import { requestDesktopOnboarding } from '@/store/onboarding'
 import { $activeGatewayProfile, $newChatProfile, ensureGatewayProfile, normalizeProfileKey } from '@/store/profile'
 import {
@@ -1239,19 +1240,40 @@ export function usePromptActions({
 
           if (isEnterpriseModelManaged(enterprise)) {
             const requestedModel = ctx.arg.trim()
+            const selection = enterpriseModelSelection(enterprise, requestedModel)
 
-            if (!isEnterpriseModelAllowed(enterprise, requestedModel)) {
+            if (!isEnterpriseModelAllowed(enterprise, requestedModel) || !selection) {
               notify({ kind: 'error', message: '该模型未被企业策略授权。' })
 
               return
             }
 
-            const nextEnterprise = await selectEnterpriseModel(requestedModel)
-            const selection = enterpriseModelSelection(nextEnterprise, requestedModel)
-
             if (selection) {
+              const prevModel = $currentModel.get()
+              const prevProvider = $currentProvider.get()
+              const prevEnterprise = $enterprise.get()
+              const sessionId = activeSessionIdRef.current
+
               $currentModel.set(selection.model)
               $currentProvider.set(selection.provider)
+              setEnterpriseRuntimeModelSelection(selection.model, selection.profileId)
+
+              if (sessionId) {
+                try {
+                  await requestGateway('config.set', {
+                    session_id: sessionId,
+                    key: 'model',
+                    value: enterpriseModelConfigValue(selection)
+                  })
+                } catch (err) {
+                  $currentModel.set(prevModel)
+                  $currentProvider.set(prevProvider)
+                  $enterprise.set(prevEnterprise)
+                  notifyError(err, copy.modelSwitchFailed)
+
+                  return
+                }
+              }
               notify({ kind: 'success', message: `已切换到企业模型：${selection.model}` })
             }
 

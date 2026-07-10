@@ -74,11 +74,16 @@ from hermes_cli.enterprise_policy import (
     load_enterprise_policy,
     managed_model_option_provider,
     model_display_name as enterprise_model_display_name,
+    require_mcp_allowed,
     runtime_defaults as enterprise_runtime_defaults,
     require_env_write_allowed,
+    require_skill_allowed,
     require_model_allowed,
     require_model_config_write_allowed,
     require_surface_allowed,
+    require_toolset_allowed,
+    tool_policy_snapshot,
+    tool_policy_status,
 )
 from gateway.status import (
     get_running_pid,
@@ -261,6 +266,40 @@ def _require_enterprise_model_config_write(
         require_model_config_write_allowed(current, proposed, action=action)
     except EnterprisePolicyDenied as exc:
         raise _enterprise_forbidden(exc) from exc
+
+
+def _require_enterprise_skill(name: str, action: str) -> None:
+    try:
+        require_skill_allowed(name, action=action)
+    except EnterprisePolicyDenied as exc:
+        raise _enterprise_forbidden(exc) from exc
+
+
+def _require_enterprise_toolset(name: str, action: str) -> None:
+    try:
+        require_toolset_allowed(name, action=action)
+    except EnterprisePolicyDenied as exc:
+        raise _enterprise_forbidden(exc) from exc
+
+
+def _require_enterprise_mcp(name: str, action: str) -> None:
+    try:
+        require_mcp_allowed(name, action=action)
+    except EnterprisePolicyDenied as exc:
+        raise _enterprise_forbidden(exc) from exc
+
+
+def _tool_policy_status(
+    collection: str,
+    key: str,
+    *,
+    default: str,
+) -> str:
+    if not is_enterprise_managed():
+        return ""
+    if not tool_policy_snapshot():
+        return ""
+    return tool_policy_status(collection, key, default=default)
 
 # CORS: restrict to localhost origins only.  The web UI is intended to run
 # locally; binding to 0.0.0.0 with allow_origins=["*"] would let any website
@@ -7556,7 +7595,7 @@ def _redact_mcp_env(env: Dict[str, Any]) -> Dict[str, str]:
 
 def _mcp_server_summary(name: str, cfg: Dict[str, Any]) -> Dict[str, Any]:
     transport = "http" if cfg.get("url") else ("stdio" if cfg.get("command") else "unknown")
-    return {
+    summary = {
         "name": name,
         "transport": transport,
         "url": cfg.get("url"),
@@ -7568,6 +7607,10 @@ def _mcp_server_summary(name: str, cfg: Dict[str, Any]) -> Dict[str, Any]:
         # Tool selection: list of enabled tool names, or None = all.
         "tools": cfg.get("tools"),
     }
+    status = _tool_policy_status("mcpServers", name, default="userCreated")
+    if status:
+        summary["policyStatus"] = status
+    return summary
 
 
 @app.get("/api/mcp/servers")
@@ -7585,12 +7628,12 @@ async def list_mcp_servers(profile: Optional[str] = None):
 
 @app.post("/api/mcp/servers")
 async def add_mcp_server(body: MCPServerCreate, profile: Optional[str] = None):
-    _require_enterprise_surface("mcp", action="/api/mcp/servers", capability="mcp.manage")
     from hermes_cli.mcp_config import _get_mcp_servers, _save_mcp_server
 
     name = (body.name or "").strip()
     if not name:
         raise HTTPException(status_code=400, detail="Server name is required")
+    _require_enterprise_mcp(name, "/api/mcp/servers")
     with _profile_scope(body.profile or profile):
         existing = _get_mcp_servers()
     if name in existing:
@@ -7631,7 +7674,7 @@ async def add_mcp_server(body: MCPServerCreate, profile: Optional[str] = None):
 
 @app.delete("/api/mcp/servers/{name}")
 async def remove_mcp_server(name: str, profile: Optional[str] = None):
-    _require_enterprise_surface("mcp", action="/api/mcp/servers", capability="mcp.manage")
+    _require_enterprise_mcp(name, "/api/mcp/servers")
     from hermes_cli.mcp_config import _remove_mcp_server
 
     with _profile_scope(profile):
@@ -7646,6 +7689,7 @@ async def test_mcp_server(name: str, profile: Optional[str] = None):
     """Connect to the server, list its tools, disconnect.  Returns tool list."""
     from hermes_cli.mcp_config import _get_mcp_servers, _probe_single_server
 
+    _require_enterprise_mcp(name, "/api/mcp/servers/test")
     with _profile_scope(profile):
         servers = _get_mcp_servers()
     if name not in servers:
@@ -7696,7 +7740,7 @@ async def set_mcp_server_enabled(
     flag the agent reads at startup.  Disabled servers stay in config so they
     can be re-enabled without re-entering their settings.
     """
-    _require_enterprise_surface("mcp", action="/api/mcp/servers/enabled", capability="mcp.manage")
+    _require_enterprise_mcp(name, "/api/mcp/servers/enabled")
     with _profile_scope(body.profile or profile):
         cfg = load_config()
         servers = cfg.get("mcp_servers")
@@ -7735,7 +7779,7 @@ async def list_mcp_catalog(profile: Optional[str] = None):
             }
         for entry in catalog_entries:
             auth = entry.auth
-            entries.append({
+            item = {
                 "name": entry.name,
                 "description": entry.description,
                 "source": entry.source,
@@ -7749,7 +7793,11 @@ async def list_mcp_catalog(profile: Optional[str] = None):
                 "needs_install": entry.install is not None,
                 "installed": installed_state.get(entry.name, (False, False))[0],
                 "enabled": installed_state.get(entry.name, (False, False))[1],
-            })
+            }
+            status = _tool_policy_status("mcpServers", entry.name, default="available")
+            if status:
+                item["policyStatus"] = status
+            entries.append(item)
     except HTTPException:
         # Unknown/invalid profile → 404, not a silently-empty catalog.
         raise
@@ -7785,10 +7833,10 @@ async def install_mcp_catalog_entry(body: MCPCatalogInstall, profile: Optional[s
     Entries that need a git bootstrap (``needs_install``) are installed via
     the CLI action path because the clone can take time.
     """
-    _require_enterprise_surface("mcp", action="/api/mcp/catalog/install", capability="mcp.manage")
     from hermes_cli import mcp_catalog
 
     name = (body.name or "").strip()
+    _require_enterprise_mcp(name, "/api/mcp/catalog/install")
     entry = mcp_catalog.get_entry(name)
     if entry is None:
         raise HTTPException(status_code=404, detail=f"No catalog entry '{name}'")
@@ -9789,12 +9837,15 @@ async def get_skills(profile: Optional[str] = None):
         skills = _find_all_skills(skip_disabled=True)
     for s in skills:
         s["enabled"] = s["name"] not in disabled
+        status = _tool_policy_status("skills", s["name"], default="userCreated")
+        if status:
+            s["policyStatus"] = status
     return skills
 
 
 @app.put("/api/skills/toggle")
 async def toggle_skill(body: SkillToggle, profile: Optional[str] = None):
-    _require_enterprise_surface("skills", action="/api/skills/toggle", capability="skills.manage")
+    _require_enterprise_skill(body.name, "/api/skills/toggle")
     from hermes_cli.skills_config import get_disabled_skills, save_disabled_skills
     with _profile_scope(body.profile or profile):
         config = load_config()
@@ -9861,7 +9912,7 @@ async def create_skill(body: SkillCreate):
     optional security scan) — but bypasses the agent write-approval gate:
     a write from the authenticated dashboard IS the user acting directly.
     """
-    _require_enterprise_surface("skills", action="/api/skills", capability="skills.manage")
+    _require_enterprise_skill(body.name, "/api/skills")
     from tools.skill_manager_tool import _create_skill
 
     with _profile_scope(body.profile):
@@ -9875,7 +9926,7 @@ async def create_skill(body: SkillCreate):
 @app.put("/api/skills/content")
 async def update_skill_content(body: SkillContentUpdate):
     """Replace the SKILL.md of an existing skill (full rewrite) from the editor."""
-    _require_enterprise_surface("skills", action="/api/skills/content", capability="skills.manage")
+    _require_enterprise_skill(body.name, "/api/skills/content")
     from tools.skill_manager_tool import _edit_skill
 
     with _profile_scope(body.profile):
@@ -9912,7 +9963,7 @@ async def get_toolsets(profile: Optional[str] = None):
         except Exception:
             tools = []
         is_enabled = name in enabled_toolsets
-        result.append({
+        item = {
             "name": name,
             "label": gui_toolset_label(label),
             "description": desc,
@@ -9920,7 +9971,11 @@ async def get_toolsets(profile: Optional[str] = None):
             "available": is_enabled,
             "configured": _toolset_has_keys(name, config),
             "tools": tools,
-        })
+        }
+        status = _tool_policy_status("toolsets", name, default="available")
+        if status:
+            item["policyStatus"] = status
+        result.append(item)
     return result
 
 
@@ -9938,7 +9993,7 @@ async def toggle_toolset(name: str, body: ToolsetToggle, profile: Optional[str] 
     lockstep. Scoped to ``body.profile`` when provided. Returns 400 for
     unknown toolset keys.
     """
-    _require_enterprise_surface("toolsets", action="/api/tools/toolsets", capability="toolsets.manage")
+    _require_enterprise_toolset(name, "/api/tools/toolsets")
     from hermes_cli.tools_config import (
         _get_effective_configurable_toolsets,
         _get_platform_tools,
@@ -9983,6 +10038,7 @@ async def get_toolset_config(name: str, profile: Optional[str] = None):
     valid = {ts_key for ts_key, _, _ in _get_effective_configurable_toolsets()}
     if name not in valid:
         raise HTTPException(status_code=400, detail=f"Unknown toolset: {name}")
+    _require_enterprise_toolset(name, "/api/tools/toolsets/config")
 
     with _profile_scope(profile):
         config = load_config()
@@ -10042,7 +10098,7 @@ async def select_toolset_provider(
     API keys and post-setup flows are handled by separate endpoints. Returns
     400 for unknown toolset or provider names.
     """
-    _require_enterprise_surface("toolsets", action="/api/tools/toolsets/provider", capability="toolsets.manage")
+    _require_enterprise_toolset(name, "/api/tools/toolsets/provider")
     from hermes_cli.tools_config import (
         apply_provider_selection,
         _get_effective_configurable_toolsets,
@@ -10079,7 +10135,7 @@ async def save_toolset_env(name: str, body: ToolsetEnvUpdate, profile: Optional[
     "leave unchanged" and skipped. Returns the saved/skipped key lists and the
     refreshed ``is_set`` status. Returns 400 for unknown toolset or env keys.
     """
-    _require_enterprise_surface("toolsets", action="/api/tools/toolsets/env", capability="toolsets.manage")
+    _require_enterprise_toolset(name, "/api/tools/toolsets/env")
     from hermes_cli.tools_config import (
         TOOL_CATEGORIES,
         _get_effective_configurable_toolsets,
@@ -10148,7 +10204,7 @@ async def run_toolset_post_setup(
     write per-profile state must see the same HERMES_HOME the rest of the
     drawer's writes targeted — so the scope is threaded for consistency.
     """
-    _require_enterprise_surface("toolsets", action="/api/tools/toolsets/post-setup", capability="toolsets.manage")
+    _require_enterprise_toolset(name, "/api/tools/toolsets/post-setup")
     from hermes_cli.tools_config import (
         _get_effective_configurable_toolsets,
         valid_post_setup_keys,

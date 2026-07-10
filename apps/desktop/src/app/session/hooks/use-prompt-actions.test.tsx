@@ -54,6 +54,7 @@ interface HarnessHandle {
 }
 
 function Harness({
+  activeRuntimeSessionId,
   busyRef,
   onReady,
   onSeedState,
@@ -63,6 +64,7 @@ function Harness({
   seedMessages,
   storedSessionId
 }: {
+  activeRuntimeSessionId?: null | string
   busyRef?: MutableRefObject<boolean>
   onReady: (handle: HarnessHandle) => void
   onSeedState?: (state: Record<string, unknown>) => void
@@ -72,7 +74,8 @@ function Harness({
   seedMessages?: unknown[]
   storedSessionId?: null | string
 }) {
-  const activeSessionIdRef: MutableRefObject<string | null> = { current: RUNTIME_SESSION_ID }
+  const runtimeSessionId = activeRuntimeSessionId === undefined ? RUNTIME_SESSION_ID : activeRuntimeSessionId
+  const activeSessionIdRef: MutableRefObject<string | null> = { current: runtimeSessionId }
   const selectedStoredSessionIdRef: MutableRefObject<string | null> = {
     current: storedSessionId === undefined ? RUNTIME_SESSION_ID : storedSessionId
   }
@@ -85,11 +88,11 @@ function Harness({
   } as never)
 
   const actions = usePromptActions({
-    activeSessionId: RUNTIME_SESSION_ID,
+    activeSessionId: runtimeSessionId,
     activeSessionIdRef,
     branchCurrentSession: async () => true,
     busyRef: localBusyRef,
-    createBackendSessionForSend: async () => RUNTIME_SESSION_ID,
+    createBackendSessionForSend: async () => runtimeSessionId,
     handleSkinCommand: () => '',
     refreshSessions,
     requestGateway,
@@ -217,6 +220,7 @@ describe('usePromptActions desktop slash pickers', () => {
     $enterprise.set(INITIAL_ENTERPRISE_STATE)
     $currentModel.set('')
     $currentProvider.set('')
+    Reflect.deleteProperty(window, 'hermesDesktop')
     vi.restoreAllMocks()
   })
 
@@ -270,7 +274,7 @@ describe('usePromptActions desktop slash pickers', () => {
     })
   })
 
-  it('handles typed /model arguments through enterprise policy instead of slash.exec', async () => {
+  it('handles active-session typed /model through enterprise config.set instead of manifest refresh', async () => {
     $enterprise.set({
       ...INITIAL_ENTERPRISE_STATE,
       allowedModels: ['enterprise/allowed'],
@@ -292,11 +296,7 @@ describe('usePromptActions desktop slash pickers', () => {
       configurable: true,
       value: {
         enterprise: {
-          selectModel: vi.fn(async () => ({
-            ...$enterprise.get(),
-            currentModel: 'enterprise/allowed',
-            currentModelProfileId: 'profile-1'
-          }))
+          selectModel: vi.fn()
         }
       }
     })
@@ -308,15 +308,106 @@ describe('usePromptActions desktop slash pickers', () => {
 
     await handle!.submitText('/model enterprise/allowed')
 
-    expect(window.hermesDesktop.enterprise.selectModel).toHaveBeenCalledWith('enterprise/allowed')
+    expect(window.hermesDesktop.enterprise.selectModel).not.toHaveBeenCalled()
+    expect(requestGateway).toHaveBeenCalledWith('config.set', {
+      session_id: RUNTIME_SESSION_ID,
+      key: 'model',
+      value: 'enterprise-profile:profile-1 --provider company-gateway'
+    })
     expect(requestGateway).not.toHaveBeenCalledWith('slash.exec', expect.anything())
     expect($currentModel.get()).toBe('enterprise/allowed')
     expect($currentProvider.get()).toBe('company-gateway')
+    expect($enterprise.get().currentModelProfileId).toBe('profile-1')
 
     await handle!.submitText('/model personal/model')
 
     expect(requestGateway).not.toHaveBeenCalledWith('slash.exec', expect.anything())
-    expect(window.hermesDesktop.enterprise.selectModel).toHaveBeenCalledTimes(1)
+    expect(window.hermesDesktop.enterprise.selectModel).not.toHaveBeenCalled()
+    expect(requestGateway).toHaveBeenCalledTimes(1)
+  })
+
+  it('handles typed enterprise profile tokens without losing the profile identity', async () => {
+    $enterprise.set({
+      ...INITIAL_ENTERPRISE_STATE,
+      allowedModels: ['glm-5.2'],
+      authenticated: true,
+      currentModel: 'glm-5.2',
+      currentModelProfileId: 'profile-a',
+      defaultModel: 'glm-5.2',
+      enabled: true,
+      modelProfiles: [
+        { id: 'profile-a', model: 'glm-5.2', name: 'GLM Anthropic' },
+        { id: 'profile-b', model: 'glm-5.2', name: 'GLM OpenAI Compatible' }
+      ],
+      status: 'authenticated'
+    })
+
+    Object.defineProperty(window, 'hermesDesktop', {
+      configurable: true,
+      value: {
+        enterprise: {
+          selectModel: vi.fn()
+        }
+      }
+    })
+
+    const requestGateway = vi.fn(async () => ({}) as never)
+
+    let handle: HarnessHandle | null = null
+    render(<Harness onReady={h => (handle = h)} refreshSessions={async () => undefined} requestGateway={requestGateway} />)
+
+    await handle!.submitText('/model enterprise-profile:profile-b')
+
+    expect(window.hermesDesktop.enterprise.selectModel).not.toHaveBeenCalled()
+    expect(requestGateway).toHaveBeenCalledWith('config.set', {
+      session_id: RUNTIME_SESSION_ID,
+      key: 'model',
+      value: 'enterprise-profile:profile-b --provider company-gateway'
+    })
+    expect(requestGateway).not.toHaveBeenCalledWith('slash.exec', expect.anything())
+    expect($currentModel.get()).toBe('glm-5.2')
+    expect($currentProvider.get()).toBe('company-gateway')
+    expect($enterprise.get().currentModelProfileId).toBe('profile-b')
+  })
+
+  it('handles no-session typed /model as enterprise composer state only', async () => {
+    $enterprise.set({
+      ...INITIAL_ENTERPRISE_STATE,
+      allowedModels: ['enterprise/allowed'],
+      authenticated: true,
+      currentModel: 'enterprise/current',
+      defaultModel: 'enterprise/allowed',
+      enabled: true,
+      status: 'authenticated'
+    })
+
+    Object.defineProperty(window, 'hermesDesktop', {
+      configurable: true,
+      value: {
+        enterprise: {
+          selectModel: vi.fn()
+        }
+      }
+    })
+
+    const requestGateway = vi.fn(async () => ({}) as never)
+
+    let handle: HarnessHandle | null = null
+    render(
+      <Harness
+        activeRuntimeSessionId={null}
+        onReady={h => (handle = h)}
+        refreshSessions={async () => undefined}
+        requestGateway={requestGateway}
+      />
+    )
+
+    await handle!.submitText('/model enterprise/allowed')
+
+    expect(window.hermesDesktop.enterprise.selectModel).not.toHaveBeenCalled()
+    expect(requestGateway).not.toHaveBeenCalled()
+    expect($currentModel.get()).toBe('enterprise/allowed')
+    expect($currentProvider.get()).toBe('company-gateway')
   })
 })
 

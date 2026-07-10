@@ -159,6 +159,7 @@ export function effectiveVisibleKeys(
 }
 
 const ENTERPRISE_PROVIDER_SLUG = 'company-gateway'
+const ENTERPRISE_PROFILE_PREFIX = 'enterprise-profile:'
 const ENTERPRISE_PROVIDER_NAME = '企业模型'
 
 export function isEnterpriseModelManaged(state: EnterpriseDesktopState): boolean {
@@ -189,10 +190,69 @@ function enterpriseProfileModel(profile: EnterpriseModelProfileSummary): string 
   )
 }
 
+export function enterpriseProfileOptionId(profile: EnterpriseModelProfileSummary): string | null {
+  const id = firstString(profile.id)
+
+  return id ? `${ENTERPRISE_PROFILE_PREFIX}${id}` : enterpriseProfileModel(profile)
+}
+
+export function enterpriseProfileIdFromOption(model: string): string | null {
+  const value = String(model || '').trim()
+
+  return value.startsWith(ENTERPRISE_PROFILE_PREFIX) ? value.slice(ENTERPRISE_PROFILE_PREFIX.length) || null : null
+}
+
+export function enterpriseProfileForSelection(
+  state: EnterpriseDesktopState,
+  selection: string | null | undefined
+): EnterpriseModelProfileSummary | null {
+  const value = String(selection || '').trim()
+
+  if (!value) {
+    return null
+  }
+
+  const profileId = enterpriseProfileIdFromOption(value)
+
+  for (const profile of state.modelProfiles ?? []) {
+    const optionId = enterpriseProfileOptionId(profile)
+    const model = enterpriseProfileModel(profile)
+
+    if (
+      (profileId && profile.id === profileId) ||
+      optionId === value ||
+      profile.id === value ||
+      (!profileId && model === value)
+    ) {
+      return profile
+    }
+  }
+
+  return null
+}
+
 function enterpriseProfileName(profile: EnterpriseModelProfileSummary, fallback: string): string {
   const expanded = profile as EnterpriseModelProfileSummary & Record<string, unknown>
 
   return firstString(expanded.name, expanded.displayName, expanded.display_name, expanded.label, fallback) ?? fallback
+}
+
+function enterpriseProfileDisplayLabel(state: EnterpriseDesktopState, profile: EnterpriseModelProfileSummary): string {
+  const model = enterpriseProfileModel(profile) ?? ''
+  const base = enterpriseProfileName(profile, model)
+  const duplicateBaseCount = (state.modelProfiles ?? []).filter(item => {
+    const itemModel = enterpriseProfileModel(item)
+
+    return itemModel === model && enterpriseProfileName(item, itemModel ?? '') === base
+  }).length
+
+  if (duplicateBaseCount <= 1) {
+    return base
+  }
+
+  const qualifier = firstString(profile.providerName, profile.name, profile.modelProviderId, profile.id)
+
+  return qualifier && qualifier !== base ? `${base} · ${qualifier}` : base
 }
 
 function enterpriseCapabilities(profile: EnterpriseModelProfileSummary): ModelCapabilities | undefined {
@@ -215,9 +275,11 @@ export function enterpriseModelOptionsFromState(state: EnterpriseDesktopState): 
   const models: string[] = []
   const capabilities: Record<string, ModelCapabilities> = {}
   const seen = new Set<string>()
+  const representedModels = new Set<string>()
 
   for (const profile of state.modelProfiles ?? []) {
-    const model = enterpriseProfileModel(profile)
+    const model = enterpriseProfileOptionId(profile)
+    const runtimeModel = enterpriseProfileModel(profile)
 
     if (!model || seen.has(model)) {
       continue
@@ -225,6 +287,9 @@ export function enterpriseModelOptionsFromState(state: EnterpriseDesktopState): 
 
     seen.add(model)
     models.push(model)
+    if (runtimeModel) {
+      representedModels.add(runtimeModel)
+    }
 
     const caps = enterpriseCapabilities(profile)
 
@@ -234,11 +299,18 @@ export function enterpriseModelOptionsFromState(state: EnterpriseDesktopState): 
   }
 
   for (const model of state.allowedModels ?? []) {
-    if (model && !seen.has(model)) {
+    if (model && !seen.has(model) && !representedModels.has(model)) {
       seen.add(model)
       models.push(model)
     }
   }
+
+  const currentProfile =
+    (state.currentModelProfileId &&
+      (state.modelProfiles ?? []).find(profile => profile.id === state.currentModelProfileId)) ||
+    enterpriseProfileForSelection(state, state.currentModel) ||
+    enterpriseProfileForSelection(state, state.defaultModel)
+  const currentModel = currentProfile ? enterpriseProfileOptionId(currentProfile) : null
 
   const provider: ModelOptionProvider = {
     authenticated: true,
@@ -250,13 +322,19 @@ export function enterpriseModelOptionsFromState(state: EnterpriseDesktopState): 
   }
 
   return {
-    model: models[0],
+    model: currentModel && models.includes(currentModel) ? currentModel : models[0],
     provider: ENTERPRISE_PROVIDER_SLUG,
     providers: models.length > 0 ? [provider] : []
   }
 }
 
 export function enterpriseModelDisplayName(state: EnterpriseDesktopState, model: string): string {
+  const selectedProfile = enterpriseProfileForSelection(state, model)
+
+  if (selectedProfile) {
+    return enterpriseProfileDisplayLabel(state, selectedProfile)
+  }
+
   for (const profile of state.modelProfiles ?? []) {
     const profileModel = enterpriseProfileModel(profile)
 

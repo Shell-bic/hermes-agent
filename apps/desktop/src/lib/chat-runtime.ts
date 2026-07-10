@@ -6,6 +6,10 @@ import { formatRefValue } from '@/components/assistant-ui/directive-text'
 import { type ChatMessage, type ChatMessagePart, chatMessageText, textPart } from '@/lib/chat-messages'
 import type { ComposerAttachment } from '@/store/composer'
 import type { EnterpriseDesktopState } from '@/global'
+import {
+  enterpriseProfileForSelection,
+  enterpriseProfileOptionId
+} from '@/store/model-visibility'
 import type { ModelOptionsResponse, SessionInfo } from '@/types/hermes'
 
 export const SLASH_COMMAND_RE = /^\/[^\s/]*(?:\s|$)/
@@ -336,6 +340,8 @@ export function enterpriseAllowedModels(state: EnterpriseDesktopState): string[]
   for (const profile of state.modelProfiles ?? []) {
     const expanded = profile as typeof profile & Record<string, unknown>
 
+    add(enterpriseProfileOptionId(profile))
+    add(expanded.id)
     add(expanded.model)
     add(expanded.modelId)
     add(expanded.model_id)
@@ -350,10 +356,74 @@ export function enterpriseAllowedModels(state: EnterpriseDesktopState): string[]
   return models
 }
 
+export interface EnterpriseModelSelection {
+  model: string
+  profileId?: string | null
+  provider: string
+  selectionModel?: string | null
+}
+
 export function enterpriseModelSelection(
   state: EnterpriseDesktopState,
   preferred?: string | null
-): { model: string; provider: string } | null {
+): EnterpriseModelSelection | null {
+  const normalizedPreferred = typeof preferred === 'string' ? preferred.trim() : ''
+  const currentProfile =
+    (state.currentModelProfileId &&
+      (state.modelProfiles ?? []).find(profile => profile.id === state.currentModelProfileId)) ||
+    null
+
+  if (normalizedPreferred && currentProfile) {
+    const currentProfileSelection = enterpriseProfileForSelection(
+      { ...state, modelProfiles: [currentProfile], allowedModels: [] },
+      normalizedPreferred
+    )
+
+    if (currentProfileSelection) {
+      const model = enterpriseAllowedModels({ ...state, modelProfiles: [currentProfile], allowedModels: [] })
+        .filter(item => !item.startsWith('enterprise-profile:') && item !== currentProfile.id)[0]
+
+      return model
+        ? {
+            model,
+            profileId: currentProfile.id,
+            provider: ENTERPRISE_MODEL_PROVIDER,
+            selectionModel: enterpriseProfileOptionId(currentProfile)
+          }
+        : null
+    }
+  }
+
+  const preferredProfile = enterpriseProfileForSelection(state, preferred)
+  if (preferredProfile) {
+    const model = enterpriseAllowedModels({ ...state, modelProfiles: [preferredProfile], allowedModels: [] })
+      .filter(item => !item.startsWith('enterprise-profile:') && item !== preferredProfile.id)[0]
+
+    return model
+      ? {
+          model,
+          profileId: preferredProfile.id,
+          provider: ENTERPRISE_MODEL_PROVIDER,
+          selectionModel: enterpriseProfileOptionId(preferredProfile)
+        }
+      : null
+  }
+
+  const fallbackCurrentProfile = currentProfile || enterpriseProfileForSelection(state, state.currentModel)
+  if (!preferred && fallbackCurrentProfile) {
+    const model = enterpriseAllowedModels({ ...state, modelProfiles: [fallbackCurrentProfile], allowedModels: [] })
+      .filter(item => !item.startsWith('enterprise-profile:') && item !== fallbackCurrentProfile.id)[0]
+
+    return model
+      ? {
+          model,
+          profileId: fallbackCurrentProfile.id,
+          provider: ENTERPRISE_MODEL_PROVIDER,
+          selectionModel: enterpriseProfileOptionId(fallbackCurrentProfile)
+        }
+      : null
+  }
+
   const allowed = enterpriseAllowedModels(state)
   const candidates = [preferred, state.currentModel, state.defaultModel, ...allowed]
     .filter((model): model is string => typeof model === 'string' && Boolean(model.trim()))
@@ -362,6 +432,18 @@ export function enterpriseModelSelection(
   const model = candidates.find(candidate => allowed.includes(candidate)) ?? null
 
   return model ? { model, provider: ENTERPRISE_MODEL_PROVIDER } : null
+}
+
+export function enterpriseModelWireValue(selection: EnterpriseModelSelection | string): string {
+  if (typeof selection === 'string') {
+    return selection.trim()
+  }
+
+  return (selection.selectionModel || selection.model).trim()
+}
+
+export function enterpriseModelConfigValue(selection: EnterpriseModelSelection | string): string {
+  return `${enterpriseModelWireValue(selection)} --provider ${ENTERPRISE_MODEL_PROVIDER}`
 }
 
 export function isEnterpriseModelAllowed(state: EnterpriseDesktopState, model: string): boolean {

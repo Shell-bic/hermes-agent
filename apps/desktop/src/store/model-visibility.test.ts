@@ -7,6 +7,7 @@ import {
   collapseModelFamilies,
   enterpriseModelDisplayName,
   enterpriseModelOptionsFromState,
+  enterpriseProfileOptionId,
   effectiveVisibleKeys,
   emptyProviderSentinelKey,
   isEnterpriseModelManaged,
@@ -101,14 +102,17 @@ describe('model visibility', () => {
       allowedModels: ['kimi-k2-enterprise'],
       authenticated: true,
       enabled: true,
+      generatedAt: null,
       lockedSurfaces: [],
       modelProfiles: [
         { id: 'profile-1', model: 'qwen-max-enterprise', name: 'Qwen Max' },
         { id: 'profile-2', model: 'kimi-k2-enterprise', name: 'Kimi K2' }
       ],
+      policyHash: null,
       policyVersion: 'v1',
       role: null,
       status: 'authenticated',
+      toolPolicySnapshot: null,
       user: null
     }
 
@@ -117,7 +121,43 @@ describe('model visibility', () => {
     expect(isEnterpriseModelManaged(state)).toBe(true)
     expect(options.provider).toBe('company-gateway')
     expect(options.providers?.[0]?.slug).toBe('company-gateway')
-    expect(options.providers?.[0]?.models).toEqual(['qwen-max-enterprise', 'kimi-k2-enterprise'])
-    expect(enterpriseModelDisplayName(state, 'qwen-max-enterprise')).toBe('Qwen Max')
+    expect(options.providers?.[0]?.models).toEqual([
+      'enterprise-profile:profile-1',
+      'enterprise-profile:profile-2'
+    ])
+    expect(enterpriseModelDisplayName(state, 'enterprise-profile:profile-1')).toBe('Qwen Max')
+  })
+
+  it('keeps enterprise profiles distinct when they share the same runtime model', () => {
+    const state: EnterpriseDesktopState = {
+      allowedModels: ['kimi-for-coding'],
+      authenticated: true,
+      currentModel: 'kimi-for-coding',
+      currentModelProfileId: 'profile-2',
+      defaultModel: 'kimi-for-coding',
+      enabled: true,
+      generatedAt: null,
+      lockedSurfaces: [],
+      modelProfiles: [
+        { id: 'profile-1', model: 'kimi-for-coding', name: 'Kimi A', providerName: 'provider-a' },
+        { id: 'profile-2', model: 'kimi-for-coding', name: 'Kimi B', providerName: 'provider-b' }
+      ],
+      policyHash: null,
+      policyVersion: 'v1',
+      role: null,
+      status: 'authenticated',
+      toolPolicySnapshot: null,
+      user: null
+    }
+
+    const options = enterpriseModelOptionsFromState(state)
+
+    expect(options.model).toBe('enterprise-profile:profile-2')
+    expect(options.providers?.[0]?.models).toEqual([
+      enterpriseProfileOptionId(state.modelProfiles[0]),
+      enterpriseProfileOptionId(state.modelProfiles[1])
+    ])
+    expect(enterpriseModelDisplayName(state, 'enterprise-profile:profile-1')).toBe('Kimi A')
+    expect(enterpriseModelDisplayName(state, 'enterprise-profile:profile-2')).toBe('Kimi B')
   })
 })

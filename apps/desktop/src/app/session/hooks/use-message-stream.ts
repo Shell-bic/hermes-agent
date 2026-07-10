@@ -29,6 +29,7 @@ import { parseTodos } from '@/lib/todos'
 import { setClarifyRequest } from '@/store/clarify'
 import { setSessionCompacting } from '@/store/compaction'
 import { refreshBackgroundProcesses } from '@/store/composer-status'
+import { setEnterpriseRuntimeModelSelection } from '@/store/enterprise'
 import { $gateway } from '@/store/gateway'
 import { dispatchNativeNotification } from '@/store/native-notifications'
 import { notify } from '@/store/notifications'
@@ -737,6 +738,10 @@ export function useMessageStream({
         if (apply) {
           if (modelChanged) {
             setCurrentModel(payload!.model || '')
+          }
+
+          if (typeof payload?.model_profile_id === 'string') {
+            setEnterpriseRuntimeModelSelection(payload.model || '', payload.model_profile_id || null)
           }
 
           if (providerChanged) {

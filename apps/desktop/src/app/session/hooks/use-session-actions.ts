@@ -5,11 +5,11 @@ import type { NavigateFunction } from 'react-router-dom'
 import { deleteSession, getSession, getSessionMessages, setSessionArchived } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { type ChatMessage, chatMessageText, preserveLocalAssistantErrors, toChatMessages } from '@/lib/chat-messages'
-import { enterpriseModelSelection, normalizePersonalityValue } from '@/lib/chat-runtime'
+import { enterpriseModelSelection, enterpriseModelWireValue, normalizePersonalityValue } from '@/lib/chat-runtime'
 import { embeddedImageUrls, textWithoutEmbeddedImages } from '@/lib/embedded-images'
 import { setSessionYolo } from '@/lib/yolo-session'
 import { clearQueuedPrompts } from '@/store/composer-queue'
-import { $enterprise } from '@/store/enterprise'
+import { $enterprise, setEnterpriseRuntimeModelSelection } from '@/store/enterprise'
 import { $pinnedSessionIds } from '@/store/layout'
 import { isEnterpriseModelManaged } from '@/store/model-visibility'
 import { clearNotifications, notify, notifyError } from '@/store/notifications'
@@ -321,6 +321,10 @@ function applyRuntimeInfo(info: SessionRuntimeInfo | undefined): SessionRuntimeS
     sessionState.provider = info.provider
   }
 
+  if (typeof info.model_profile_id === 'string') {
+    setEnterpriseRuntimeModelSelection(info.model || '', info.model_profile_id || null)
+  }
+
   if (info.cwd) {
     setCurrentCwd(info.cwd)
     sessionState.cwd = info.cwd
@@ -469,7 +473,7 @@ export function useSessionActions({
           ...(cwd && { cwd }),
           ...(newChatProfile ? { profile: newChatProfile } : {}),
           ...(enterpriseSelection
-            ? { model: enterpriseSelection.model, provider: enterpriseSelection.provider }
+            ? { model: enterpriseModelWireValue(enterpriseSelection), provider: enterpriseSelection.provider }
             : uiModel
               ? { model: uiModel, ...(uiProvider ? { provider: uiProvider } : {}) }
               : {}),

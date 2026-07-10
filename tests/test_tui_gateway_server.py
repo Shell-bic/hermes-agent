@@ -1199,6 +1199,62 @@ def test_persist_live_session_runtime_preserves_resume_metadata(monkeypatch):
     )
 
 
+def test_persist_live_session_runtime_tracks_enterprise_profile_id():
+    updates = []
+
+    class FakeDB:
+        def __init__(self, model_config):
+            self.model_config = model_config
+
+        def get_session(self, session_id):
+            assert session_id == "stored-session"
+            return {"model_config": self.model_config}
+
+        def update_session_meta(self, session_id, model_config_json, model=None):
+            updates.append((session_id, json.loads(model_config_json), model))
+
+    agent = types.SimpleNamespace(
+        model="glm-5.2",
+        provider="company-gateway",
+        base_url="https://gateway.example/v1",
+        api_mode="anthropic_messages",
+        reasoning_config=None,
+        service_tier=None,
+    )
+
+    agent._session_db = FakeDB('{"_branched_from":"root"}')
+    server._persist_live_session_runtime(
+        {
+            "agent": agent,
+            "session_key": "stored-session",
+            "model_override": {
+                "model": "glm-5.2",
+                "provider": "company-gateway",
+                "model_profile_id": "profile-b",
+            },
+        }
+    )
+
+    assert updates[-1][1]["model_profile_id"] == "profile-b"
+    assert updates[-1][1]["model"] == "glm-5.2"
+    assert updates[-1][1]["provider"] == "company-gateway"
+
+    agent._session_db = FakeDB(json.dumps(updates[-1][1]))
+    server._persist_live_session_runtime(
+        {
+            "agent": agent,
+            "session_key": "stored-session",
+            "model_override": {
+                "model": "glm-5.2",
+                "provider": "company-gateway",
+                "model_profile_id": None,
+            },
+        }
+    )
+
+    assert "model_profile_id" not in updates[-1][1]
+
+
 def test_status_callback_emits_kind_and_text():
     with patch("tui_gateway.server._emit") as emit:
         cb = server._agent_cbs("sid")["status_callback"]
@@ -1596,6 +1652,61 @@ def _session(agent=None, **extra):
         "tool_progress_mode": "all",
         **extra,
     }
+
+
+def _reset_server_config_cache():
+    server._cfg_cache = None
+    server._cfg_mtime = None
+    server._cfg_path = None
+
+
+def _setup_enterprise_model_guard(monkeypatch, tmp_path, *, allowed_models=None):
+    allowed_models = allowed_models or ["allowed/model"]
+    policy_path = tmp_path / "enterprise-policy.json"
+    policy_path.write_text(
+        json.dumps(
+            {
+                "allowedModels": allowed_models,
+                "currentModel": allowed_models[0],
+                "defaultModel": allowed_models[0],
+                "modelProfiles": [
+                    {
+                        "id": "profile-allowed",
+                        "displayName": "Allowed Enterprise Model",
+                        "model": allowed_models[0],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    (home / "config.yaml").write_text(
+        "\n".join(
+            [
+                "model:",
+                "  provider: company-gateway",
+                f"  default: {allowed_models[0]}",
+                "providers:",
+                "  company-gateway:",
+                "    base_url: https://gateway.example/v1",
+                "    key_env: COMPANY_GATEWAY_TOKEN",
+                "    models:",
+                f"      {allowed_models[0]}: {{}}",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setenv("HERMES_ENTERPRISE_MANAGED", "1")
+    monkeypatch.setenv("HERMES_ENTERPRISE_TOOL_POLICY_FILE", str(policy_path))
+    monkeypatch.setenv("COMPANY_GATEWAY_TOKEN", "gateway-token")
+    token = set_hermes_home_override(home)
+    _reset_server_config_cache()
+    return token
 
 
 def test_session_close_commits_memory_and_fires_finalize_hook(monkeypatch):
@@ -3065,6 +3176,270 @@ def test_config_set_model_uses_live_switch_path(monkeypatch):
     assert resp["result"]["value"] == "new/model"
     assert resp["result"]["warning"] == "catalog unreachable"
     assert seen["args"] == ("sid", "session-key", "new/model")
+
+
+def _enterprise_agent():
+    class Agent:
+        model = "old/model"
+        provider = "company-gateway"
+        base_url = "https://gateway.example/v1"
+        api_key = "gateway-token"
+
+        def switch_model(self, **kwargs):
+            self.model = kwargs["new_model"]
+            self.provider = kwargs["new_provider"]
+            self.base_url = kwargs["base_url"]
+            self.api_key = kwargs["api_key"]
+
+    return Agent()
+
+
+def _patch_model_switch_side_effects(monkeypatch):
+    monkeypatch.setattr(server, "_restart_slash_worker", lambda *args, **kwargs: None)
+    monkeypatch.setattr(server, "_persist_live_session_runtime", lambda *args, **kwargs: None)
+    monkeypatch.setattr(server, "_persist_live_session_system_prompt", lambda *args, **kwargs: None)
+    monkeypatch.setattr(server, "_append_model_switch_marker", lambda *args, **kwargs: None)
+    monkeypatch.setattr(server, "_emit", lambda *args, **kwargs: None)
+
+
+def _switch_result(
+    *,
+    model="allowed/model",
+    provider="company-gateway",
+    base_url="https://gateway.example/v1",
+    api_key="gateway-token",
+):
+    return types.SimpleNamespace(
+        success=True,
+        new_model=model,
+        target_provider=provider,
+        api_key=api_key,
+        base_url=base_url,
+        api_mode="chat_completions",
+        warning_message="",
+        model_info=None,
+    )
+
+
+def test_enterprise_config_set_model_allows_authorized_company_gateway(
+    monkeypatch, tmp_path
+):
+    token = _setup_enterprise_model_guard(monkeypatch, tmp_path)
+    _patch_model_switch_side_effects(monkeypatch)
+    calls = []
+
+    def fake_switch_model(**kwargs):
+        calls.append(kwargs)
+        return _switch_result()
+
+    monkeypatch.setattr("hermes_cli.model_switch.switch_model", fake_switch_model)
+    server._sessions["sid"] = _session(agent=_enterprise_agent())
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "config.set",
+                "params": {
+                    "session_id": "sid",
+                    "key": "model",
+                    "value": "allowed/model --provider company-gateway",
+                    "confirm_expensive_model": True,
+                },
+            }
+        )
+
+        assert resp["result"]["value"] == "allowed/model"
+        assert calls[0]["explicit_provider"] == "company-gateway"
+        override = server._sessions["sid"]["model_override"]
+        assert override["model"] == "allowed/model"
+        assert override["provider"] == "company-gateway"
+    finally:
+        server._sessions.clear()
+        reset_hermes_home_override(token)
+        _reset_server_config_cache()
+
+
+def test_enterprise_config_set_model_profile_token_pins_request_overrides(
+    monkeypatch, tmp_path
+):
+    token = _setup_enterprise_model_guard(monkeypatch, tmp_path)
+    _patch_model_switch_side_effects(monkeypatch)
+    calls = []
+
+    def fake_switch_model(**kwargs):
+        calls.append(kwargs)
+        return _switch_result()
+
+    monkeypatch.setattr("hermes_cli.model_switch.switch_model", fake_switch_model)
+    agent = _enterprise_agent()
+    server._sessions["sid"] = _session(agent=agent)
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "config.set",
+                "params": {
+                    "session_id": "sid",
+                    "key": "model",
+                    "value": "enterprise-profile:profile-allowed --provider company-gateway",
+                    "confirm_expensive_model": True,
+                },
+            }
+        )
+
+        assert resp["result"]["value"] == "allowed/model"
+        assert calls[0]["raw_input"] == "allowed/model"
+        override = server._sessions["sid"]["model_override"]
+        assert override["model"] == "allowed/model"
+        assert override["model_profile_id"] == "profile-allowed"
+        assert override["request_overrides"] == {
+            "extra_body": {"modelProfileId": "profile-allowed"}
+        }
+        assert agent.request_overrides == {
+            "extra_body": {"modelProfileId": "profile-allowed"}
+        }
+    finally:
+        server._sessions.clear()
+        reset_hermes_home_override(token)
+        _reset_server_config_cache()
+
+
+def test_enterprise_config_set_model_rejects_unallowed_model(monkeypatch, tmp_path):
+    token = _setup_enterprise_model_guard(monkeypatch, tmp_path)
+    called = {"switch": False}
+
+    def fake_switch_model(**_kwargs):
+        called["switch"] = True
+        return _switch_result(model="blocked/model")
+
+    monkeypatch.setattr("hermes_cli.model_switch.switch_model", fake_switch_model)
+    server._sessions["sid"] = _session(agent=_enterprise_agent())
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "config.set",
+                "params": {
+                    "session_id": "sid",
+                    "key": "model",
+                    "value": "blocked/model --provider company-gateway",
+                    "confirm_expensive_model": True,
+                },
+            }
+        )
+
+        assert resp["error"]["code"] == 403
+        assert "model 'blocked/model' is not in allowedModels" in resp["error"]["message"]
+        assert called["switch"] is False
+    finally:
+        server._sessions.clear()
+        reset_hermes_home_override(token)
+        _reset_server_config_cache()
+
+
+def test_enterprise_config_set_model_rejects_provider_override(monkeypatch, tmp_path):
+    token = _setup_enterprise_model_guard(monkeypatch, tmp_path)
+    called = {"switch": False}
+
+    def fake_switch_model(**_kwargs):
+        called["switch"] = True
+        return _switch_result(provider="openrouter")
+
+    monkeypatch.setattr("hermes_cli.model_switch.switch_model", fake_switch_model)
+    server._sessions["sid"] = _session(agent=_enterprise_agent())
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "config.set",
+                "params": {
+                    "session_id": "sid",
+                    "key": "model",
+                    "value": "allowed/model --provider openrouter",
+                    "confirm_expensive_model": True,
+                },
+            }
+        )
+
+        assert resp["error"]["code"] == 403
+        assert "provider 'openrouter'" in resp["error"]["message"]
+        assert called["switch"] is False
+    finally:
+        server._sessions.clear()
+        reset_hermes_home_override(token)
+        _reset_server_config_cache()
+
+
+def test_enterprise_config_set_model_rejects_resolved_custom_endpoint(
+    monkeypatch, tmp_path
+):
+    token = _setup_enterprise_model_guard(monkeypatch, tmp_path)
+    _patch_model_switch_side_effects(monkeypatch)
+
+    def fake_switch_model(**_kwargs):
+        return _switch_result(
+            base_url="http://127.0.0.1:11434/v1",
+            api_key="no-key-required",
+        )
+
+    monkeypatch.setattr("hermes_cli.model_switch.switch_model", fake_switch_model)
+    server._sessions["sid"] = _session(agent=_enterprise_agent())
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "config.set",
+                "params": {
+                    "session_id": "sid",
+                    "key": "model",
+                    "value": "allowed/model --provider company-gateway",
+                    "confirm_expensive_model": True,
+                },
+            }
+        )
+
+        assert resp["error"]["code"] == 403
+        assert "custom endpoints" in resp["error"]["message"]
+        assert "local endpoints" in resp["error"]["message"]
+    finally:
+        server._sessions.clear()
+        reset_hermes_home_override(token)
+        _reset_server_config_cache()
+
+
+def test_enterprise_config_set_model_running_session_keeps_busy_guard(
+    monkeypatch, tmp_path
+):
+    token = _setup_enterprise_model_guard(monkeypatch, tmp_path)
+    called = {"switch": False}
+
+    def fake_switch_model(**_kwargs):
+        called["switch"] = True
+        return _switch_result()
+
+    monkeypatch.setattr("hermes_cli.model_switch.switch_model", fake_switch_model)
+    server._sessions["sid"] = _session(agent=_enterprise_agent(), running=True)
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "config.set",
+                "params": {
+                    "session_id": "sid",
+                    "key": "model",
+                    "value": "blocked/model --provider openrouter",
+                    "confirm_expensive_model": True,
+                },
+            }
+        )
+
+        assert resp["error"]["code"] == 4009
+        assert "session busy" in resp["error"]["message"]
+        assert called["switch"] is False
+    finally:
+        server._sessions.clear()
+        reset_hermes_home_override(token)
+        _reset_server_config_cache()
 
 
 def test_config_set_model_requires_confirmation_for_expensive_model(monkeypatch):

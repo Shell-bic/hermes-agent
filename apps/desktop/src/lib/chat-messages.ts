@@ -41,6 +41,7 @@ export type GatewayEventPayload = {
   duration_s?: number
   todos?: unknown
   model?: string
+  model_profile_id?: string
   provider?: string
   reasoning_effort?: string
   service_tier?: string

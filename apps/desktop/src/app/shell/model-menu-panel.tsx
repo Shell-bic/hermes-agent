@@ -98,11 +98,15 @@ export function ModelMenuPanel({ gateway, onSelectModel, requestGateway }: Model
 
   const options = enterpriseManaged ? enterpriseModelOptionsFromState(enterprise) : modelOptions.data
 
-  const { model: optionsModel, provider: optionsProvider } = currentPickerSelection(
+  const pickerSelection = currentPickerSelection(
     !!activeSessionId,
     { model: currentModel, provider: currentProvider },
     options
   )
+  const optionsModel = enterpriseManaged ? String(options?.model || pickerSelection.model || '') : pickerSelection.model
+  const optionsProvider = enterpriseManaged
+    ? String(options?.provider || pickerSelection.provider || '')
+    : pickerSelection.provider
 
   const loading = !enterpriseManaged && modelOptions.isPending && !modelOptions.data
 

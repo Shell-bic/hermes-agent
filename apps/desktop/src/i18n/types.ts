@@ -7,6 +7,16 @@
 
 export type Locale = 'en' | 'zh' | 'zh-hant' | 'ja'
 
+interface SkillsPolicyStatusCopy {
+  available: string
+  blocked: string
+  defaultEnabled: string
+  recommended: string
+  restricted: string
+  teamShared: string
+  userCreated: string
+}
+
 interface ModeOptionCopy {
   label: string
   description: string
@@ -554,7 +564,26 @@ export interface Translations {
     noDescription: string
     configured: string
     needsKeys: string
+    bestFor: string
+    callableSchema: string
+    configuration: string
+    detailExamples: string
+    details: string
+    enterprisePolicyImpact: string
+    hideDetails: (name: string) => string
+    includedTools: string
+    originalSkill: string
+    rawSkillUnavailable: string
+    riskBoundary: string
+    showDetails: (name: string) => string
+    skillContentFailed: (name: string) => string
+    skillContentLoading: string
+    skillUsage: string
+    statusMeaning: string
+    userControl: string
+    policyStatus: SkillsPolicyStatusCopy
     toolsetsEnabled: (enabled: number, total: number) => string
+    toggleSkill: (name: string) => string
     configureToolset: (label: string) => string
     toggleToolset: (label: string) => string
     skillsLoadFailed: string

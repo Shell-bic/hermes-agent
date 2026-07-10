@@ -11,6 +11,7 @@ Precedence verified here:
 """
 
 import importlib
+import json
 import os
 import sys
 import textwrap
@@ -93,6 +94,51 @@ def test_per_provider_max_output_tokens_fallback(isolated_home):
     grun = fresh_gateway()
     kw = grun._resolve_runtime_agent_kwargs()
     assert kw["max_tokens"] == 12000
+
+
+def test_enterprise_runtime_defaults_max_output_tokens_fallback(isolated_home, monkeypatch):
+    """Managed profiles use runtimeDefaults, not capability ceilings, for requests."""
+    write_cfg, fresh_gateway = isolated_home
+    monkeypatch.setenv("HERMES_ENTERPRISE_MANAGED", "1")
+    monkeypatch.setenv("COMPANY_GATEWAY_TOKEN", "gw-test")
+    monkeypatch.setenv(
+        "HERMES_ENTERPRISE_TOOL_POLICY_JSON",
+        json.dumps(
+            {
+                "allowedModels": ["glm-5.2"],
+                "currentModel": "glm-5.2",
+                "currentModelProfileId": "profile-glm",
+                "defaultModel": "glm-5.2",
+                "modelProfiles": [
+                    {
+                        "id": "profile-glm",
+                        "apiFormat": "anthropic-messages",
+                        "capabilities": {"maxOutputTokens": 128000},
+                        "model": "glm-5.2",
+                        "runtimeDefaults": {"maxOutputTokens": 4096},
+                    }
+                ],
+            }
+        ),
+    )
+    write_cfg(
+        """
+        model:
+          default: glm-5.2
+          provider: company-gateway
+        providers:
+          company-gateway:
+            base_url: http://localhost:5048/v1
+            key_env: COMPANY_GATEWAY_TOKEN
+            transport: anthropic_messages
+        """
+    )
+    grun = fresh_gateway()
+    kw = grun._resolve_runtime_agent_kwargs()
+    assert kw["max_tokens"] == 4096
+    assert kw["request_overrides"] == {
+        "extra_body": {"modelProfileId": "profile-glm"}
+    }
 
 
 def test_global_max_tokens_beats_per_provider(isolated_home):

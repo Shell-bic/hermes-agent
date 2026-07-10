@@ -26,18 +26,25 @@ import {
 export const INITIAL_ENTERPRISE_STATE: EnterpriseDesktopState = {
   allowedModels: [],
   authenticated: false,
+  apiMode: null,
   auxiliaryPolicy: {},
   capabilities: {},
   currentModel: null,
   currentModelProfileId: null,
   defaultModel: null,
   enabled: false,
+  generatedAt: null,
   lockedSurfaces: [],
+  modelRuntimeHash: null,
   modelProfiles: [],
+  policyHash: null,
   policyVersion: null,
+  protocolSnapshot: null,
   role: null,
   runtimeDefaults: {},
+  runtimeLimits: {},
   status: 'loading',
+  toolPolicySnapshot: null,
   user: null
 }
 
@@ -120,8 +127,23 @@ export async function logoutEnterprise(): Promise<EnterpriseDesktopState> {
   return applyEnterpriseState(state)
 }
 
+export function setEnterpriseRuntimeModelSelection(model: string, profileId?: string | null): void {
+  const state = $enterprise.get()
+
+  if (!state.enabled) {
+    return
+  }
+
+  applyEnterpriseState({
+    ...state,
+    currentModel: model || state.currentModel,
+    currentModelProfileId: profileId || null
+  })
+}
+
 export async function selectEnterpriseModel(model: string): Promise<EnterpriseDesktopState> {
   const state = await window.hermesDesktop.enterprise.selectModel(model)
+  clearEnterpriseRuntimeSessionState()
 
   return applyEnterpriseState(state)
 }

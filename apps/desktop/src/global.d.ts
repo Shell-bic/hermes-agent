@@ -360,24 +360,79 @@ export interface EnterpriseModelProviderSummary {
 
 export interface EnterpriseModelProfileSummary {
   apiFormat?: string | null
+  apiMode?: string | null
   auxiliaryPolicy?: Record<string, unknown>
   capabilities?: Record<string, unknown>
   displayName?: string | null
+  gatewayEndpoint?: string | null
   id: string | null
   isDefault?: boolean
   model: string | null
   modelProviderId?: string | null
   name: string | null
   pricing?: Record<string, unknown>
+  protocolKey?: string | null
   provider?: EnterpriseModelProviderSummary | Record<string, unknown> | null
   providerName?: string | null
   providerType?: string | null
+  requestPolicy?: Record<string, unknown>
   runtimeDefaults?: Record<string, unknown>
+  runtimeLimits?: Record<string, unknown>
+  streamingPolicy?: Record<string, unknown>
+  toolSchemaPolicy?: Record<string, unknown>
+}
+
+export type EnterpriseToolPolicyStatus =
+  | 'available'
+  | 'blocked'
+  | 'defaultEnabled'
+  | 'recommended'
+  | 'restricted'
+  | 'teamShared'
+  | 'userCreated'
+
+export interface EnterpriseToolPolicyLocalizedValue {
+  description?: string | null
+  displayName?: string | null
+  name?: string | null
+}
+
+export type EnterpriseToolPolicyLocalizedDisplay =
+  | Record<string, EnterpriseToolPolicyLocalizedValue | string | null | undefined>
+  | null
+
+export interface EnterpriseToolPolicyItem {
+  category?: string | null
+  description?: string | null
+  displayName?: string | null
+  key: string
+  localizedDisplay?: EnterpriseToolPolicyLocalizedDisplay
+  reason?: string | null
+  riskLevel?: string | null
+  source?: string | null
+  status: EnterpriseToolPolicyStatus
+}
+
+export type EnterpriseToolPolicyCapabilityFlags =
+  | EnterpriseToolPolicyItem[]
+  | Record<string, unknown>
+  | string[]
+
+export interface EnterpriseToolPolicySnapshot {
+  capabilityFlags: EnterpriseToolPolicyCapabilityFlags
+  generatedAt: null | string
+  mcpServers: EnterpriseToolPolicyItem[]
+  policyHash: null | string
+  policyVersion: null | string
+  skills: EnterpriseToolPolicyItem[]
+  toolSets: EnterpriseToolPolicyItem[]
+  tools: EnterpriseToolPolicyItem[]
 }
 
 export interface EnterpriseDesktopState {
   allowedModels: string[]
   authenticated: boolean
+  apiMode?: null | string
   auxiliaryPolicy?: Record<string, unknown>
   capabilities?: Record<string, unknown>
   currentModel?: null | string
@@ -385,12 +440,18 @@ export interface EnterpriseDesktopState {
   defaultModel?: null | string
   enabled: boolean
   error?: string | null
+  generatedAt: null | string
   lockedSurfaces: string[]
+  modelRuntimeHash?: null | string
   modelProfiles: EnterpriseModelProfileSummary[]
+  policyHash: null | string
   policyVersion: null | string
+  protocolSnapshot?: null | Record<string, unknown>
   role: unknown
   runtimeDefaults?: Record<string, unknown>
+  runtimeLimits?: Record<string, unknown>
   status: EnterpriseDesktopStatus
+  toolPolicySnapshot: EnterpriseToolPolicySnapshot | null
   uiPolicy?: EnterpriseUiPolicy
   user: unknown
 }

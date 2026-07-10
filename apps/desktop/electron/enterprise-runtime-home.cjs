@@ -9,6 +9,17 @@ const ENTERPRISE_UI_POLICY_DEFAULT = Object.freeze({
   lockedLocale: false
 })
 const SUPPORTED_DISPLAY_LANGUAGES = new Set(['en', 'zh', 'zh-hant', 'ja'])
+const NON_SECRET_TOKEN_FIELDS = new Set([
+  'completiontokens',
+  'contextlengthtokens',
+  'contextwindowtokens',
+  'inputtokens',
+  'maxoutputtokens',
+  'maxtokens',
+  'outputtokens',
+  'prompttokens',
+  'totaltokens'
+])
 
 function asArray(value) {
   return Array.isArray(value) ? value : []
@@ -126,19 +137,26 @@ function normalizeModelProfile(profile) {
 
   return {
     apiFormat: profile.apiFormat || profile.transport || null,
+    ...(profile.apiMode || profile.api_mode ? { apiMode: profile.apiMode || profile.api_mode } : {}),
     auxiliaryPolicy: scrubSecretFields(profile.auxiliaryPolicy || {}),
     capabilities: scrubSecretFields(profile.capabilities || {}),
     displayName: profile.displayName || profile.name || profile.model || profile.id || null,
+    ...(profile.gatewayEndpoint || profile.gateway_endpoint ? { gatewayEndpoint: profile.gatewayEndpoint || profile.gateway_endpoint } : {}),
     id,
     isDefault: Boolean(profile.isDefault),
     model,
     modelProviderId: profile.modelProviderId || profile.providerId || null,
     name: profile.name || profile.displayName || profile.model || profile.id || null,
     pricing: scrubSecretFields(profile.pricing || {}),
+    ...(profile.protocolKey || profile.protocol_key ? { protocolKey: profile.protocolKey || profile.protocol_key } : {}),
     provider,
     providerName: profile.providerName || provider?.name || null,
     providerType: profile.providerType || provider?.type || null,
-    runtimeDefaults: scrubSecretFields(profile.runtimeDefaults || {})
+    ...(profile.requestPolicy ? { requestPolicy: scrubSecretFields(profile.requestPolicy) } : {}),
+    runtimeDefaults: scrubSecretFields(profile.runtimeDefaults || {}),
+    ...(profile.runtimeLimits ? { runtimeLimits: scrubSecretFields(profile.runtimeLimits) } : {}),
+    ...(profile.streamingPolicy ? { streamingPolicy: scrubSecretFields(profile.streamingPolicy) } : {}),
+    ...(profile.toolSchemaPolicy ? { toolSchemaPolicy: scrubSecretFields(profile.toolSchemaPolicy) } : {})
   }
 }
 
@@ -173,6 +191,11 @@ function resolveManifestApiMode(manifest) {
   const currentProfile = normalizedProfiles.find(profile => profile.model === currentModel || profile.id === currentModel)
     || normalizedProfiles.find(profile => profile.isDefault)
     || normalizedProfiles[0]
+  const apiMode = manifest?.apiMode || manifest?.api_mode || currentProfile?.apiMode
+  if (apiMode) {
+    return apiModeFromApiFormat(apiMode)
+  }
+
   const apiFormat = manifest?.transport || manifest?.apiFormat || currentProfile?.apiFormat
 
   return apiModeFromApiFormat(apiFormat)
@@ -189,7 +212,8 @@ function scrubSecretFields(value) {
 
   const result = {}
   for (const [key, item] of Object.entries(value)) {
-    if (/secret|token|api[_-]?key|password|credential/i.test(key)) {
+    const normalizedKey = String(key || '').replace(/[_-]/g, '').toLowerCase()
+    if (!NON_SECRET_TOKEN_FIELDS.has(normalizedKey) && /secret|token|api[_-]?key|password|credential/i.test(key)) {
       continue
     }
 
@@ -265,12 +289,108 @@ function resolveRole({ bootstrap = null, manifest = null } = {}) {
   return manifest?.roles || manifest?.role || bootstrap?.roles || bootstrap?.role || null
 }
 
+function normalizeToolPolicyItem(item) {
+  if (!item || typeof item !== 'object' || Array.isArray(item)) {
+    return null
+  }
+
+  const key = String(item.key || '').trim()
+  if (!key) {
+    return null
+  }
+
+  const normalized = {
+    key,
+    status: item.status || 'available',
+    ...(item.displayName != null ? { displayName: item.displayName } : {}),
+    ...(item.description != null ? { description: item.description } : {}),
+    ...(item.category != null ? { category: item.category } : {}),
+    ...(item.riskLevel != null ? { riskLevel: item.riskLevel } : {}),
+    ...(item.source != null ? { source: item.source } : {}),
+    ...(item.localizedDisplay != null ? { localizedDisplay: item.localizedDisplay } : {}),
+    ...(item.reason != null ? { reason: item.reason } : {})
+  }
+
+  return scrubSecretFields(normalized)
+}
+
+function normalizeToolPolicyItems(items) {
+  return asArray(items).map(item => normalizeToolPolicyItem(item)).filter(Boolean)
+}
+
+function normalizeCapabilityFlags(value) {
+  if (Array.isArray(value)) {
+    return value
+      .map(item => {
+        if (typeof item === 'string') {
+          return item
+        }
+
+        return normalizeToolPolicyItem(item)
+      })
+      .filter(Boolean)
+  }
+
+  if (value && typeof value === 'object') {
+    return scrubSecretFields(value)
+  }
+
+  return {}
+}
+
+function normalizeToolPolicySnapshot(manifest) {
+  const snapshot = manifest?.toolPolicySnapshot
+  if (!snapshot || typeof snapshot !== 'object' || Array.isArray(snapshot)) {
+    return null
+  }
+
+  return scrubSecretFields({
+    skills: normalizeToolPolicyItems(snapshot.skills),
+    toolSets: normalizeToolPolicyItems(snapshot.toolSets),
+    tools: normalizeToolPolicyItems(snapshot.tools),
+    mcpServers: normalizeToolPolicyItems(snapshot.mcpServers),
+    capabilityFlags: normalizeCapabilityFlags(snapshot.capabilityFlags),
+    policyVersion: snapshot.policyVersion || manifest?.policyVersion || null,
+    policyHash: snapshot.policyHash || manifest?.policyHash || null,
+    generatedAt: snapshot.generatedAt || manifest?.generatedAt || null
+  })
+}
+
+function modelProfileKey(profile) {
+  return String(profile?.id || profile?.model || profile?.name || '').trim()
+}
+
+function mergedModelProfiles(manifestProfiles, fetchedProfiles) {
+  const result = []
+  const seen = new Set()
+
+  for (const rawProfile of [...asArray(manifestProfiles), ...asArray(fetchedProfiles)]) {
+    const profile = normalizeModelProfile(rawProfile)
+
+    if (!profile) {
+      continue
+    }
+
+    const key = modelProfileKey(profile)
+
+    if (key && seen.has(key)) {
+      continue
+    }
+
+    if (key) {
+      seen.add(key)
+    }
+
+    result.push(profile)
+  }
+
+  return result
+}
+
 function publicEnterpriseState({ bootstrap = null, manifest = null, modelProfiles = [] } = {}) {
   const allowedModels = asArray(manifest?.allowedModels).map(String).filter(Boolean)
   const lockedSurfaces = asArray(manifest?.lockedSurfaces || bootstrap?.lockedSurfaces).map(String).filter(Boolean)
-  const normalizedProfiles = asArray(manifest?.modelProfiles || modelProfiles)
-    .map(normalizeModelProfile)
-    .filter(Boolean)
+  const normalizedProfiles = mergedModelProfiles(manifest?.modelProfiles, modelProfiles)
   const defaultModel = manifest?.defaultModel || normalizedProfiles.find(profile => profile.isDefault)?.model || allowedModels[0] || null
   const currentModel = manifest?.currentModel || manifest?.selectedModel || defaultModel
   const currentModelProfile =
@@ -279,6 +399,7 @@ function publicEnterpriseState({ bootstrap = null, manifest = null, modelProfile
   return {
     allowedModels,
     authenticated: true,
+    apiMode: resolveManifestApiMode(manifest),
     auxiliaryPolicy: scrubSecretFields(manifest?.auxiliaryPolicy || {}),
     capabilities: scrubSecretFields(manifest?.capabilities || bootstrap?.capabilities || {}),
     currentModel,
@@ -287,10 +408,16 @@ function publicEnterpriseState({ bootstrap = null, manifest = null, modelProfile
     enabled: true,
     lockedSurfaces,
     modelProfiles: normalizedProfiles,
+    modelRuntimeHash: manifest?.modelRuntimeHash || null,
+    generatedAt: manifest?.generatedAt || manifest?.toolPolicySnapshot?.generatedAt || null,
+    policyHash: manifest?.policyHash || manifest?.toolPolicySnapshot?.policyHash || null,
     policyVersion: manifest?.policyVersion || bootstrap?.policyVersion || null,
+    protocolSnapshot: scrubSecretFields(manifest?.protocolSnapshot || {}),
     role: resolveRole({ bootstrap, manifest }),
     runtimeDefaults: scrubSecretFields(manifest?.runtimeDefaults || {}),
+    runtimeLimits: scrubSecretFields(manifest?.runtimeLimits || {}),
     status: 'authenticated',
+    toolPolicySnapshot: normalizeToolPolicySnapshot(manifest),
     uiPolicy: normalizeEnterpriseUiPolicy({ bootstrap, manifest }),
     user: bootstrap?.user || bootstrap?.account || null
   }
@@ -301,6 +428,9 @@ function buildManagedConfigYaml({ manifest, displayLanguage = ENTERPRISE_UI_POLI
   const defaultModel = manifest.defaultModel || asArray(manifest.allowedModels)[0] || ''
   const apiMode = resolveManifestApiMode(manifest)
   const config = {
+    agent: {
+      api_max_retries: 1
+    },
     display: {
       language: supportedDisplayLanguage(displayLanguage) || ENTERPRISE_UI_POLICY_DEFAULT.defaultLocale
     },
@@ -335,16 +465,23 @@ function buildPolicySnapshot({ bootstrap = null, manifest = null, modelProfiles 
     allowedModels: publicState.allowedModels,
     auxiliaryPolicy: publicState.auxiliaryPolicy,
     capabilities: publicState.capabilities,
+    apiMode: publicState.apiMode,
     currentModel: publicState.currentModel,
     currentModelProfileId: publicState.currentModelProfileId,
     defaultModel: publicState.defaultModel,
     lockedSurfaces: publicState.lockedSurfaces,
     manifestId: manifest?.manifestId || null,
     modelProfiles: publicState.modelProfiles,
+    modelRuntimeHash: publicState.modelRuntimeHash,
+    generatedAt: publicState.generatedAt,
+    policyHash: publicState.policyHash,
     policyVersion: manifest?.policyVersion || bootstrap?.policyVersion || null,
+    protocolSnapshot: publicState.protocolSnapshot,
     role: resolveRole({ bootstrap, manifest }),
     runtimeDefaults: publicState.runtimeDefaults,
+    runtimeLimits: publicState.runtimeLimits,
     sessionId: manifest?.sessionId || null,
+    toolPolicySnapshot: publicState.toolPolicySnapshot,
     uiPolicy: publicState.uiPolicy,
     user: bootstrap?.user || bootstrap?.account || null
   }
@@ -419,6 +556,7 @@ module.exports = {
   enterpriseUserPathSegment,
   normalizeGatewayApiBaseUrl,
   normalizeEnterpriseUiPolicy,
+  normalizeToolPolicySnapshot,
   publicEnterpriseState,
   readManagedConfigDisplayLanguage,
   resolveRole,

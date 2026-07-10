@@ -1210,6 +1210,7 @@ def _ensure_session_db_row(session: dict) -> None:
         ("provider", "provider"),
         ("base_url", "base_url"),
         ("api_mode", "api_mode"),
+        ("model_profile_id", "model_profile_id"),
     ):
         if val := override.get(src_key):
             model_config[cfg_key] = str(val)
@@ -1571,6 +1572,7 @@ def _stored_session_runtime_overrides(row: dict | None) -> dict:
         provider = billing_provider
     base_url = str(model_config.get("base_url") or "").strip()
     api_mode = str(model_config.get("api_mode") or "").strip()
+    model_profile_id = str(model_config.get("model_profile_id") or "").strip()
     reasoning_config = model_config.get("reasoning_config")
     service_tier = str(model_config.get("service_tier") or "").strip()
 
@@ -1585,6 +1587,7 @@ def _stored_session_runtime_overrides(row: dict | None) -> dict:
             "provider": provider or None,
             "base_url": base_url or None,
             "api_mode": api_mode or None,
+            "model_profile_id": model_profile_id or None,
         }
     if provider:
         overrides["provider_override"] = provider
@@ -1672,6 +1675,13 @@ def _persist_live_session_runtime(session: dict | None) -> None:
             if isinstance(parsed, dict):
                 existing_config = parsed
         model_config = _runtime_model_config(agent, existing_config)
+        override = session.get("model_override") if isinstance(session, dict) else None
+        if isinstance(override, dict):
+            profile_id = str(override.get("model_profile_id") or "").strip()
+            if profile_id:
+                model_config["model_profile_id"] = profile_id
+            else:
+                model_config.pop("model_profile_id", None)
         model = str(getattr(agent, "model", "") or "").strip()
         if hasattr(db, "update_session_meta"):
             db.update_session_meta(session_key, json.dumps(model_config), model or None)
@@ -2061,6 +2071,67 @@ def _persist_model_switch(result) -> None:
     save_config(cfg)
 
 
+def _require_enterprise_model_switch_request(
+    model_input: str,
+    explicit_provider: str,
+    session: dict | None,
+) -> None:
+    from hermes_cli.enterprise_policy import (
+        is_enterprise_managed,
+        require_runtime_model_switch_allowed,
+    )
+
+    if not is_enterprise_managed():
+        return
+
+    current_provider = ""
+    if session:
+        agent = session.get("agent")
+        if agent is not None:
+            current_provider = str(getattr(agent, "provider", "") or "")
+        elif not explicit_provider:
+            _model, current_provider = _config_model_target()
+
+    require_runtime_model_switch_allowed(
+        model_input,
+        requested_provider=explicit_provider,
+        current_provider=current_provider,
+    )
+
+
+def _merge_request_overrides(base: dict | None, extra: dict | None) -> dict:
+    merged = dict(base or {})
+    for key, value in dict(extra or {}).items():
+        if key == "extra_body" and isinstance(value, dict):
+            body = dict(merged.get("extra_body") or {})
+            body.update(value)
+            merged["extra_body"] = body
+        else:
+            merged[key] = value
+    return merged
+
+
+def _enterprise_model_selection_target(model_input: str) -> dict:
+    from hermes_cli.enterprise_policy import is_enterprise_managed, resolve_model_selection
+
+    if not is_enterprise_managed():
+        return {"model": model_input, "profile_id": "", "selection": model_input}
+    return resolve_model_selection(model_input)
+
+
+def _enterprise_runtime_for_selection(selection: str, requested_provider: str) -> dict:
+    from hermes_cli.enterprise_policy import is_enterprise_managed
+
+    if not is_enterprise_managed():
+        return {}
+    from hermes_cli.runtime_provider import resolve_runtime_provider
+
+    return resolve_runtime_provider(
+        requested=requested_provider or None,
+        target_model=selection or None,
+    )
+
+
 def _apply_model_switch(
     sid: str,
     session: dict,
@@ -2078,6 +2149,13 @@ def _apply_model_switch(
     model_input, explicit_provider, persist_global, _force_refresh = parsed_flags
     if not model_input:
         raise ValueError("model value required")
+
+    _require_enterprise_model_switch_request(model_input, explicit_provider, session)
+    enterprise_selection = _enterprise_model_selection_target(model_input)
+    switch_model_input = enterprise_selection.get("model") or model_input
+    enterprise_runtime: dict = {}
+    enterprise_request_overrides: dict = {}
+    enterprise_max_tokens = None
 
     agent = session.get("agent")
     if agent:
@@ -2119,7 +2197,7 @@ def _apply_model_switch(
         pass
 
     result = switch_model(
-        raw_input=model_input,
+        raw_input=switch_model_input,
         current_provider=current_provider,
         current_model=current_model,
         current_base_url=current_base_url,
@@ -2131,6 +2209,27 @@ def _apply_model_switch(
     )
     if not result.success:
         raise ValueError(result.error_message or "model switch failed")
+
+    from hermes_cli.enterprise_policy import require_runtime_model_switch_allowed
+
+    require_runtime_model_switch_allowed(
+        result.new_model,
+        resolved_provider=result.target_provider,
+        resolved_base_url=result.base_url,
+    )
+    if enterprise_selection.get("profile_id"):
+        enterprise_runtime = _enterprise_runtime_for_selection(
+            enterprise_selection.get("selection") or model_input,
+            result.target_provider,
+        )
+        if enterprise_runtime.get("api_mode"):
+            result.api_mode = enterprise_runtime.get("api_mode") or result.api_mode
+        if enterprise_runtime.get("base_url"):
+            result.base_url = enterprise_runtime.get("base_url") or result.base_url
+        if enterprise_runtime.get("api_key"):
+            result.api_key = enterprise_runtime.get("api_key") or result.api_key
+        enterprise_request_overrides = dict(enterprise_runtime.get("request_overrides") or {})
+        enterprise_max_tokens = enterprise_runtime.get("max_output_tokens")
 
     if not confirm_expensive_model:
         try:
@@ -2153,6 +2252,18 @@ def _apply_model_switch(
                 "confirm_message": warning.message,
             }
 
+    if pin_session_override and isinstance(session, dict):
+        session["model_override"] = {
+            "model": result.new_model,
+            "provider": result.target_provider,
+            "base_url": result.base_url,
+            "api_key": result.api_key,
+            "api_mode": result.api_mode,
+            "model_profile_id": enterprise_selection.get("profile_id") or None,
+            "request_overrides": enterprise_request_overrides or None,
+            "max_tokens": enterprise_max_tokens,
+        }
+
     if agent:
         agent.switch_model(
             new_model=result.new_model,
@@ -2161,6 +2272,13 @@ def _apply_model_switch(
             base_url=result.base_url,
             api_mode=result.api_mode,
         )
+        if enterprise_request_overrides:
+            agent.request_overrides = _merge_request_overrides(
+                getattr(agent, "request_overrides", {}) or {},
+                enterprise_request_overrides,
+            )
+        if isinstance(enterprise_max_tokens, int) and enterprise_max_tokens > 0:
+            agent.max_tokens = enterprise_max_tokens
         _restart_slash_worker(sid, session)
         _persist_live_session_runtime(session)
         _persist_live_session_system_prompt(session)
@@ -2182,14 +2300,6 @@ def _apply_model_switch(
     # contamination bug). agent.switch_model() above already mutated the right
     # agent in place; the override dict makes that choice survive a rebuild
     # without touching shared process state.
-    if pin_session_override and isinstance(session, dict):
-        session["model_override"] = {
-            "model": result.new_model,
-            "provider": result.target_provider,
-            "base_url": result.base_url,
-            "api_key": result.api_key,
-            "api_mode": result.api_mode,
-        }
     if persist_global:
         _persist_model_switch(result)
     return {
@@ -2542,6 +2652,9 @@ def _session_info(agent, session: dict | None = None) -> dict:
         "usage": _get_usage(agent),
         "profile_name": _current_profile_name(),
     }
+    override = session.get("model_override") if isinstance(session, dict) else None
+    if isinstance(override, dict) and override.get("model_profile_id"):
+        info["model_profile_id"] = str(override.get("model_profile_id") or "")
     try:
         from hermes_cli import __version__, __release_date__
 
@@ -3457,12 +3570,18 @@ def _make_agent(
     # Prefer a per-session model override (set by a prior in-session /model
     # switch) over global config/env resolution. Resume-time stored sessions may
     # also pass scalar model/provider/runtime knobs from the persisted DB row.
+    request_overrides: dict = {}
+    max_tokens = None
     if isinstance(model_override, dict) and model_override.get("model"):
         model = str(model_override.get("model") or "")
         requested_provider = model_override.get("provider") or provider_override or None
         override_base_url = model_override.get("base_url")
         override_api_key = model_override.get("api_key")
         override_api_mode = model_override.get("api_mode")
+        override_profile_id = str(model_override.get("model_profile_id") or "").strip()
+        override_selection = (
+            f"enterprise-profile:{override_profile_id}" if override_profile_id else model
+        )
         resolve_kwargs = {}
         if (
             override_base_url
@@ -3485,7 +3604,7 @@ def _make_agent(
             resolve_kwargs["explicit_base_url"] = override_base_url
         runtime = resolve_runtime_provider(
             requested=requested_provider,
-            target_model=model or None,
+            target_model=override_selection or model or None,
             **resolve_kwargs,
         )
         # The switch already resolved concrete credentials/endpoint; honor them
@@ -3497,16 +3616,29 @@ def _make_agent(
             runtime["api_key"] = override_api_key
         if override_api_mode:
             runtime["api_mode"] = override_api_mode
+        request_overrides = _merge_request_overrides(
+            runtime.get("request_overrides"),
+            model_override.get("request_overrides") if isinstance(model_override, dict) else None,
+        )
+        raw_max_tokens = model_override.get("max_tokens")
+        max_tokens = raw_max_tokens if isinstance(raw_max_tokens, int) and raw_max_tokens > 0 else None
     else:
         model, requested_provider = _resolve_startup_runtime()
+        target_model = model or None
         if isinstance(model_override, str) and model_override:
-            model = model_override
+            selection = _enterprise_model_selection_target(model_override)
+            model = selection.get("model") or model_override
+            target_model = selection.get("selection") or model
         if provider_override:
             requested_provider = provider_override
         runtime = resolve_runtime_provider(
             requested=requested_provider,
-            target_model=model or None,
+            target_model=target_model,
         )
+        request_overrides = dict(runtime.get("request_overrides") or {})
+    runtime_max_tokens = runtime.get("max_output_tokens")
+    if max_tokens is None and isinstance(runtime_max_tokens, int) and runtime_max_tokens > 0:
+        max_tokens = runtime_max_tokens
     _pr = _load_provider_routing()
     return AIAgent(
         model=model,
@@ -3518,6 +3650,8 @@ def _make_agent(
         acp_command=runtime.get("command"),
         acp_args=runtime.get("args"),
         credential_pool=runtime.get("credential_pool"),
+        max_tokens=max_tokens,
+        request_overrides=request_overrides,
         quiet_mode=True,
         # verbose_logging controls DEBUG-level agent logging; it is intentionally
         # independent of tool_progress_mode (which only controls per-tool
@@ -4015,11 +4149,19 @@ def _(rid, params: dict) -> dict:
     # for a new chat can't mutate the profile default. provider is optional
     # (resolved at build).
     create_model = str(params.get("model") or "").strip()
-    session_model_override = (
-        {"model": create_model, "provider": str(params.get("provider") or "").strip() or None}
-        if create_model
-        else None
-    )
+    session_model_override = None
+    if create_model:
+        selection = _enterprise_model_selection_target(create_model)
+        profile_id = str(selection.get("profile_id") or "").strip()
+        request_overrides = {}
+        if profile_id:
+            request_overrides = {"extra_body": {"modelProfileId": profile_id}}
+        session_model_override = {
+            "model": selection.get("model") or create_model,
+            "provider": str(params.get("provider") or "").strip() or None,
+            "model_profile_id": profile_id or None,
+            "request_overrides": request_overrides or None,
+        }
     create_reasoning_override = None
     if effort := str(params.get("reasoning_effort") or "").strip():
         try:
@@ -4111,6 +4253,11 @@ def _(rid, params: dict) -> dict:
                 **(
                     {"provider": session_model_override["provider"]}
                     if session_model_override and session_model_override.get("provider")
+                    else {}
+                ),
+                **(
+                    {"model_profile_id": session_model_override["model_profile_id"]}
+                    if session_model_override and session_model_override.get("model_profile_id")
                     else {}
                 ),
                 "tools": {},
@@ -7181,6 +7328,8 @@ def _(rid, params: dict) -> dict:
 
     if key == "model":
         try:
+            from hermes_cli.enterprise_policy import EnterprisePolicyDenied
+
             if not value:
                 return _err(rid, 4002, "model value required")
             if session:
@@ -7202,6 +7351,11 @@ def _(rid, params: dict) -> dict:
 
                 parsed_flags = parse_model_flags(value)
                 _model_input, explicit_provider, _persist_global, _force_refresh = parsed_flags
+                _require_enterprise_model_switch_request(
+                    _model_input,
+                    explicit_provider,
+                    session,
+                )
                 if session.get("agent") is None and not explicit_provider.strip():
                     session_id = params.get("session_id", "")
                     _start_agent_build(session_id, session)
@@ -7238,6 +7392,8 @@ def _(rid, params: dict) -> dict:
                     "confirm_message": result.get("confirm_message", ""),
                 },
             )
+        except EnterprisePolicyDenied as e:
+            return _err(rid, 403, str(e))
         except Exception as e:
             return _err(rid, 5001, str(e))
 

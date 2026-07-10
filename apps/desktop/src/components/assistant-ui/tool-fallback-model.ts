@@ -1,6 +1,6 @@
+import { translateNow } from '@/i18n'
 import { normalizeExternalUrl } from '@/lib/external-link'
 import { extractToolErrorMessage, formatToolResultSummary } from '@/lib/tool-result-summary'
-import { translateNow } from '@/i18n'
 
 export type ToolTone = 'agent' | 'browser' | 'default' | 'file' | 'image' | 'terminal' | 'web'
 export type ToolStatus = 'error' | 'running' | 'success' | 'warning'
@@ -639,6 +639,29 @@ export function cleanVisibleText(text: string): string {
     .join('')
 }
 
+function browserSnapshotPreviewLines(snapshot: string): string[] {
+  const seen = new Set<string>()
+
+  return snapshot
+    .split('\n')
+    .map(line => line.trim())
+    .filter(Boolean)
+    .filter(line => !/^[-=]{3,}$/.test(line))
+    .map(line => (line.length > 220 ? `${line.slice(0, 219)}...` : line))
+    .filter(line => {
+      const normalized = line.replace(/\s+/g, ' ')
+
+      if (seen.has(normalized)) {
+        return false
+      }
+
+      seen.add(normalized)
+
+      return true
+    })
+    .slice(0, 14)
+}
+
 function summarizeBrowserSnapshot(snapshot: string): string {
   const count = (re: RegExp) => snapshot.match(re)?.length ?? 0
 
@@ -646,14 +669,18 @@ function summarizeBrowserSnapshot(snapshot: string): string {
     `${count(/button\s+"[^"]+"/g)} buttons`,
     `${count(/link\s+"[^"]+"/g)} links`,
     `${count(/(?:textbox|combobox|searchbox)\s+"[^"]+"/g)} inputs`
-  ].join(' · ')
+  ].join(' | ')
 
   const labels = Array.from(snapshot.matchAll(/(?:button|link|combobox|textbox)\s+"([^"]+)"/g))
     .map(m => m[1].trim())
     .filter(Boolean)
     .slice(0, 4)
 
-  return labels.length ? `${stats}\nTop controls: ${labels.join(', ')}` : stats
+  const controls = labels.length ? `Top controls: ${labels.join(', ')}` : ''
+  const previewLines = browserSnapshotPreviewLines(snapshot)
+  const preview = previewLines.length ? `Visible snapshot:\n${previewLines.join('\n')}` : ''
+
+  return [stats, controls, preview].filter(Boolean).join('\n\n')
 }
 
 function firstStringField(record: Record<string, unknown>, keys: readonly string[]): string {
@@ -901,8 +928,13 @@ function fallbackDetailText(args: unknown, result: unknown): string {
 }
 
 function cronScalar(value: unknown): string {
-  if (typeof value === 'string') return value.trim()
-  if (typeof value === 'number' && Number.isFinite(value)) return String(value)
+  if (typeof value === 'string') {
+    return value.trim()
+  }
+
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return String(value)
+  }
 
   return ''
 }
@@ -910,7 +942,9 @@ function cronScalar(value: unknown): string {
 function formatCronTime(iso: string): string {
   const ts = Date.parse(iso)
 
-  if (Number.isNaN(ts)) return iso
+  if (Number.isNaN(ts)) {
+    return iso
+  }
 
   return new Date(ts).toLocaleString(undefined, {
     month: 'short',
@@ -932,7 +966,9 @@ function cronjobSubtitle(
 
   const message = firstStringField(resultRecord, ['message'])
 
-  if (message) return message
+  if (message) {
+    return message
+  }
 
   const action = firstStringField(argsRecord, ['action']) || 'manage'
   const name = firstStringField(resultRecord, ['name']) || firstStringField(argsRecord, ['name', 'job_id'])
@@ -948,7 +984,9 @@ function cronjobDetail(
   const jobs = Array.isArray(resultRecord.jobs) ? resultRecord.jobs : null
 
   if (jobs) {
-    if (!jobs.length) return 'No cron jobs scheduled'
+    if (!jobs.length) {
+      return 'No cron jobs scheduled'
+    }
 
     return jobs
       .slice(0, 20)
@@ -963,12 +1001,14 @@ function cronjobDetail(
   }
 
   const nextRun = cronScalar(resultRecord.next_run_at)
+
   const rows: [string, string][] = [
     ['Schedule', cronScalar(resultRecord.schedule)],
     ['Repeat', cronScalar(resultRecord.repeat)],
     ['Delivery', cronScalar(resultRecord.deliver)],
     ['Next run', nextRun ? formatCronTime(nextRun) : '']
   ]
+
   const lines = rows.filter(([, value]) => value).map(([key, value]) => `${key}: ${value}`)
 
   return lines.length ? lines.join('\n') : fallbackDetailText(argsRecord, resultRecord)
@@ -1084,6 +1124,10 @@ function toolDetailLabel(toolName: string): string {
     return 'Details'
   }
 
+  if (toolName === 'browser_navigate') {
+    return 'Page snapshot'
+  }
+
   if (toolName === 'browser_snapshot') {
     return 'Snapshot summary'
   }
@@ -1100,6 +1144,12 @@ function toolDetailText(
   argsRecord: Record<string, unknown>,
   resultRecord: Record<string, unknown>
 ): string {
+  if (part.toolName === 'browser_navigate') {
+    const snapshot = firstStringField(resultRecord, ['snapshot'])
+
+    return snapshot ? summarizeBrowserSnapshot(snapshot) : fallbackDetailText(argsRecord, resultRecord)
+  }
+
   if (part.toolName === 'browser_snapshot') {
     const snapshot = firstStringField(resultRecord, ['snapshot'])
 
@@ -1190,6 +1240,7 @@ export function toolCopyPayload(part: ToolPart, view: ToolView): { label: string
     url: translateNow('assistant.tool.copyUrl'),
     generic: translateNow('common.copy')
   }
+
   const args = parseMaybeObject(part.args)
   const result = parseMaybeObject(part.result)
   const detail = view.detail.trim()

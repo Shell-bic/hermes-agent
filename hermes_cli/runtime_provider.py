@@ -38,8 +38,10 @@ from hermes_cli.enterprise_policy import (
     current_model_profile,
     is_enterprise_managed,
     load_enterprise_policy,
+    model_profile_for_selection,
     require_model_allowed,
     require_runtime_provider_allowed,
+    runtime_defaults,
 )
 from hermes_constants import OPENROUTER_BASE_URL
 from utils import base_url_host_matches, base_url_hostname, env_int
@@ -225,10 +227,25 @@ def _enterprise_api_mode(raw: Any) -> str:
     return "chat_completions"
 
 
+def _positive_int(value: Any) -> Optional[int]:
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value if value > 0 else None
+
+
+def _runtime_max_output_tokens(defaults: Dict[str, Any]) -> Optional[int]:
+    for key in ("maxOutputTokens", "max_output_tokens", "max_tokens"):
+        resolved = _positive_int(defaults.get(key))
+        if resolved is not None:
+            return resolved
+    return None
+
+
 def _resolve_enterprise_gateway_runtime(
     *,
     explicit_api_key: Optional[str] = None,
     explicit_base_url: Optional[str] = None,
+    target_model: Optional[str] = None,
 ) -> Dict[str, Any]:
     if str(explicit_api_key or "").strip() or str(explicit_base_url or "").strip():
         raise AuthError(
@@ -250,12 +267,12 @@ def _resolve_enterprise_gateway_runtime(
     ).strip().rstrip("/")
     key_env = str(provider_cfg.get("key_env") or ENTERPRISE_GATEWAY_TOKEN_ENV).strip()
     policy = load_enterprise_policy()
-    profile = current_model_profile(policy)
+    profile = model_profile_for_selection(target_model or "", policy) or current_model_profile(policy)
     api_format = profile.get("apiFormat") if isinstance(profile, dict) else None
     if not api_format:
         api_format = provider_cfg.get("transport") or provider_cfg.get("api_mode")
 
-    return {
+    result = {
         "provider": ENTERPRISE_PROVIDER,
         "api_mode": _enterprise_api_mode(api_format),
         "base_url": base_url,
@@ -263,6 +280,15 @@ def _resolve_enterprise_gateway_runtime(
         "source": "enterprise-policy",
         "requested_provider": ENTERPRISE_PROVIDER,
     }
+    profile_id = ""
+    if isinstance(profile, dict):
+        profile_id = str(profile.get("id") or "").strip()
+    if profile_id:
+        result["request_overrides"] = {"extra_body": {"modelProfileId": profile_id}}
+    max_output_tokens = _runtime_max_output_tokens(runtime_defaults(policy, profile_id or target_model or ""))
+    if max_output_tokens is not None:
+        result["max_output_tokens"] = max_output_tokens
+    return result
 
 
 def _provider_supports_explicit_api_mode(provider: Optional[str], configured_provider: Optional[str] = None) -> bool:
@@ -1403,6 +1429,7 @@ def resolve_runtime_provider(
         return _resolve_enterprise_gateway_runtime(
             explicit_api_key=explicit_api_key,
             explicit_base_url=explicit_base_url,
+            target_model=target_model,
         )
 
     # Azure Anthropic short-circuit: when explicitly targeting an Azure endpoint

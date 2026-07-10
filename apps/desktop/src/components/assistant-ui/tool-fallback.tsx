@@ -41,7 +41,8 @@ import {
   toolCopyPayload,
   type ToolPart,
   toolPartDisclosureId,
-  type ToolStatus
+  type ToolStatus,
+  type ToolView
 } from './tool-fallback-model'
 
 // `true` when a ToolEntry is rendered inside an embedding wrapper that owns
@@ -194,6 +195,21 @@ function useDisclosureOpen(disclosureId: string, fallbackOpen = false): boolean 
   return persistedOpen ?? fallbackOpen
 }
 
+const BROWSER_AUTO_OPEN_TOOLS = new Set([
+  'browser_navigate',
+  'browser_snapshot',
+  'browser_take_screenshot',
+  'browser_vision'
+])
+
+function shouldAutoOpenTool(part: ToolPart, view: ToolView, isPending: boolean): boolean {
+  if (isPending || !BROWSER_AUTO_OPEN_TOOLS.has(part.toolName)) {
+    return false
+  }
+
+  return Boolean(view.detail || view.imageUrl || (view.previewTarget && isPreviewableTarget(view.previewTarget)))
+}
+
 function ToolEntry({ part }: ToolEntryProps) {
   const { t } = useI18n()
   const copy = t.assistant.tool
@@ -204,7 +220,6 @@ function ToolEntry({ part }: ToolEntryProps) {
   const toolViewMode = useStore($toolViewMode)
   const disclosureId = `tool-entry:${messageId}:${toolPartDisclosureId(part)}`
   const dismissed = useStore($toolRowDismissed(disclosureId))
-  const open = useDisclosureOpen(disclosureId)
   const isPending = messageRunning && part.result === undefined
   const canDismiss = !isPending && !embedded
   // Only animate entries that mount while their message is actively
@@ -224,6 +239,8 @@ function ToolEntry({ part }: ToolEntryProps) {
 
     return buildToolView(p, inlineDiff)
   }, [inlineDiff, isPending, part])
+
+  const open = useDisclosureOpen(disclosureId, shouldAutoOpenTool(part, view, isPending))
 
   const detailSections = useMemo(() => {
     if (!view.detail) {

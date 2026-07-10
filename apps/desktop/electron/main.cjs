@@ -5471,10 +5471,16 @@ ipcMain.handle('hermes:enterprise:refresh', async () => enterpriseRuntime.refres
 ipcMain.handle('hermes:enterprise:login', async (_event, payload) => {
   const state = await enterpriseRuntime.login(payload || {})
   bootstrapFailure = null
-  resetHermesConnection()
+  await teardownPrimaryBackendAndWait()
   return state
 })
-ipcMain.handle('hermes:enterprise:selectModel', async (_event, model) => enterpriseRuntime.selectModel(model))
+// Explicit manifest/default refresh only. Ordinary model picker hot-switches
+// through gateway config.set and must not tear down the running backend.
+ipcMain.handle('hermes:enterprise:selectModel', async (_event, model) => {
+  const state = await enterpriseRuntime.selectModel(model)
+  bootstrapFailure = null
+  return state
+})
 ipcMain.handle('hermes:enterprise:logout', async () => {
   const state = await enterpriseRuntime.logout()
   await teardownPrimaryBackendAndWait()

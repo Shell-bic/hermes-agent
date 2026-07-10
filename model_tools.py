@@ -29,6 +29,11 @@ import threading
 import time
 from typing import Dict, Any, List, Optional, Tuple
 
+from hermes_cli.enterprise_policy import (
+    enterprise_policy_fingerprint,
+    runtime_tool_policy_error,
+    runtime_tool_schema_decision,
+)
 from tools.registry import discover_builtin_tools, registry
 from toolsets import resolve_toolset, validate_toolset
 
@@ -269,6 +274,16 @@ def _clear_tool_defs_cache() -> None:
     _tool_defs_cache.clear()
 
 
+def _enterprise_policy_decision(tool_name: str) -> Dict[str, Any]:
+    entry = registry.get_entry(tool_name)
+    toolset = entry.toolset if entry is not None else ""
+    try:
+        return runtime_tool_schema_decision(tool_name, toolset=toolset)
+    except Exception as exc:
+        logger.debug("Enterprise policy decision failed for %s: %s", tool_name, exc)
+        return {"allowed": True, "reason": "enterprise_policy_unavailable"}
+
+
 def get_tool_definitions(
     enabled_toolsets: Optional[List[str]] = None,
     disabled_toolsets: Optional[List[str]] = None,
@@ -314,6 +329,7 @@ def get_tool_definitions(
             frozenset(disabled_toolsets) if disabled_toolsets else None,
             registry._generation,
             cfg_fp,
+            enterprise_policy_fingerprint(),
             bool(os.environ.get("HERMES_KANBAN_TASK")),
             bool(skip_tool_search_assembly),
         )
@@ -413,7 +429,24 @@ def _compute_tool_definitions(
     # Ask the registry for schemas (only returns tools whose check_fn passes)
     filtered_tools = registry.get_definitions(tools_to_include, quiet=quiet_mode)
 
-    # The set of tool names that actually passed check_fn filtering.
+    # U3 enterprise policy: hide callable schemas denied by the managed
+    # tool-policy snapshot before any downstream schema references are built.
+    policy_filtered_tools: List[Dict[str, Any]] = []
+    for tool_def in filtered_tools:
+        tool_name = tool_def.get("function", {}).get("name", "")
+        decision = _enterprise_policy_decision(tool_name)
+        if decision.get("allowed", True):
+            policy_filtered_tools.append(tool_def)
+        else:
+            logger.debug(
+                "Enterprise policy hid tool schema %s: %s",
+                tool_name,
+                decision.get("reason"),
+            )
+    filtered_tools = policy_filtered_tools
+
+    # The set of tool names that actually passed check_fn and enterprise policy
+    # filtering.
     # Use this (not tools_to_include) for any downstream schema that references
     # other tools by name — otherwise the model sees tools mentioned in
     # descriptions that don't actually exist, and hallucinates calls to them.
@@ -963,6 +996,12 @@ def handle_function_call(
             if err or not underlying_name:
                 return json.dumps({"error": err or "tool_call could not be resolved"},
                                   ensure_ascii=False)
+            enterprise_policy_decision = _enterprise_policy_decision(underlying_name)
+            if not enterprise_policy_decision.get("allowed", True):
+                return json.dumps(
+                    runtime_tool_policy_error(enterprise_policy_decision),
+                    ensure_ascii=False,
+                )
             # Defense in depth: the underlying tool MUST be in the session's
             # scoped deferrable catalog. resolve_underlying_call() only checks
             # that the name is deferrable in the global registry; this gate
@@ -993,6 +1032,13 @@ def handle_function_call(
                 enabled_toolsets=enabled_toolsets,
                 disabled_toolsets=disabled_toolsets,
             )
+
+    enterprise_policy_decision = _enterprise_policy_decision(function_name)
+    if not enterprise_policy_decision.get("allowed", True):
+        return json.dumps(
+            runtime_tool_policy_error(enterprise_policy_decision),
+            ensure_ascii=False,
+        )
 
     _tool_original_args = dict(function_args)
     if not skip_tool_request_middleware:

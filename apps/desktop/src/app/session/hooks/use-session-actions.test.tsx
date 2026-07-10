@@ -4,8 +4,17 @@ import { useEffect } from 'react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { getSessionMessages } from '@/hermes'
+import { $enterprise, INITIAL_ENTERPRISE_STATE } from '@/store/enterprise'
 import { $activeGatewayProfile, $newChatProfile } from '@/store/profile'
-import { $currentCwd, $messages, $resumeFailedSessionId, setMessages, setResumeFailedSessionId } from '@/store/session'
+import {
+  $currentCwd,
+  $currentModel,
+  $currentProvider,
+  $messages,
+  $resumeFailedSessionId,
+  setMessages,
+  setResumeFailedSessionId
+} from '@/store/session'
 
 import type { ClientSessionState } from '../../types'
 
@@ -55,14 +64,17 @@ function Harness({
   return null
 }
 
-async function createWith(profileSetup: () => void): Promise<Record<string, unknown> | undefined> {
+async function createWith(
+  profileSetup: () => void,
+  info?: Record<string, unknown>
+): Promise<Record<string, unknown> | undefined> {
   let createParams: Record<string, unknown> | undefined
 
   const requestGateway = vi.fn(async (method: string, params?: Record<string, unknown>) => {
     if (method === 'session.create') {
       createParams = params
 
-      return { session_id: RUNTIME_SESSION_ID, stored_session_id: null } as never
+      return { session_id: RUNTIME_SESSION_ID, stored_session_id: null, ...(info ? { info } : {}) } as never
     }
 
     return {} as never
@@ -82,6 +94,9 @@ async function createWith(profileSetup: () => void): Promise<Record<string, unkn
 describe('createBackendSessionForSend profile routing', () => {
   afterEach(() => {
     cleanup()
+    $currentModel.set('')
+    $currentProvider.set('')
+    $enterprise.set(INITIAL_ENTERPRISE_STATE)
     $newChatProfile.set(null)
     $activeGatewayProfile.set('default')
     vi.restoreAllMocks()
@@ -116,6 +131,53 @@ describe('createBackendSessionForSend profile routing', () => {
     })
 
     expect(params).toMatchObject({ profile: 'default' })
+  })
+
+  it('sends the selected enterprise profile token when a new chat starts', async () => {
+    const params = await createWith(() => {
+      $activeGatewayProfile.set('default')
+      $newChatProfile.set(null)
+      $currentModel.set('glm-5.2')
+      $currentProvider.set('company-gateway')
+      $enterprise.set({
+        ...INITIAL_ENTERPRISE_STATE,
+        allowedModels: ['glm-5.2'],
+        authenticated: true,
+        currentModel: 'glm-5.2',
+        currentModelProfileId: 'profile-b',
+        defaultModel: 'glm-5.2',
+        enabled: true,
+        modelProfiles: [
+          { id: 'profile-a', model: 'glm-5.2', name: 'GLM Anthropic' },
+          { id: 'profile-b', model: 'glm-5.2', name: 'GLM OpenAI Compatible' }
+        ],
+        status: 'authenticated'
+      })
+    })
+
+    expect(params).toMatchObject({
+      model: 'enterprise-profile:profile-b',
+      provider: 'company-gateway'
+    })
+  })
+
+  it('applies enterprise profile id returned by session.create info', async () => {
+    await createWith(
+      () => {
+        $enterprise.set({
+          ...INITIAL_ENTERPRISE_STATE,
+          allowedModels: ['glm-5.2'],
+          authenticated: true,
+          enabled: true,
+          modelProfiles: [{ id: 'profile-b', model: 'glm-5.2', name: 'GLM OpenAI Compatible' }],
+          status: 'authenticated'
+        })
+      },
+      { model: 'glm-5.2', provider: 'company-gateway', model_profile_id: 'profile-b' }
+    )
+
+    expect($enterprise.get().currentModel).toBe('glm-5.2')
+    expect($enterprise.get().currentModelProfileId).toBe('profile-b')
   })
 })
 
@@ -160,6 +222,7 @@ function ResumeHarness({
 describe('resumeSession failure recovery', () => {
   afterEach(() => {
     cleanup()
+    $enterprise.set(INITIAL_ENTERPRISE_STATE)
     setResumeFailedSessionId(null)
     setMessages([])
     vi.restoreAllMocks()
@@ -255,5 +318,36 @@ describe('resumeSession failure recovery', () => {
     await runResume(requestGateway)
 
     expect($resumeFailedSessionId.get()).toBeNull()
+  })
+
+  it('applies enterprise profile id returned by session.resume info', async () => {
+    $enterprise.set({
+      ...INITIAL_ENTERPRISE_STATE,
+      allowedModels: ['glm-5.2'],
+      authenticated: true,
+      enabled: true,
+      modelProfiles: [{ id: 'profile-b', model: 'glm-5.2', name: 'GLM OpenAI Compatible' }],
+      status: 'authenticated'
+    })
+
+    const requestGateway = vi.fn(async (method: string, params?: Record<string, unknown>) => {
+      if (method === 'session.resume') {
+        return {
+          session_id: 'runtime-1',
+          resumed: params?.session_id,
+          messages: [],
+          info: { model: 'glm-5.2', provider: 'company-gateway', model_profile_id: 'profile-b' }
+        } as never
+      }
+
+      return {} as never
+    })
+
+    vi.mocked(getSessionMessages).mockResolvedValue({ messages: [] } as never)
+
+    await runResume(requestGateway)
+
+    expect($enterprise.get().currentModel).toBe('glm-5.2')
+    expect($enterprise.get().currentModelProfileId).toBe('profile-b')
   })
 })

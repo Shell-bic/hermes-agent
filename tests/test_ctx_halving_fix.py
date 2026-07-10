@@ -262,6 +262,19 @@ class TestEphemeralMaxOutputTokens:
         kwargs = agent._build_api_kwargs([{"role": "user", "content": "hi"}])
         assert kwargs["max_tokens"] == 8_192
 
+    def test_request_overrides_extra_body_survives_anthropic_kwargs(self):
+        """Gateway profile metadata must reach Anthropic-compatible transports."""
+        agent = self._make_agent()
+        agent.request_overrides = {
+            "speed": "fast",
+            "extra_body": {"modelProfileId": "profile-glm"},
+        }
+
+        kwargs = agent._build_api_kwargs([{"role": "user", "content": "hi"}])
+
+        assert kwargs["extra_body"]["modelProfileId"] == "profile-glm"
+        assert kwargs["extra_body"]["speed"] == "fast"
+
 
 # ---------------------------------------------------------------------------
 # Integration: error handler does NOT halve context_length for output-cap errors

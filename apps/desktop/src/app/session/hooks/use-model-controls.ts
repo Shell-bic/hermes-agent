@@ -3,8 +3,8 @@ import { useCallback } from 'react'
 
 import { getGlobalModelInfo } from '@/hermes'
 import { useI18n } from '@/i18n'
-import { enterpriseModelSelection, isEnterpriseModelAllowed } from '@/lib/chat-runtime'
-import { $enterprise, selectEnterpriseModel } from '@/store/enterprise'
+import { enterpriseModelConfigValue, enterpriseModelSelection, isEnterpriseModelAllowed } from '@/lib/chat-runtime'
+import { $enterprise, setEnterpriseRuntimeModelSelection } from '@/store/enterprise'
 import { isEnterpriseModelManaged } from '@/store/model-visibility'
 import { notifyError } from '@/store/notifications'
 import {
@@ -104,6 +104,7 @@ export function useModelControls({ activeSessionId, queryClient, requestGateway 
       const prevModel = $currentModel.get()
       const prevProvider = $currentProvider.get()
       const enterprise = $enterprise.get()
+      const prevEnterprise = enterprise
       const enterpriseManaged = isEnterpriseModelManaged(enterprise)
       const enterpriseSelection = enterpriseManaged ? enterpriseModelSelection(enterprise, selection.model) : null
 
@@ -118,31 +119,10 @@ export function useModelControls({ activeSessionId, queryClient, requestGateway 
 
       setCurrentModel(nextModel)
       setCurrentProvider(nextProvider)
-      updateModelOptionsCache(nextProvider, nextModel, !activeSessionId)
-
-      if (enterpriseManaged) {
-        try {
-          const nextEnterprise = await selectEnterpriseModel(nextModel)
-          const nextSelection = enterpriseModelSelection(nextEnterprise, nextModel)
-
-          if (nextSelection) {
-            setCurrentModel(nextSelection.model)
-            setCurrentProvider(nextSelection.provider)
-            updateModelOptionsCache(nextSelection.provider, nextSelection.model, !activeSessionId)
-          }
-
-          void queryClient.invalidateQueries({ queryKey: ['model-options'] })
-
-          return true
-        } catch (err) {
-          setCurrentModel(prevModel)
-          setCurrentProvider(prevProvider)
-          updateModelOptionsCache(prevProvider, prevModel, !activeSessionId)
-          notifyError(err, copy.modelSwitchFailed)
-
-          return false
-        }
+      if (enterpriseSelection) {
+        setEnterpriseRuntimeModelSelection(enterpriseSelection.model, enterpriseSelection.profileId)
       }
+      updateModelOptionsCache(nextProvider, nextModel, !activeSessionId)
 
       // No live session yet: the pick is pure UI state. session.create reads
       // $currentModel/$currentProvider and applies it as that session's override.
@@ -154,7 +134,9 @@ export function useModelControls({ activeSessionId, queryClient, requestGateway 
         await requestGateway('config.set', {
           session_id: activeSessionId,
           key: 'model',
-          value: `${selection.model} --provider ${selection.provider}`
+          value: enterpriseManaged
+            ? enterpriseModelConfigValue(enterpriseSelection ?? nextModel)
+            : `${selection.model} --provider ${selection.provider}`
         })
 
         void queryClient.invalidateQueries({ queryKey: ['model-options', activeSessionId] })
@@ -163,6 +145,9 @@ export function useModelControls({ activeSessionId, queryClient, requestGateway 
       } catch (err) {
         setCurrentModel(prevModel)
         setCurrentProvider(prevProvider)
+        if (enterpriseSelection) {
+          $enterprise.set(prevEnterprise)
+        }
         updateModelOptionsCache(prevProvider, prevModel, !activeSessionId)
         notifyError(err, copy.modelSwitchFailed)
 
