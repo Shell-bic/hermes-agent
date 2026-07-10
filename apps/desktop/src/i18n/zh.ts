@@ -857,8 +857,8 @@ export const zh: Translations = {
   },
 
   skills: {
-    tabSkills: '技能',
-    tabToolsets: '工具集',
+    tabSkills: '技能指导',
+    tabToolsets: '工具能力',
     all: '全部',
     searchSkills: '搜索技能…',
     searchToolsets: '搜索工具集…',
@@ -870,6 +870,9 @@ export const zh: Translations = {
     noToolsetsTitle: '未找到工具集',
     noToolsetsDesc: '尝试更宽泛的搜索词。',
     noDescription: '暂无描述。',
+    skillGuidance: '为模型提供任务流程和领域说明',
+    toolCapability: '为会话提供可调用工具',
+    notInstalled: '当前不可用',
     configured: '已配置',
     needsKeys: '需要密钥',
     bestFor: '适合场景',
@@ -899,6 +902,7 @@ export const zh: Translations = {
       userCreated: '用户创建'
     },
     toolsetsEnabled: (enabled, total) => `已启用 ${enabled}/${total} 个工具集`,
+    toolCount: count => `${count} 个工具`,
     toggleSkill: name => `切换 ${name} 技能`,
     configureToolset: label => `配置 ${label}`,
     toggleToolset: label => `切换 ${label} 工具集`,

@@ -760,8 +760,8 @@ export const zhHant = defineLocale({
   },
 
   skills: {
-    tabSkills: '技能',
-    tabToolsets: '工具集',
+    tabSkills: '技能指引',
+    tabToolsets: '工具能力',
     all: '全部',
     searchSkills: '搜尋技能...',
     searchToolsets: '搜尋工具集...',
@@ -773,6 +773,9 @@ export const zhHant = defineLocale({
     noToolsetsTitle: '找不到工具集',
     noToolsetsDesc: '請嘗試更廣泛的搜尋詞。',
     noDescription: '無可用描述。',
+    skillGuidance: '為模型提供任務流程和領域說明',
+    toolCapability: '為工作階段提供可呼叫工具',
+    notInstalled: '目前不可用',
     configured: '已設定',
     needsKeys: '需要金鑰',
     bestFor: '適合場景',
@@ -802,6 +805,7 @@ export const zhHant = defineLocale({
       userCreated: '使用者建立'
     },
     toolsetsEnabled: (enabled, total) => `已啟用 ${enabled}/${total} 個工具集`,
+    toolCount: count => `${count} 個工具`,
     toggleSkill: name => `切換 ${name} 技能`,
     configureToolset: label => `設定 ${label}`,
     toggleToolset: label => `切換 ${label} 工具集`,

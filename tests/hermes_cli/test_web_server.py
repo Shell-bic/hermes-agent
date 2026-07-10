@@ -3185,6 +3185,25 @@ class TestNewEndpoints:
             },
         ]
 
+    def test_toggle_skill_unknown_returns_400(self, monkeypatch):
+        import tools.skills_tool as skills_tool
+
+        monkeypatch.setattr(
+            skills_tool,
+            "_find_all_skills",
+            lambda *, skip_disabled=False: [
+                {"name": "known-skill", "description": "known", "category": "demo"}
+            ],
+        )
+
+        resp = self.client.put(
+            "/api/skills/toggle",
+            json={"name": "not-a-real-skill", "enabled": True},
+        )
+
+        assert resp.status_code == 400
+        assert "Unknown skill" in resp.json()["detail"]
+
     def test_toolsets_list(self):
         resp = self.client.get("/api/tools/toolsets")
         assert resp.status_code == 200

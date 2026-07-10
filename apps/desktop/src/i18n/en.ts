@@ -668,8 +668,8 @@ export const en: Translations = {
   },
 
   skills: {
-    tabSkills: 'Skills',
-    tabToolsets: 'Toolsets',
+    tabSkills: 'Guidance',
+    tabToolsets: 'Tools',
     all: 'All',
     searchSkills: 'Search skills...',
     searchToolsets: 'Search toolsets...',
@@ -681,6 +681,9 @@ export const en: Translations = {
     noToolsetsTitle: 'No toolsets found',
     noToolsetsDesc: 'Try a broader search query.',
     noDescription: 'No description.',
+    skillGuidance: 'Task guidance and domain instructions for the model',
+    toolCapability: 'Callable tools available to sessions',
+    notInstalled: 'Unavailable',
     configured: 'Configured',
     needsKeys: 'Needs keys',
     bestFor: 'Best for',
@@ -710,6 +713,7 @@ export const en: Translations = {
       userCreated: 'User'
     },
     toolsetsEnabled: (enabled, total) => `${enabled}/${total} toolsets enabled`,
+    toolCount: count => `${count} ${count === 1 ? 'tool' : 'tools'}`,
     toggleSkill: name => `Toggle ${name} skill`,
     configureToolset: label => `Configure ${label}`,
     toggleToolset: label => `Toggle ${label} toolset`,

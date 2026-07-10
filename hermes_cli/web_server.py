@@ -9847,7 +9847,13 @@ async def get_skills(profile: Optional[str] = None):
 async def toggle_skill(body: SkillToggle, profile: Optional[str] = None):
     _require_enterprise_skill(body.name, "/api/skills/toggle")
     from hermes_cli.skills_config import get_disabled_skills, save_disabled_skills
+    from tools.skills_tool import _find_all_skills
+
     with _profile_scope(body.profile or profile):
+        known_skills = {skill["name"] for skill in _find_all_skills(skip_disabled=True)}
+        if body.name not in known_skills:
+            raise HTTPException(status_code=400, detail=f"Unknown skill: {body.name}")
+
         config = load_config()
         disabled = get_disabled_skills(config)
         if body.enabled:

@@ -239,9 +239,18 @@ def test_tool_policy_parser_reads_snapshot_and_status(managed_tool_policy):
 
 
 def test_gateway_capability_entries_default_unlisted_capabilities_to_allowed(
-    client, managed_tool_policy_gateway_capability_entries
+    client, managed_tool_policy_gateway_capability_entries, monkeypatch
 ):
     from hermes_cli.enterprise_policy import capability_enabled
+    import tools.skills_tool as skills_tool
+
+    monkeypatch.setattr(
+        skills_tool,
+        "_find_all_skills",
+        lambda *, skip_disabled=False: [
+            {"name": "local-user-skill", "description": "local", "category": "demo"}
+        ],
+    )
 
     assert capability_enabled("capability.env.secret-access") is False
     assert capability_enabled("skills.manage") is True
@@ -528,8 +537,18 @@ def test_managed_restricted_or_blocked_skill_toggle_rejected(
 
 
 def test_managed_user_created_skill_toggle_is_not_default_denied(
-    client, managed_tool_policy
+    client, managed_tool_policy, monkeypatch
 ):
+    import tools.skills_tool as skills_tool
+
+    monkeypatch.setattr(
+        skills_tool,
+        "_find_all_skills",
+        lambda *, skip_disabled=False: [
+            {"name": "local-user-skill", "description": "local", "category": "demo"}
+        ],
+    )
+
     resp = client.put(
         "/api/skills/toggle",
         json={"name": "local-user-skill", "enabled": False},

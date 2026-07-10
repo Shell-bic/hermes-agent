@@ -1,23 +1,20 @@
-import type * as React from 'react'
 import { useStore } from '@nanostores/react'
+import type * as React from 'react'
 import { useCallback, useEffect, useMemo, useState } from 'react'
 
 import { PageLoader } from '@/components/page-loader'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Codicon } from '@/components/ui/codicon'
+import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from '@/components/ui/sheet'
 import { Switch } from '@/components/ui/switch'
 import { TextTab, TextTabMeta } from '@/components/ui/text-tab'
+import type { EnterpriseToolPolicyItem, EnterpriseToolPolicySnapshot, EnterpriseToolPolicyStatus } from '@/global'
 import { getSkillContent, getSkills, getToolsets, toggleSkill, toggleToolset } from '@/hermes'
 import { type Translations, useI18n } from '@/i18n'
 import { cn } from '@/lib/utils'
 import { $enterprise } from '@/store/enterprise'
 import { notify, notifyError } from '@/store/notifications'
-import type {
-  EnterpriseToolPolicyItem,
-  EnterpriseToolPolicySnapshot,
-  EnterpriseToolPolicyStatus
-} from '@/global'
 import type { SkillInfo, ToolsetInfo } from '@/types/hermes'
 
 import { useRefreshHotkey } from '../hooks/use-refresh-hotkey'
@@ -27,11 +24,12 @@ import { PageSearchShell } from '../page-search-shell'
 import { asText, includesQuery, prettyName, toolNames, toolsetDisplayLabel } from '../settings/helpers'
 import { ToolsetConfigPanel } from '../settings/toolset-config-panel'
 import type { SetStatusbarItemGroup } from '../shell/statusbar-controls'
+
 import {
+  type CapabilityDetailCopy,
   getSkillDetail,
   getToolsetDetail,
-  shortCapabilitySummary,
-  type CapabilityDetailCopy
+  shortCapabilitySummary
 } from './capability-details'
 
 const SKILLS_MODES = ['skills', 'toolsets'] as const
@@ -45,6 +43,7 @@ interface EnterprisePolicyMeta {
   enterpriseRuntimeKey?: string
   enterprisePolicySource?: string | null
   enterprisePolicyStatus?: EnterpriseToolPolicyStatus
+  runtimeAvailable?: boolean
   userCreated?: boolean
 }
 
@@ -74,6 +73,7 @@ function policyMapKey(value: string | null | undefined): string {
 function stripCatalogPrefix(value: string, prefix: 'skill' | 'toolset'): string {
   const normalized = policyKey(value)
   const marker = `${prefix}.`
+
   return normalized.toLowerCase().startsWith(marker) ? normalized.slice(marker.length) : normalized
 }
 
@@ -81,31 +81,44 @@ function policyLookupKeys(value: string, prefix: 'skill' | 'toolset'): string[] 
   const key = policyKey(value)
   const stripped = stripCatalogPrefix(key, prefix)
   const prefixed = `${prefix}.${stripped}`
+
   return Array.from(new Set([key, stripped, prefixed].map(policyMapKey).filter(Boolean)))
 }
 
 function localSkillMap(localSkills: SkillInfo[]): Map<string, SkillInfo> {
   const result = new Map<string, SkillInfo>()
+
   for (const skill of localSkills) {
     for (const key of policyLookupKeys(skill.name, 'skill')) {
       result.set(key, skill)
     }
   }
+
   return result
 }
 
 function localToolsetMap(localToolsets: ToolsetInfo[]): Map<string, ToolsetInfo> {
   const result = new Map<string, ToolsetInfo>()
+
   for (const toolset of localToolsets) {
     for (const key of policyLookupKeys(toolset.name, 'toolset')) {
       result.set(key, toolset)
     }
   }
+
   return result
 }
 
 function operationKey(item: EnterprisePolicyMeta & { name: string }): string {
   return item.enterpriseRuntimeKey || item.name
+}
+
+function matchesRuntimeKey(name: string, key: string, prefix: 'skill' | 'toolset'): boolean {
+  return policyLookupKeys(name, prefix).includes(policyMapKey(key))
+}
+
+function isRuntimeAvailable(item: EnterprisePolicyMeta): boolean {
+  return item.runtimeAvailable !== false
 }
 
 function localizedField(
@@ -121,7 +134,7 @@ function localizedField(
 
   if (value && typeof value === 'object') {
     const record = value as { description?: unknown; displayName?: unknown; name?: unknown }
-    const raw = field === 'displayName' ? record.displayName ?? record.name : record.description
+    const raw = field === 'displayName' ? (record.displayName ?? record.name) : record.description
     const text = String(raw || '').trim()
 
     return text || null
@@ -171,7 +184,10 @@ function enabledForPolicy(item: EnterpriseToolPolicyItem, localEnabled: boolean 
   return item.status === 'defaultEnabled' || item.status === 'recommended' || item.status === 'teamShared'
 }
 
-function mergeManagedSkills(localSkills: SkillInfo[], snapshot: EnterpriseToolPolicySnapshot | null): ManagedSkillInfo[] {
+function mergeManagedSkills(
+  localSkills: SkillInfo[],
+  snapshot: EnterpriseToolPolicySnapshot | null
+): ManagedSkillInfo[] {
   if (!snapshot) {
     return localSkills
   }
@@ -181,6 +197,7 @@ function mergeManagedSkills(localSkills: SkillInfo[], snapshot: EnterpriseToolPo
 
   for (const item of asPolicyArray(snapshot.skills)) {
     const key = policyKey(item.key)
+
     if (!key) {
       continue
     }
@@ -198,6 +215,7 @@ function mergeManagedSkills(localSkills: SkillInfo[], snapshot: EnterpriseToolPo
       enterprisePolicySource: item.source || null,
       enterprisePolicyStatus: item.status,
       name: policyDisplayName(item),
+      runtimeAvailable: Boolean(local),
       userCreated: item.status === 'userCreated'
     })
   }
@@ -212,6 +230,7 @@ function mergeManagedSkills(localSkills: SkillInfo[], snapshot: EnterpriseToolPo
       enterprisePolicyKey: skill.name,
       enterprisePolicySource: 'local-runtime',
       enterprisePolicyStatus: 'userCreated',
+      runtimeAvailable: true,
       userCreated: true
     })
   }
@@ -232,6 +251,7 @@ function mergeManagedToolsets(
 
   for (const item of asPolicyArray(snapshot.toolSets)) {
     const key = policyKey(item.key)
+
     if (!key) {
       continue
     }
@@ -250,6 +270,7 @@ function mergeManagedToolsets(
       enterprisePolicyStatus: item.status,
       label: policyDisplayName(item),
       name: runtimeKey,
+      runtimeAvailable: Boolean(local),
       tools: Array.isArray(local?.tools) ? local.tools : [],
       userCreated: item.status === 'userCreated'
     })
@@ -265,6 +286,7 @@ function mergeManagedToolsets(
       enterprisePolicyKey: toolset.name,
       enterprisePolicySource: 'local-runtime',
       enterprisePolicyStatus: 'userCreated',
+      runtimeAvailable: true,
       userCreated: true
     })
   }
@@ -376,6 +398,7 @@ export function SkillsView({ setStatusbarItemGroup: _setStatusbarItemGroup, ...p
     () => (skills ? mergeManagedSkills(skills, enterprisePolicySnapshot) : null),
     [enterprisePolicySnapshot, skills]
   )
+
   const effectiveToolsets = useMemo(
     () => (toolsets ? mergeManagedToolsets(toolsets, enterprisePolicySnapshot) : null),
     [enterprisePolicySnapshot, toolsets]
@@ -408,22 +431,23 @@ export function SkillsView({ setStatusbarItemGroup: _setStatusbarItemGroup, ...p
     [effectiveToolsets, query]
   )
 
-  const skillGroups = useMemo(() => {
-    const groups = new Map<string, ManagedSkillInfo[]>()
-
-    for (const skill of visibleSkills) {
-      const key = categoryFor(skill)
-      groups.set(key, [...(groups.get(key) || []), skill])
-    }
-
-    return Array.from(groups.entries()).sort(([a], [b]) => a.localeCompare(b))
-  }, [visibleSkills])
-
   const totalSkills = effectiveSkills?.length || 0
   const enabledToolsets = effectiveToolsets?.filter(toolset => toolset.enabled).length || 0
 
+  const selectedSkill =
+    expandedCapability?.kind === 'skill'
+      ? effectiveSkills?.find(skill => operationKey(skill) === expandedCapability.key) || null
+      : null
+
+  const selectedToolset =
+    expandedCapability?.kind === 'toolset'
+      ? effectiveToolsets?.find(toolset => operationKey(toolset) === expandedCapability.key) || null
+      : null
+
+  const configuringToolset = effectiveToolsets?.find(toolset => toolset.name === expandedToolset) || null
+
   async function handleToggleSkill(skill: ManagedSkillInfo, enabled: boolean) {
-    if (isPolicyLocked(skill)) {
+    if (isPolicyLocked(skill) || !isRuntimeAvailable(skill)) {
       return
     }
 
@@ -431,8 +455,14 @@ export function SkillsView({ setStatusbarItemGroup: _setStatusbarItemGroup, ...p
     setSavingSkill(key)
 
     try {
-      await toggleSkill(key, enabled)
-      setSkills(current => current?.map(row => (operationKey(row) === key ? { ...row, enabled } : row)) ?? current)
+      const result = await toggleSkill(key, enabled)
+      setSkills(
+        current =>
+          current?.map(row =>
+            matchesRuntimeKey(row.name, result.name, 'skill') ? { ...row, enabled: result.enabled } : row
+          ) ?? current
+      )
+      setSkills(await getSkills())
       notify({
         kind: 'success',
         title: enabled ? t.skills.skillEnabled : t.skills.skillDisabled,
@@ -446,7 +476,7 @@ export function SkillsView({ setStatusbarItemGroup: _setStatusbarItemGroup, ...p
   }
 
   async function handleToggleToolset(toolset: ManagedToolsetInfo, enabled: boolean) {
-    if (isPolicyLocked(toolset)) {
+    if (isPolicyLocked(toolset) || !isRuntimeAvailable(toolset)) {
       return
     }
 
@@ -454,11 +484,16 @@ export function SkillsView({ setStatusbarItemGroup: _setStatusbarItemGroup, ...p
     setSavingToolset(key)
 
     try {
-      await toggleToolset(key, enabled)
+      const result = await toggleToolset(key, enabled)
       setToolsets(
         current =>
-          current?.map(row => (row.name === key ? { ...row, enabled, available: enabled } : row)) ?? current
+          current?.map(row =>
+            matchesRuntimeKey(row.name, result.name, 'toolset')
+              ? { ...row, enabled: result.enabled, available: result.enabled }
+              : row
+          ) ?? current
       )
+      setToolsets(await getToolsets())
       notify({
         kind: 'success',
         title: enabled ? t.skills.toolsetEnabled : t.skills.toolsetDisabled,
@@ -552,10 +587,10 @@ export function SkillsView({ setStatusbarItemGroup: _setStatusbarItemGroup, ...p
       tabs={
         <>
           <TextTab active={mode === 'skills'} onClick={() => setMode('skills')}>
-            {t.skills.tabSkills}
+            {t.skills.tabSkills} <TextTabMeta>{totalSkills}</TextTabMeta>
           </TextTab>
           <TextTab active={mode === 'toolsets'} onClick={() => setMode('toolsets')}>
-            {t.skills.tabToolsets}
+            {t.skills.tabToolsets} <TextTabMeta>{effectiveToolsets?.length || 0}</TextTabMeta>
           </TextTab>
         </>
       }
@@ -567,68 +602,62 @@ export function SkillsView({ setStatusbarItemGroup: _setStatusbarItemGroup, ...p
           {visibleSkills.length === 0 ? (
             <EmptyState description={t.skills.noSkillsDesc} title={t.skills.noSkillsTitle} />
           ) : (
-            <div className="space-y-4">
-              {skillGroups.map(([category, list]) => (
-                <div className="space-y-1.5" key={category}>
-                  {activeCategory === null && (
-                    <div className="text-[0.68rem] font-semibold uppercase tracking-[0.12em] text-muted-foreground">
-                      {prettyName(category)}
-                    </div>
-                  )}
-                  <div>
-                    {list.map(skill => {
-                      const key = operationKey(skill)
-                      const expanded = expandedCapability?.kind === 'skill' && expandedCapability.key === key
-                      const detail = getSkillDetail(skill, locale)
-                      const contentState = skillContent[key]
+            <div className="grid grid-cols-[repeat(auto-fit,minmax(240px,1fr))] gap-3">
+              {visibleSkills.map(skill => {
+                const key = operationKey(skill)
+                const detail = getSkillDetail(skill, locale)
+                const runtimeAvailable = isRuntimeAvailable(skill)
 
-                      return (
-                        <div className="px-0 py-2.5" key={skill.name}>
-                          <div className="grid gap-3 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-center">
-                            <div className="min-w-0">
-                              <div className="flex min-w-0 items-center gap-2">
-                                <div className="truncate text-sm font-medium">{skill.name}</div>
-                                <PolicyStatusPill item={skill} labels={t.skills.policyStatus} />
-                              </div>
-                              <p className="mt-0.5 text-xs text-muted-foreground">
-                                {shortCapabilitySummary(detail) || t.skills.noDescription}
-                              </p>
-                            </div>
-                            <div className="flex shrink-0 items-center gap-1.5">
-                              <Button
-                                aria-expanded={expanded}
-                                aria-label={expanded ? t.skills.hideDetails(skill.name) : t.skills.showDetails(skill.name)}
-                                className="text-(--ui-text-tertiary)"
-                                onClick={() => handleToggleDetails('skill', key, skill)}
-                                size="icon-xs"
-                                title={expanded ? t.skills.hideDetails(skill.name) : t.skills.showDetails(skill.name)}
-                                type="button"
-                                variant="ghost"
-                              >
-                                <Codicon name={expanded ? 'chevron-up' : 'chevron-down'} size="0.875rem" />
-                              </Button>
-                              <Switch
-                                aria-label={t.skills.toggleSkill(skill.name)}
-                                checked={skill.enabled}
-                                disabled={savingSkill === key || isPolicyLocked(skill)}
-                                onCheckedChange={checked => void handleToggleSkill(skill, checked)}
-                              />
-                            </div>
-                          </div>
-                          {expanded && (
-                            <SkillDetailPanel
-                              contentState={contentState}
-                              detail={detail}
-                              item={skill}
-                              labels={t.skills}
-                            />
-                          )}
+                return (
+                  <article
+                    className="flex min-h-44 min-w-0 flex-col rounded-lg border border-(--ui-stroke-secondary) bg-(--ui-bg-secondary)/25 p-3 transition-colors hover:border-(--ui-stroke-primary)"
+                    key={skill.enterprisePolicyKey || skill.name}
+                  >
+                    <div className="flex min-w-0 items-start gap-2.5">
+                      <div className="grid size-8 shrink-0 place-items-center rounded-md bg-primary/10 text-primary">
+                        <Codicon name="book" size="1rem" />
+                      </div>
+                      <div className="min-w-0 flex-1">
+                        <div className="flex min-w-0 flex-wrap items-center gap-1.5">
+                          <h3 className="min-w-0 truncate text-sm font-semibold">{skill.name}</h3>
+                          <PolicyStatusPill item={skill} labels={t.skills.policyStatus} />
                         </div>
-                      )
-                    })}
-                  </div>
-                </div>
-              ))}
+                        <div className="mt-1 text-[0.68rem] text-(--ui-text-tertiary)">{t.skills.skillGuidance}</div>
+                      </div>
+                    </div>
+                    <p className="mt-3 line-clamp-3 text-xs leading-5 text-muted-foreground">
+                      {shortCapabilitySummary(detail) || t.skills.noDescription}
+                    </p>
+                    <div className="mt-auto flex min-w-0 items-center justify-between gap-2 pt-3">
+                      <Badge className="max-w-[60%] truncate" variant="outline">
+                        {prettyName(categoryFor(skill))}
+                      </Badge>
+                      <div className="flex shrink-0 items-center gap-1.5">
+                        {!runtimeAvailable && <Badge variant="muted">{t.skills.notInstalled}</Badge>}
+                        <Button
+                          aria-label={t.skills.showDetails(skill.name)}
+                          className="text-(--ui-text-tertiary)"
+                          onClick={() => handleToggleDetails('skill', key, skill)}
+                          size="icon-xs"
+                          title={t.skills.showDetails(skill.name)}
+                          type="button"
+                          variant="ghost"
+                        >
+                          <Codicon name="info" size="0.875rem" />
+                        </Button>
+                        {runtimeAvailable && (
+                          <Switch
+                            aria-label={t.skills.toggleSkill(skill.name)}
+                            checked={skill.enabled}
+                            disabled={savingSkill === key || isPolicyLocked(skill)}
+                            onCheckedChange={checked => void handleToggleSkill(skill, checked)}
+                          />
+                        )}
+                      </div>
+                    </div>
+                  </article>
+                )
+              })}
             </div>
           )}
         </div>
@@ -641,16 +670,15 @@ export function SkillsView({ setStatusbarItemGroup: _setStatusbarItemGroup, ...p
               <div className="text-xs text-muted-foreground">
                 {t.skills.toolsetsEnabled(enabledToolsets, effectiveToolsets.length)}
               </div>
-              <div>
+              <div className="grid grid-cols-[repeat(auto-fit,minmax(240px,1fr))] gap-3">
                 {visibleToolsets.map(toolset => {
                   const tools = toolNames(toolset)
                   const label = toolsetDisplayLabel(toolset)
-                  const expanded = expandedToolset === toolset.name
                   const detailKey = operationKey(toolset)
-                  const detailExpanded =
-                    expandedCapability?.kind === 'toolset' && expandedCapability.key === detailKey
                   const detail = getToolsetDetail(toolset, locale)
                   const lockedByPolicy = isPolicyLocked(toolset)
+                  const runtimeAvailable = isRuntimeAvailable(toolset)
+
                   const configLabel = lockedByPolicy
                     ? policyStatusLabel(toolset.enterprisePolicyStatus, t.skills.policyStatus) ||
                       (toolset.enterprisePolicyStatus === 'blocked'
@@ -661,72 +689,71 @@ export function SkillsView({ setStatusbarItemGroup: _setStatusbarItemGroup, ...p
                       : t.skills.needsKeys
 
                   return (
-                    <div className="px-0 py-2.5" key={toolset.name}>
-                      <div className="flex items-center justify-between gap-2">
-                        <div className="flex min-w-0 items-center gap-2">
-                          <div className="truncate text-sm font-medium">{label}</div>
-                          <PolicyStatusPill item={toolset} labels={t.skills.policyStatus} />
+                    <article
+                      className="flex min-h-44 min-w-0 flex-col rounded-lg border border-(--ui-stroke-secondary) bg-(--ui-bg-secondary)/25 p-3 transition-colors hover:border-(--ui-stroke-primary)"
+                      key={toolset.enterprisePolicyKey || toolset.name}
+                    >
+                      <div className="flex min-w-0 items-start gap-2.5">
+                        <div className="grid size-8 shrink-0 place-items-center rounded-md bg-emerald-500/10 text-emerald-600 dark:text-emerald-300">
+                          <Codicon name="tools" size="1rem" />
+                        </div>
+                        <div className="min-w-0 flex-1">
+                          <div className="flex min-w-0 flex-wrap items-center gap-1.5">
+                            <h3 className="min-w-0 truncate text-sm font-semibold">{label}</h3>
+                            <PolicyStatusPill item={toolset} labels={t.skills.policyStatus} />
+                          </div>
+                          <div className="mt-1 text-[0.68rem] text-(--ui-text-tertiary)">{t.skills.toolCapability}</div>
+                        </div>
+                      </div>
+                      <p className="mt-3 line-clamp-3 text-xs leading-5 text-muted-foreground">
+                        {shortCapabilitySummary(detail) || t.skills.noDescription}
+                      </p>
+                      <div className="mt-auto flex min-w-0 items-center justify-between gap-2 pt-3">
+                        <div className="flex min-w-0 items-center gap-1.5">
+                          <StatusPill active={toolset.configured} locked={lockedByPolicy}>
+                            {runtimeAvailable ? configLabel : t.skills.notInstalled}
+                          </StatusPill>
+                          {tools.length > 0 && <Badge variant="outline">{t.skills.toolCount(tools.length)}</Badge>}
                         </div>
                         <div className="flex shrink-0 items-center gap-1.5">
                           <Button
-                            aria-expanded={detailExpanded}
-                            aria-label={detailExpanded ? t.skills.hideDetails(label) : t.skills.showDetails(label)}
+                            aria-label={t.skills.showDetails(label)}
                             className="text-(--ui-text-tertiary)"
                             onClick={() => handleToggleDetails('toolset', detailKey)}
                             size="icon-xs"
-                            title={detailExpanded ? t.skills.hideDetails(label) : t.skills.showDetails(label)}
+                            title={t.skills.showDetails(label)}
                             type="button"
                             variant="ghost"
                           >
-                            <Codicon name={detailExpanded ? 'chevron-up' : 'chevron-down'} size="0.875rem" />
+                            <Codicon name="info" size="0.875rem" />
                           </Button>
-                          <button
-                            aria-expanded={expanded}
-                            aria-label={t.skills.configureToolset(label)}
-                            className="cursor-pointer rounded-full outline-none focus-visible:ring-2 focus-visible:ring-ring/50 disabled:cursor-not-allowed disabled:opacity-60"
-                            disabled={lockedByPolicy}
-                            onClick={() => {
-                              setExpandedCapability(null)
-                              setExpandedToolset(current => (current === toolset.name ? null : toolset.name))
-                            }}
-                            type="button"
-                          >
-                            <StatusPill active={toolset.configured} locked={lockedByPolicy}>
-                              {configLabel}
-                            </StatusPill>
-                          </button>
-                          <Switch
-                            aria-label={t.skills.toggleToolset(label)}
-                            checked={toolset.enabled}
-                            disabled={
-                              savingToolset === operationKey(toolset) || lockedByPolicy
-                            }
-                            onCheckedChange={checked => void handleToggleToolset(toolset, checked)}
-                          />
+                          {runtimeAvailable && !lockedByPolicy && (
+                            <Button
+                              aria-label={t.skills.configureToolset(label)}
+                              className="text-(--ui-text-tertiary)"
+                              onClick={() => {
+                                setExpandedCapability(null)
+                                setExpandedToolset(toolset.name)
+                              }}
+                              size="icon-xs"
+                              title={t.skills.configureToolset(label)}
+                              type="button"
+                              variant="ghost"
+                            >
+                              <Codicon name="settings-gear" size="0.875rem" />
+                            </Button>
+                          )}
+                          {runtimeAvailable && (
+                            <Switch
+                              aria-label={t.skills.toggleToolset(label)}
+                              checked={toolset.enabled}
+                              disabled={savingToolset === operationKey(toolset) || lockedByPolicy}
+                              onCheckedChange={checked => void handleToggleToolset(toolset, checked)}
+                            />
+                          )}
                         </div>
                       </div>
-                      <p className="mt-1 text-xs text-muted-foreground">
-                        {shortCapabilitySummary(detail) || t.skills.noDescription}
-                      </p>
-                      {tools.length > 0 && (
-                        <div className="mt-2 flex flex-wrap gap-1">
-                          {tools.map(name => (
-                            <span
-                              className="rounded-md bg-(--ui-bg-quinary) px-1.5 py-0.5 font-mono text-[0.65rem] text-(--ui-text-tertiary)"
-                              key={name}
-                            >
-                              {name}
-                            </span>
-                          ))}
-                        </div>
-                      )}
-                      {expanded && !lockedByPolicy && (
-                        <ToolsetConfigPanel onConfiguredChange={refreshToolsets} toolset={toolset.name} />
-                      )}
-                      {detailExpanded && (
-                        <ToolsetDetailPanel detail={detail} item={toolset} labels={t.skills} tools={tools} />
-                      )}
-                    </div>
+                    </article>
                   )
                 })}
               </div>
@@ -734,6 +761,66 @@ export function SkillsView({ setStatusbarItemGroup: _setStatusbarItemGroup, ...p
           )}
         </div>
       )}
+
+      <Sheet
+        onOpenChange={open => {
+          if (!open) {
+            setExpandedCapability(null)
+          }
+        }}
+        open={Boolean(selectedSkill || selectedToolset)}
+      >
+        <SheetContent className="w-full gap-0 overflow-y-auto p-0 sm:max-w-xl">
+          {selectedSkill && (
+            <>
+              <SheetHeader className="border-b border-(--ui-stroke-secondary) pr-11">
+                <SheetTitle>{selectedSkill.name}</SheetTitle>
+                <SheetDescription>{t.skills.skillGuidance}</SheetDescription>
+              </SheetHeader>
+              <div className="px-3 pb-4">
+                <SkillDetailPanel
+                  contentState={skillContent[operationKey(selectedSkill)]}
+                  detail={getSkillDetail(selectedSkill, locale)}
+                  item={selectedSkill}
+                  labels={t.skills}
+                />
+              </div>
+            </>
+          )}
+          {selectedToolset && (
+            <>
+              <SheetHeader className="border-b border-(--ui-stroke-secondary) pr-11">
+                <SheetTitle>{toolsetDisplayLabel(selectedToolset)}</SheetTitle>
+                <SheetDescription>{t.skills.toolCapability}</SheetDescription>
+              </SheetHeader>
+              <div className="px-3 pb-4">
+                <ToolsetDetailPanel
+                  detail={getToolsetDetail(selectedToolset, locale)}
+                  item={selectedToolset}
+                  labels={t.skills}
+                  tools={toolNames(selectedToolset)}
+                />
+              </div>
+            </>
+          )}
+        </SheetContent>
+      </Sheet>
+
+      <Sheet onOpenChange={open => !open && setExpandedToolset(null)} open={Boolean(configuringToolset)}>
+        <SheetContent className="w-full gap-0 overflow-y-auto p-0 sm:max-w-md">
+          {configuringToolset && (
+            <>
+              <SheetHeader className="border-b border-(--ui-stroke-secondary) pr-11">
+                <SheetTitle>{toolsetDisplayLabel(configuringToolset)}</SheetTitle>
+                <SheetDescription>{getToolsetDetail(configuringToolset, locale).summary}</SheetDescription>
+              </SheetHeader>
+              <div className="px-3 pb-4">
+                <ToolsetConfigPanel onConfiguredChange={refreshToolsets} toolset={configuringToolset.name} />
+              </div>
+            </>
+          )}
+        </SheetContent>
+      </Sheet>
     </PageSearchShell>
   )
 }
@@ -759,48 +846,67 @@ function capabilityStatusRows(
 ): { callable: string; status: string; userControl: string } {
   const language = copyLanguage(labels)
   const locked = isPolicyLocked(item)
+  const runtimeAvailable = isRuntimeAvailable(item)
   const policy = policyStatusLabel(item.enterprisePolicyStatus, labels.policyStatus)
+
   const statusParts = [policy, configured === undefined ? null : configured ? labels.configured : labels.needsKeys]
     .filter(Boolean)
     .join(' / ')
-  const status = statusParts || (item.enabled ? labels.policyStatus.available : labels.policyStatus.blocked)
+
+  const status = runtimeAvailable
+    ? statusParts || (item.enabled ? labels.policyStatus.available : labels.policyStatus.blocked)
+    : labels.notInstalled
 
   if (language === 'zh') {
     return {
-      callable: locked
-        ? '不会进入当前会话 callable tools；需要策略放行。'
-        : item.enabled
-          ? '可进入新会话工具 schema；当前会话仍以实际可用工具列表为准。'
-          : '未启用，默认不会进入新会话 callable tools。',
+      callable: !runtimeAvailable
+        ? '当前运行时没有安装这项能力，不会进入会话。'
+        : locked
+          ? '不会进入当前会话 callable tools；需要策略放行。'
+          : item.enabled
+            ? '可进入新会话工具 schema；当前会话仍以实际可用工具列表为准。'
+            : '未启用，默认不会进入新会话 callable tools。',
       status,
-      userControl: locked ? '由企业策略控制，用户不能在此修改。' : '用户可在此切换；变更通常应用于新会话。'
+      userControl: !runtimeAvailable
+        ? '这是企业目录条目；安装到当前运行时后才可切换。'
+        : locked
+          ? '由企业策略控制，用户不能在此修改。'
+          : '用户可在此切换；变更通常应用于新会话。'
     }
   }
 
   if (language === 'ja') {
     return {
-      callable: locked
-        ? '現在の callable tools には入りません。ポリシー許可が必要です。'
-        : item.enabled
-          ? 'New sessions may receive this schema; the current session still depends on actual callable tools.'
-          : 'Disabled entries normally do not enter new-session callable tools.',
+      callable: !runtimeAvailable
+        ? 'This capability is not installed in the current runtime.'
+        : locked
+          ? '現在の callable tools には入りません。ポリシー許可が必要です。'
+          : item.enabled
+            ? 'New sessions may receive this schema; the current session still depends on actual callable tools.'
+            : 'Disabled entries normally do not enter new-session callable tools.',
       status,
-      userControl: locked
-        ? 'Enterprise policy controls this entry, so users cannot change it here.'
-        : 'Users can toggle this entry; changes usually apply to new sessions.'
+      userControl: !runtimeAvailable
+        ? 'Install this catalog entry in the current runtime before changing it.'
+        : locked
+          ? 'Enterprise policy controls this entry, so users cannot change it here.'
+          : 'Users can toggle this entry; changes usually apply to new sessions.'
     }
   }
 
   return {
-    callable: locked
-      ? 'Does not enter current callable tools until policy allows it.'
-      : item.enabled
-        ? 'May enter new-session tool schemas; the current session still depends on actual callable tools.'
-        : 'Disabled entries normally do not enter new-session callable tools.',
+    callable: !runtimeAvailable
+      ? 'This capability is not installed in the current runtime.'
+      : locked
+        ? 'Does not enter current callable tools until policy allows it.'
+        : item.enabled
+          ? 'May enter new-session tool schemas; the current session still depends on actual callable tools.'
+          : 'Disabled entries normally do not enter new-session callable tools.',
     status,
-    userControl: locked
-      ? 'Enterprise policy controls this entry; users cannot change it here.'
-      : 'Users can toggle this entry; changes usually apply to new sessions.'
+    userControl: !runtimeAvailable
+      ? 'Install this catalog entry in the current runtime before changing it.'
+      : locked
+        ? 'Enterprise policy controls this entry; users cannot change it here.'
+        : 'Users can toggle this entry; changes usually apply to new sessions.'
   }
 }
 
@@ -816,9 +922,7 @@ function DetailPanelShell({ children, detail }: { children?: React.ReactNode; de
 function DetailSection({ children, title }: { children: React.ReactNode; title: string }) {
   return (
     <div className="min-w-0">
-      <div className="mb-1 text-[0.65rem] font-semibold uppercase tracking-[0.12em] text-muted-foreground">
-        {title}
-      </div>
+      <div className="mb-1 text-[0.65rem] font-semibold uppercase tracking-[0.12em] text-muted-foreground">{title}</div>
       {children}
     </div>
   )
@@ -992,9 +1096,7 @@ function PolicyStatusPill({
   return (
     <Badge
       className={
-        isPolicyLocked(item)
-          ? 'bg-destructive/10 text-destructive'
-          : 'bg-(--ui-bg-quinary) text-(--ui-text-tertiary)'
+        isPolicyLocked(item) ? 'bg-destructive/10 text-destructive' : 'bg-(--ui-bg-quinary) text-(--ui-text-tertiary)'
       }
       title={item.enterprisePolicyReason || undefined}
     >

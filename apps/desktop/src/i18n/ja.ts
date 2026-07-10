@@ -788,8 +788,8 @@ export const ja = defineLocale({
   },
 
   skills: {
-    tabSkills: 'スキル',
-    tabToolsets: 'ツールセット',
+    tabSkills: 'ガイダンス',
+    tabToolsets: 'ツール機能',
     all: 'すべて',
     searchSkills: 'スキルを検索...',
     searchToolsets: 'ツールセットを検索...',
@@ -801,6 +801,9 @@ export const ja = defineLocale({
     noToolsetsTitle: 'ツールセットが見つかりません',
     noToolsetsDesc: '検索キーワードを広げてください。',
     noDescription: '説明はありません。',
+    skillGuidance: 'モデルにタスク手順と分野別の指示を提供',
+    toolCapability: 'セッションで呼び出せるツールを提供',
+    notInstalled: '利用不可',
     configured: '設定済み',
     needsKeys: 'キーが必要',
     bestFor: '適した用途',
@@ -830,6 +833,7 @@ export const ja = defineLocale({
       userCreated: 'ユーザー作成'
     },
     toolsetsEnabled: (enabled, total) => `${enabled}/${total} ツールセットが有効`,
+    toolCount: count => `${count} ツール`,
     toggleSkill: name => `${name} スキルを切り替え`,
     configureToolset: label => `${label} を設定`,
     toggleToolset: label => `${label} ツールセットを切り替え`,

@@ -562,6 +562,9 @@ export interface Translations {
     noToolsetsTitle: string
     noToolsetsDesc: string
     noDescription: string
+    skillGuidance: string
+    toolCapability: string
+    notInstalled: string
     configured: string
     needsKeys: string
     bestFor: string
@@ -583,6 +586,7 @@ export interface Translations {
     userControl: string
     policyStatus: SkillsPolicyStatusCopy
     toolsetsEnabled: (enabled: number, total: number) => string
+    toolCount: (count: number) => string
     toggleSkill: (name: string) => string
     configureToolset: (label: string) => string
     toggleToolset: (label: string) => string

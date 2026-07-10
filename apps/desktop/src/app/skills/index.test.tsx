@@ -96,6 +96,7 @@ beforeEach(() => {
     path: 'terminal/SKILL.md'
   })
   getToolsets.mockResolvedValue([toolset()])
+  toggleSkill.mockResolvedValue({ ok: true, name: 'terminal', enabled: true })
   toggleToolset.mockResolvedValue({ ok: true, name: 'web', enabled: false })
   getToolsetConfig.mockResolvedValue({ has_category: false, active_provider: null, providers: [] })
 })
@@ -108,6 +109,9 @@ afterEach(() => {
 
 describe('SkillsView toolset management', () => {
   it('renders a switch for each toolset and toggles it off', async () => {
+    getToolsets
+      .mockResolvedValueOnce([toolset()])
+      .mockResolvedValueOnce([toolset({ enabled: false, available: false })])
     await renderSkills()
 
     const sw = await screen.findByRole('switch', { name: 'Toggle Web Search toolset' })
@@ -116,12 +120,58 @@ describe('SkillsView toolset management', () => {
     fireEvent.click(sw)
 
     await waitFor(() => expect(toggleToolset).toHaveBeenCalledWith('web', false))
+    await waitFor(() => expect(sw.getAttribute('aria-checked')).toBe('false'))
+  })
+
+  it('refreshes skill state from the runtime after a successful toggle', async () => {
+    getSkills.mockResolvedValueOnce([skill({ enabled: false })]).mockResolvedValueOnce([skill({ enabled: true })])
+
+    await renderSkills('skills')
+
+    const sw = await screen.findByRole('switch', { name: 'Toggle terminal skill' })
+    expect(sw.getAttribute('aria-checked')).toBe('false')
+
+    fireEvent.click(sw)
+
+    await waitFor(() => expect(toggleSkill).toHaveBeenCalledWith('terminal', true))
+    await waitFor(() => expect(sw.getAttribute('aria-checked')).toBe('true'))
+  })
+
+  it('renders catalog-only skills as unavailable cards without a fake toggle', async () => {
+    getSkills.mockResolvedValue([])
+    $enterprise.set(
+      managedEnterpriseState({
+        toolPolicySnapshot: {
+          skills: [
+            {
+              key: 'skill.core-chat',
+              displayName: '基础对话',
+              description: '提供基础会话能力',
+              status: 'available',
+              source: 'enterprise'
+            }
+          ],
+          toolSets: [],
+          tools: [],
+          mcpServers: [],
+          capabilityFlags: {},
+          policyVersion: 'pv-tools',
+          policyHash: 'hash-tools',
+          generatedAt: '2026-07-06T12:00:00Z'
+        }
+      })
+    )
+
+    await renderSkills('skills', 'zh')
+
+    const title = await screen.findByText('基础对话')
+    expect(title.closest('article')).toBeTruthy()
+    expect(screen.getByText('当前不可用')).toBeTruthy()
+    expect(screen.queryByRole('switch', { name: '切换 基础对话 技能' })).toBeNull()
   })
 
   it('renders toolset titles without leading emoji', async () => {
-    getToolsets.mockResolvedValue([
-      toolset({ name: 'cronjob', label: '⏰ Cron Jobs', description: 'cron tools' })
-    ])
+    getToolsets.mockResolvedValue([toolset({ name: 'cronjob', label: '⏰ Cron Jobs', description: 'cron tools' })])
 
     await renderSkills()
 
@@ -287,9 +337,7 @@ describe('SkillsView toolset management', () => {
     fireEvent.click(sw)
     expect(toggleToolset).not.toHaveBeenCalled()
 
-    const configureBtn = screen.getByRole('button', { name: 'Configure 企业浏览器' })
-    expect(configureBtn.getAttribute('disabled')).not.toBeNull()
-    fireEvent.click(configureBtn)
+    expect(screen.queryByRole('button', { name: 'Configure 企业浏览器' })).toBeNull()
     expect(getToolsetConfig).not.toHaveBeenCalled()
   })
 
@@ -324,9 +372,7 @@ describe('SkillsView toolset management', () => {
     expect(screen.getAllByText('Blocked').length).toBeGreaterThanOrEqual(1)
     expect(screen.queryByText('Needs keys')).toBeNull()
 
-    const configureBtn = screen.getByRole('button', { name: 'Configure Enterprise Web' })
-    expect(configureBtn.getAttribute('disabled')).not.toBeNull()
-    fireEvent.click(configureBtn)
+    expect(screen.queryByRole('button', { name: 'Configure Enterprise Web' })).toBeNull()
     expect(getToolsetConfig).not.toHaveBeenCalled()
   })
 
@@ -357,6 +403,9 @@ describe('SkillsView toolset management', () => {
 
     await renderSkills('toolsets', 'zh')
 
+    const sw = await screen.findByRole('switch', { name: '切换 Web Search 工具集' })
+    expect(sw.getAttribute('disabled')).not.toBeNull()
+
     const detailButton = await screen.findByRole('button', { name: '查看 Web Search 详情' })
     fireEvent.click(detailButton)
 
@@ -365,8 +414,6 @@ describe('SkillsView toolset management', () => {
     expect(screen.getByText(/不会进入当前会话 callable tools/)).toBeTruthy()
     expect(screen.getByText('包含工具')).toBeTruthy()
 
-    const sw = screen.getByRole('switch', { name: '切换 Web Search 工具集' })
-    expect(sw.getAttribute('disabled')).not.toBeNull()
     fireEvent.click(sw)
     expect(toggleToolset).not.toHaveBeenCalled()
   })
@@ -439,11 +486,12 @@ describe('SkillsView toolset management', () => {
 
     await renderSkills('skills', 'zh')
 
+    const skillSwitch = await screen.findByRole('switch', { name: '切换 terminal 技能' })
     const detailButton = await screen.findByRole('button', { name: '查看 terminal 详情' })
     fireEvent.click(detailButton)
 
     expect(await screen.findByText('读取 terminal 的 SKILL.md 失败。')).toBeTruthy()
-    expect(screen.getByRole('switch', { name: '切换 terminal 技能' })).toBeTruthy()
+    expect(skillSwitch).toBeTruthy()
   })
 
   it('falls back to local runtime lists when the old enterprise manifest has no tool policy snapshot', async () => {
