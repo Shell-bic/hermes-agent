@@ -46,7 +46,9 @@ from hermes_cli._subprocess_compat import windows_hide_flags
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
+from agent.secret_policy import secret_policy
 from hermes_cli.config import get_hermes_home
+from hermes_cli.enterprise_policy import is_enterprise_managed
 
 logger = logging.getLogger(__name__)
 
@@ -182,6 +184,33 @@ class ProcessRegistry:
         self._global_watch_window_hits: int = 0
         self._global_watch_tripped_until: float = 0.0
         self._global_watch_suppressed_during_trip: int = 0
+
+    @staticmethod
+    def _redact_output(text: Any) -> str:
+        """Apply the shared boundary, forcing it for enterprise managed mode."""
+        if text is None:
+            return ""
+        return secret_policy.redact_text(
+            text,
+            force=is_enterprise_managed(),
+        )
+
+    def _set_output(self, session: ProcessSession, text: Any) -> str:
+        """Replace a process buffer with redacted, rolling output."""
+        redacted = self._redact_output(text)
+        session.output_buffer = redacted[-session.max_output_chars:]
+        return session.output_buffer
+
+    def _append_output(self, session: ProcessSession, text: Any) -> str:
+        """Append output through one ingestion seam before retaining it."""
+        return self._set_output(session, session.output_buffer + str(text or ""))
+
+    def _redact_event(self, event: dict) -> dict:
+        """Return a safe copy of a process notification event."""
+        return {
+            key: self._redact_output(value) if isinstance(value, str) else value
+            for key, value in event.items()
+        }
 
     @staticmethod
     def _clean_shell_noise(text: str) -> str:
@@ -537,7 +566,7 @@ class ProcessRegistry:
         """
         session = ProcessSession(
             id=f"proc_{uuid.uuid4().hex[:12]}",
-            command=command,
+            command=self._redact_output(command),
             task_id=task_id,
             session_key=session_key,
             cwd=_resolve_safe_cwd(cwd or os.getcwd()),
@@ -675,7 +704,7 @@ class ProcessRegistry:
         """
         session = ProcessSession(
             id=f"proc_{uuid.uuid4().hex[:12]}",
-            command=command,
+            command=self._redact_output(command),
             task_id=task_id,
             session_key=session_key,
             cwd=cwd,
@@ -724,13 +753,13 @@ class ProcessRegistry:
                     session.exit_code = -1
                 session.completion_reason = "failed_start"
                 session.termination_source = "failed_start"
-                session.output_buffer = result.get("output", "").strip()
+                self._set_output(session, result.get("output", "").strip())
         except Exception as e:
             session.exited = True
             session.exit_code = -1
             session.completion_reason = "failed_start"
             session.termination_source = "failed_start"
-            session.output_buffer = f"Failed to start: {e}"
+            self._set_output(session, f"Failed to start: {e}")
 
         if not session.exited:
             # Start a poller thread that periodically reads the log file
@@ -767,10 +796,8 @@ class ProcessRegistry:
                     chunk = self._clean_shell_noise(chunk)
                     first_chunk = False
                 with session._lock:
-                    session.output_buffer += chunk
-                    if len(session.output_buffer) > session.max_output_chars:
-                        session.output_buffer = session.output_buffer[-session.max_output_chars:]
-                self._check_watch_patterns(session, chunk)
+                    self._append_output(session, chunk)
+                self._check_watch_patterns(session, self._redact_output(chunk))
         except Exception as e:
             logger.debug("Process stdout reader ended: %s", e)
         finally:
@@ -804,11 +831,9 @@ class ProcessRegistry:
                     delta = new_output[prev_output_len:] if len(new_output) > prev_output_len else ""
                     prev_output_len = len(new_output)
                     with session._lock:
-                        session.output_buffer = new_output
-                        if len(session.output_buffer) > session.max_output_chars:
-                            session.output_buffer = session.output_buffer[-session.max_output_chars:]
+                        self._set_output(session, new_output)
                     if delta:
-                        self._check_watch_patterns(session, delta)
+                        self._check_watch_patterns(session, self._redact_output(delta))
 
                 # Check if process is still running
                 check = env.execute(
@@ -853,10 +878,8 @@ class ProcessRegistry:
                         # ptyprocess returns bytes
                         text = chunk if isinstance(chunk, str) else chunk.decode("utf-8", errors="replace")
                         with session._lock:
-                            session.output_buffer += text
-                            if len(session.output_buffer) > session.max_output_chars:
-                                session.output_buffer = session.output_buffer[-session.max_output_chars:]
-                        self._check_watch_patterns(session, text)
+                            self._append_output(session, text)
+                        self._check_watch_patterns(session, self._redact_output(text))
                 except EOFError:
                     break
                 except Exception:
@@ -893,7 +916,9 @@ class ProcessRegistry:
         # _move_to_finished(), producing duplicate [IMPORTANT: ...] messages.
         if was_running and session.notify_on_complete:
             from tools.ansi_strip import strip_ansi
-            output_tail = strip_ansi(session.output_buffer[-2000:]) if session.output_buffer else ""
+            output_tail = self._redact_output(
+                strip_ansi(session.output_buffer[-2000:]) if session.output_buffer else ""
+            )
             self.completion_queue.put({
                 "type": "completion",
                 "session_id": session.id,
@@ -926,6 +951,7 @@ class ProcessRegistry:
             _evt_sid = evt.get("session_id", "")
             if evt.get("type") == "completion" and self.is_completion_consumed(_evt_sid):
                 continue
+            evt = self._redact_event(evt)
             text = format_process_notification(evt)
             if text:
                 results.append((evt, text))
@@ -997,9 +1023,7 @@ class ProcessRegistry:
 
         with session._lock:
             if drained:
-                session.output_buffer += drained
-                if len(session.output_buffer) > session.max_output_chars:
-                    session.output_buffer = session.output_buffer[-session.max_output_chars:]
+                self._append_output(session, drained)
             session.exited = True
             if session.completion_reason != "killed":
                 session.exit_code = rc
@@ -1024,11 +1048,13 @@ class ProcessRegistry:
         self._reconcile_local_exit(session)
 
         with session._lock:
-            output_preview = strip_ansi(session.output_buffer[-1000:]) if session.output_buffer else ""
+            output_preview = self._redact_output(
+                strip_ansi(session.output_buffer[-1000:]) if session.output_buffer else ""
+            )
 
         result = {
             "session_id": session.id,
-            "command": session.command,
+            "command": self._redact_output(session.command),
             "status": "exited" if session.exited else "running",
             "pid": session.pid,
             "uptime_seconds": int(time.time() - session.started_at),
@@ -1053,7 +1079,7 @@ class ProcessRegistry:
             return {"status": "not_found", "error": f"No process with ID {session_id}"}
 
         with session._lock:
-            full_output = strip_ansi(session.output_buffer)
+            full_output = self._redact_output(strip_ansi(session.output_buffer))
 
         lines = full_output.splitlines()
         total_lines = len(lines)
@@ -1128,7 +1154,7 @@ class ProcessRegistry:
                     "exit_code": session.exit_code,
                     "completion_reason": session.completion_reason,
                     "termination_source": session.termination_source,
-                    "output": strip_ansi(session.output_buffer[-2000:]),
+                    "output": self._redact_output(strip_ansi(session.output_buffer[-2000:])),
                 }
                 if timeout_note:
                     result["timeout_note"] = timeout_note
@@ -1137,7 +1163,7 @@ class ProcessRegistry:
             if _is_interrupted():
                 result = {
                     "status": "interrupted",
-                    "output": strip_ansi(session.output_buffer[-1000:]),
+                    "output": self._redact_output(strip_ansi(session.output_buffer[-1000:])),
                     "note": "User sent a new message -- wait interrupted",
                 }
                 if timeout_note:
@@ -1151,7 +1177,7 @@ class ProcessRegistry:
 
         result = {
             "status": "timeout",
-            "output": strip_ansi(session.output_buffer[-1000:]),
+            "output": self._redact_output(strip_ansi(session.output_buffer[-1000:])),
         }
         if timeout_note:
             result["timeout_note"] = timeout_note
@@ -1321,13 +1347,15 @@ class ProcessRegistry:
         for s in all_sessions:
             entry = {
                 "session_id": s.id,
-                "command": s.command[:200],
+                "command": self._redact_output(s.command[:200]),
                 "cwd": s.cwd,
                 "pid": s.pid,
                 "started_at": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(s.started_at)),
                 "uptime_seconds": int(time.time() - s.started_at),
                 "status": "exited" if s.exited else "running",
-                "output_preview": s.output_buffer[-200:] if s.output_buffer else "",
+                "output_preview": self._redact_output(
+                    s.output_buffer[-200:] if s.output_buffer else ""
+                ),
             }
             if s.exited:
                 entry["exit_code"] = s.exit_code
@@ -1421,7 +1449,7 @@ class ProcessRegistry:
                     if not s.exited:
                         entries.append({
                             "session_id": s.id,
-                            "command": s.command,
+                            "command": self._redact_output(s.command),
                             "pid": s.pid,
                             "pid_scope": s.pid_scope,
                             "cwd": s.cwd,
@@ -1436,7 +1464,9 @@ class ProcessRegistry:
                             "watcher_message_id": s.watcher_message_id,
                             "watcher_interval": s.watcher_interval,
                             "notify_on_complete": s.notify_on_complete,
-                            "watch_patterns": s.watch_patterns,
+                            "watch_patterns": [
+                                self._redact_output(pattern) for pattern in s.watch_patterns
+                            ],
                         })
             
             # Atomic write to avoid corruption on crash
@@ -1484,7 +1514,7 @@ class ProcessRegistry:
             if alive:
                 session = ProcessSession(
                     id=entry["session_id"],
-                    command=entry.get("command", "unknown"),
+                    command=self._redact_output(entry.get("command", "unknown")),
                     task_id=entry.get("task_id", ""),
                     session_key=entry.get("session_key", ""),
                     pid=pid,
@@ -1622,6 +1652,12 @@ def format_process_notification(evt: dict) -> "str | None":
     Handles completion events (notify_on_complete), watch pattern matches,
     and watch disabled events from the unified completion_queue.
     """
+    force_redaction = is_enterprise_managed()
+    evt = {
+        key: secret_policy.redact_text(value, force=force_redaction)
+        if isinstance(value, str) else value
+        for key, value in evt.items()
+    }
     evt_type = evt.get("type", "completion")
     _sid = evt.get("session_id", "unknown")
     _cmd = evt.get("command", "unknown")

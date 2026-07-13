@@ -1,5 +1,6 @@
 """Tests for tools/process_registry.py — ProcessRegistry query methods, pruning, checkpoint."""
 
+import base64
 import json
 import os
 import signal
@@ -16,6 +17,10 @@ from tools.process_registry import (
     ProcessSession,
     FINISHED_TTL_SECONDS,
     MAX_PROCESSES,
+)
+from tests.fixtures.secret_boundary import (
+    FAKE_ENV_TEXT,
+    assert_fake_secrets_redacted,
 )
 
 
@@ -138,6 +143,15 @@ class TestGetAndPoll:
         result = registry.poll(s.id)
         assert result["status"] == "exited"
         assert result["exit_code"] == 0
+
+    def test_managed_poll_redacts_synthetic_credentials(self, monkeypatch, registry):
+        monkeypatch.setenv("HERMES_ENTERPRISE_MANAGED", "1")
+        s = _make_session(output=FAKE_ENV_TEXT)
+        registry._running[s.id] = s
+
+        result = registry.poll(s.id)
+
+        assert_fake_secrets_redacted(result["output_preview"])
 
 
 # =========================================================================
@@ -323,6 +337,121 @@ class TestReadLog:
         registry._running[s.id] = s
         result = registry.read_log(s.id, offset=10, limit=5)
         assert "5 lines" in result["showing"]
+
+    def test_managed_log_redacts_synthetic_credentials(self, monkeypatch, registry):
+        monkeypatch.setenv("HERMES_ENTERPRISE_MANAGED", "1")
+        s = _make_session(output=FAKE_ENV_TEXT)
+        registry._running[s.id] = s
+
+        result = registry.read_log(s.id)
+
+        assert_fake_secrets_redacted(result["output"])
+
+
+class TestSecretBoundaryIngress:
+    def test_managed_output_is_redacted_before_buffer_storage(self, monkeypatch, registry):
+        monkeypatch.setenv("HERMES_ENTERPRISE_MANAGED", "1")
+        s = _make_session()
+
+        registry._append_output(s, FAKE_ENV_TEXT)
+
+        assert_fake_secrets_redacted(s.output_buffer)
+
+    def test_managed_output_redacts_a_token_split_across_chunks(self, monkeypatch, registry):
+        monkeypatch.setenv("HERMES_ENTERPRISE_MANAGED", "1")
+        secret_line = FAKE_ENV_TEXT.splitlines()[0]
+        midpoint = len(secret_line) // 2
+        s = _make_session()
+
+        registry._append_output(s, secret_line[:midpoint])
+        registry._append_output(s, secret_line[midpoint:])
+
+        assert_fake_secrets_redacted(s.output_buffer)
+
+    def test_managed_base64_payload_is_redacted_at_ingress_and_queries(
+        self,
+        monkeypatch,
+        registry,
+    ):
+        monkeypatch.setenv("HERMES_ENTERPRISE_MANAGED", "1")
+        encoded = base64.b64encode(FAKE_ENV_TEXT.encode("utf-8")).decode("ascii")
+        s = _make_session()
+        registry._running[s.id] = s
+
+        registry._append_output(s, encoded)
+        polled = registry.poll(s.id)
+        logged = registry.read_log(s.id)
+
+        assert encoded not in s.output_buffer
+        assert encoded not in polled["output_preview"]
+        assert encoded not in logged["output"]
+
+    def test_managed_wait_and_list_apply_defensive_redaction(self, monkeypatch, registry):
+        monkeypatch.setenv("HERMES_ENTERPRISE_MANAGED", "1")
+        s = _make_session(
+            command=f"echo {FAKE_ENV_TEXT.splitlines()[0].split('=', 1)[1]}",
+            exited=True,
+            exit_code=0,
+            output=FAKE_ENV_TEXT,
+        )
+        registry._finished[s.id] = s
+
+        waited = registry.wait(s.id, timeout=1)
+        listed = json.dumps(registry.list_sessions(), ensure_ascii=False)
+
+        assert_fake_secrets_redacted(waited["output"])
+        assert_fake_secrets_redacted(listed)
+
+    def test_managed_checkpoint_redacts_command_and_watch_patterns(
+        self,
+        monkeypatch,
+        registry,
+        tmp_path,
+    ):
+        monkeypatch.setenv("HERMES_ENTERPRISE_MANAGED", "1")
+        checkpoint = tmp_path / "processes.json"
+        monkeypatch.setattr("tools.process_registry.CHECKPOINT_PATH", checkpoint)
+        secret = FAKE_ENV_TEXT.splitlines()[0].split("=", 1)[1]
+        s = _make_session(command=f"echo {secret}")
+        s.watch_patterns = [secret]
+        registry._running[s.id] = s
+
+        registry._write_checkpoint()
+
+        encoded = checkpoint.read_text(encoding="utf-8")
+        assert_fake_secrets_redacted(encoded)
+
+    def test_managed_completion_notification_is_redacted(self, monkeypatch, registry):
+        monkeypatch.setenv("HERMES_ENTERPRISE_MANAGED", "1")
+        s = _make_session(exited=False, output=FAKE_ENV_TEXT)
+        s.notify_on_complete = True
+        registry._running[s.id] = s
+
+        s.exited = True
+        s.exit_code = 0
+        with patch.object(registry, "_write_checkpoint"):
+            registry._move_to_finished(s)
+        events = registry.drain_notifications()
+
+        assert len(events) == 1
+        raw_event, formatted = events[0]
+        assert_fake_secrets_redacted(raw_event["output"])
+        assert_fake_secrets_redacted(formatted)
+
+    def test_managed_drain_redacts_already_queued_raw_event(self, monkeypatch, registry):
+        monkeypatch.setenv("HERMES_ENTERPRISE_MANAGED", "1")
+        registry.completion_queue.put({
+            "type": "completion",
+            "session_id": "proc_raw",
+            "command": FAKE_ENV_TEXT,
+            "output": FAKE_ENV_TEXT,
+            "exit_code": 0,
+        })
+
+        raw_event, formatted = registry.drain_notifications()[0]
+
+        assert_fake_secrets_redacted(json.dumps(raw_event, ensure_ascii=False))
+        assert_fake_secrets_redacted(formatted)
 
 
 # =========================================================================

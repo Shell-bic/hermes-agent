@@ -46,6 +46,8 @@ from pathlib import Path
 from typing import Optional, Dict, Any, List
 
 from utils import env_var_enabled
+from agent.secret_policy import secret_policy
+from hermes_cli.enterprise_policy import is_enterprise_managed
 
 logger = logging.getLogger(__name__)
 
@@ -261,6 +263,29 @@ def _check_all_guards(command: str, env_type: str) -> dict:
     """Delegate to consolidated guard (tirith + dangerous cmd) with CLI callback."""
     return _check_all_guards_impl(command, env_type,
                                   approval_callback=_get_approval_callback())
+
+
+def _check_secret_boundary(command: str, cwd: Optional[str] = None) -> dict:
+    """Apply the non-bypassable enterprise credential-read preflight."""
+    if not is_enterprise_managed():
+        return {"approved": True, "message": None}
+
+    decision = secret_policy.classify_command(command, cwd=cwd)
+    if decision.allowed:
+        return {"approved": True, "message": None}
+
+    description = decision.reason or "command may expose managed credentials"
+    logger.warning(
+        "Enterprise Secret Boundary block: %s (command: %s)",
+        description,
+        _safe_command_preview(command),
+    )
+    return {
+        "approved": False,
+        "status": "blocked",
+        "description": description,
+        "message": f"BLOCKED: Enterprise Secret Boundary denied command: {description}.",
+    }
 
 
 # Allowlist: characters that can legitimately appear in directory paths.
@@ -1928,6 +1953,18 @@ def terminal_tool(
         default_timeout = config["timeout"]
         effective_timeout = timeout or default_timeout
 
+        # Enterprise Secret Boundary is a policy floor, not an approval.  Run
+        # before environment creation and before force/yolo/approval handling
+        # so no replay or operator convenience flag can bypass it.
+        secret_boundary = _check_secret_boundary(command, workdir or cwd)
+        if not secret_boundary["approved"]:
+            return json.dumps({
+                "output": "",
+                "exit_code": -1,
+                "error": secret_boundary["message"],
+                "status": "blocked",
+            }, ensure_ascii=False)
+
         # Reject foreground commands where the model explicitly requests
         # a timeout above FOREGROUND_MAX_TIMEOUT — nudge it toward background.
         if not background and timeout and timeout > FOREGROUND_MAX_TIMEOUT:
@@ -2432,9 +2469,9 @@ def terminal_tool(
             from tools.ansi_strip import strip_ansi
             output = strip_ansi(output)
 
-            # Redact secrets from command output (catches env/printenv leaking keys)
-            from agent.redact import redact_sensitive_text
-            output = redact_sensitive_text(output.strip()) if output else ""
+            # Model-visible terminal output is a hard Secret Boundary.  Force
+            # the shared policy even when optional logging redaction is off.
+            output = secret_policy.redact_text(output.strip(), force=True) if output else ""
 
             # Interpret non-zero exit codes that aren't real errors
             # (e.g. grep=1 means "no matches", diff=1 means "files differ")

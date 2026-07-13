@@ -6,6 +6,12 @@ import os
 from pathlib import Path
 from typing import Optional
 
+from agent.secret_policy import (
+    BLOCKED_PROJECT_ENV_BASENAMES,
+    PathSensitivity,
+    secret_policy,
+)
+
 
 def _hermes_home_path() -> Path:
     """Resolve the active HERMES_HOME (profile-aware) without circular imports."""
@@ -131,164 +137,41 @@ def is_write_denied(path: str) -> bool:
     return False
 
 
-# Common secret-bearing project-local environment file basenames.
-# These are blocked because .env files routinely contain API keys,
-# database passwords, and other credentials.
-_BLOCKED_PROJECT_ENV_BASENAMES: set[str] = {
-    ".env",
-    ".env.local",
-    ".env.development",
-    ".env.production",
-    ".env.test",
-    ".env.staging",
-    ".envrc",
-}
+# Backward-compatible export for tests and callers that inspect the canonical
+# project env-file set.  The rules themselves live in SecretPolicy.
+_BLOCKED_PROJECT_ENV_BASENAMES = BLOCKED_PROJECT_ENV_BASENAMES
 
 
 def get_read_block_error(path: str) -> Optional[str]:
-    """Return an error message when a read targets a denied Hermes path.
-
-    Three categories are blocked:
-
-      * Internal Hermes cache files under ``HERMES_HOME/skills/.hub`` —
-        readable metadata that an attacker could use as a prompt-injection
-        carrier.
-      * Credential / secret stores under HERMES_HOME and the global Hermes
-        root: ``auth.json``, ``auth.lock``, ``.anthropic_oauth.json``,
-        ``.env``, ``webhook_subscriptions.json``, ``auth/google_oauth.json``,
-        and anything under ``mcp-tokens/``. These hold plaintext provider keys,
-        OAuth tokens, and HMAC secrets that the agent never needs to read
-        directly — provider tools / gateway adapters consume them through
-        internal channels.
-      * Project-local environment files anywhere on disk: ``.env``,
-        ``.env.local``, ``.env.development``, ``.env.production``,
-        ``.env.test``, ``.env.staging``, ``.envrc``. These routinely hold
-        API keys, database passwords, and other credentials for the user's
-        own projects. The agent helping debug a project shouldn't normally
-        need to read these — ``.env.example`` is the documented-shape
-        substitute.
-
-    **This is NOT a security boundary.** The terminal tool runs as the
-    same OS user with shell access; the agent can still ``cat auth.json``
-    or ``cat ~/.hermes/.env`` and exfiltrate the file. The read-deny exists
-    as defense-in-depth that:
-
-      * Returns a clear error to models that respect tool denials, which
-        empirically prompts most modern models to stop rather than reach
-        for the shell.
-      * Surfaces a visible audit trail when something tries to read
-        credentials — easier to spot in logs than a generic ``cat``.
-
-    Treat any user-visible framing around this as "may help" rather than
-    "stops attackers." A determined model or malicious instruction can
-    always shell out.
-
-    Callers that resolve relative paths against a non-process cwd
-    (e.g. ``TERMINAL_CWD`` in ``tools/file_tools.py``) MUST pre-resolve
-    and pass the absolute path string.  This function's own ``resolve()``
-    is anchored at the Python process cwd, so a relative input like
-    ``"auth.json"`` would otherwise miss the denylist when the task's
-    terminal cwd differs from the process cwd.
-    """
-    resolved = Path(path).expanduser().resolve()
-
-    # Resolve BOTH the active HERMES_HOME (profile-aware) AND the global
-    # Hermes root so credential stores at <root>/auth.json etc. are also
-    # blocked when running under a profile (HERMES_HOME points at
-    # <root>/profiles/<name> in profile mode). Same shape as the write
-    # deny widening (#15981, #14157).
-    hermes_dirs: list[Path] = []
-    for base in (_hermes_home_path(), _hermes_root_path()):
-        try:
-            real = base.resolve()
-            if real not in hermes_dirs:
-                hermes_dirs.append(real)
-        except Exception:
-            continue
-
-    # Skills .hub: prompt-injection carriers.
-    for hd in hermes_dirs:
-        blocked_dirs = [
-            hd / "skills" / ".hub" / "index-cache",
-            hd / "skills" / ".hub",
-        ]
-        for blocked in blocked_dirs:
-            try:
-                resolved.relative_to(blocked)
-            except ValueError:
-                continue
-            return (
-                f"Access denied: {path} is an internal Hermes cache file "
-                "and cannot be read directly to prevent prompt injection. "
-                "Use the skills_list or skill_view tools instead."
-            )
-
-    # Credential / secret stores. Exact-file matches under either
-    # HERMES_HOME or <root>.
-    credential_file_names = (
-        "auth.json",
-        "auth.lock",
-        ".anthropic_oauth.json",
-        ".env",
-        "webhook_subscriptions.json",
-        os.path.join("auth", "google_oauth.json"),
-        # Bitwarden Secrets Manager disk cache: stores plaintext secret values
-        # to avoid re-fetching across back-to-back CLI invocations. The file
-        # was introduced by #31968 but not added to this guard.
-        os.path.join("cache", "bws_cache.json"),
+    """Return a stable denial message from the shared SecretPolicy result."""
+    classification = secret_policy.classify_path(
+        path,
+        hermes_paths=(_hermes_home_path(), _hermes_root_path()),
     )
-    for hd in hermes_dirs:
-        for name in credential_file_names:
-            try:
-                blocked = (hd / name).resolve()
-            except Exception:
-                continue
-            if resolved == blocked:
-                return (
-                    f"Access denied: {path} is a Hermes credential store "
-                    "and cannot be read directly. Provider tools consume "
-                    "these credentials through internal channels. "
-                    "(Defense-in-depth — not a security boundary; the "
-                    "terminal tool can still bypass.)"
-                )
-
-    # mcp-tokens/: directory prefix match — anything inside is OAuth
-    # token material.
-    for hd in hermes_dirs:
-        try:
-            mcp_tokens = (hd / "mcp-tokens").resolve()
-        except Exception:
-            continue
-        if resolved == mcp_tokens:
-            return (
-                f"Access denied: {path} is the Hermes MCP token directory "
-                "and cannot be read directly. (Defense-in-depth — not a "
-                "security boundary; the terminal tool can still bypass.)"
-            )
-        try:
-            resolved.relative_to(mcp_tokens)
-        except ValueError:
-            continue
+    if classification.sensitivity is PathSensitivity.PUBLIC:
+        return None
+    if classification.sensitivity is PathSensitivity.INTERNAL_CACHE:
         return (
-            f"Access denied: {path} is a Hermes MCP token file "
-            "and cannot be read directly. (Defense-in-depth — not a "
-            "security boundary; the terminal tool can still bypass.)"
+            f"Access denied: {path} is an internal Hermes cache file "
+            "and cannot be read directly to prevent prompt injection. "
+            "Use the skills_list or skill_view tools instead."
         )
-
-    # Block common secret-bearing project-local .env files anywhere on disk.
-    # The agent helping a user with their project rarely needs to read raw
-    # .env contents — .env.example is the documented-shape substitute. The
-    # terminal tool can still ``cat .env``; this is defense-in-depth, not a
-    # boundary (see module docstring).
-    if resolved.name in _BLOCKED_PROJECT_ENV_BASENAMES:
+    if classification.reason == "Hermes MCP token store":
+        return (
+            f"Access denied: {path} is a Hermes MCP token file or directory "
+            "and cannot be read directly."
+        )
+    if classification.reason == "secret-bearing environment file":
         return (
             f"Access denied: {path} is a secret-bearing environment file "
             "and cannot be read to prevent credential leakage. "
-            "If you need to check the file structure, read .env.example instead. "
-            "(Defense-in-depth — not a security boundary; the terminal tool can still bypass.)"
+            "If you need to check the file structure, read .env.example instead."
         )
-
-    return None
+    return (
+        f"Access denied: {path} is a Hermes credential store and cannot be "
+        "read directly. Provider tools consume these credentials through "
+        "internal channels."
+    )
 
 
 # ---------------------------------------------------------------------------
