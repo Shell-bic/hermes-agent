@@ -15,7 +15,7 @@ import re
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from agent.redact import redact_sensitive_text
 from hermes_cli.enterprise_policy import is_enterprise_managed
@@ -102,8 +102,15 @@ _LABELED_API_KEY_RE = re.compile(
     re.IGNORECASE,
 )
 _BASE64_CANDIDATE_RE = re.compile(
-    r"(?<![A-Za-z0-9+/])(?:[A-Za-z0-9+/]{24,})(?:={0,2})(?![A-Za-z0-9+/=])"
+    r"(?<![A-Za-z0-9+/_-])(?:[A-Za-z0-9+/_-]{24,})(?:={0,2})(?![A-Za-z0-9+/_=-])"
 )
+_HEX_CANDIDATE_RE = re.compile(
+    r"(?<![A-Za-z0-9])(?:[0-9A-Fa-f]{2}){12,}(?![A-Za-z0-9])"
+)
+_PERCENT_ENCODED_CANDIDATE_RE = re.compile(
+    r"(?<!%)(?:%[0-9A-Fa-f]{2}){12,}(?![0-9A-Fa-f])"
+)
+_PHONE_CANDIDATE_RE = re.compile(r"\+[1-9]\d{6,14}(?![A-Za-z0-9])")
 
 _SAFE_PATH_TOKEN = r"(?:\"[A-Za-z0-9_./\\:~ -]+\"|'[A-Za-z0-9_./\\:~ -]+'|[A-Za-z0-9_./\\:~-]+)"
 _SAFE_METADATA_SIMPLE_RE = re.compile(
@@ -164,8 +171,58 @@ def _is_relative_to(path: Path, parent: Path) -> bool:
 
 
 def _looks_like_secret_text(text: str) -> bool:
-    forced = redact_sensitive_text(text, force=True)
-    return forced != text or bool(_ENTERPRISE_TOKEN_RE.search(text))
+    # Phone-number masking is valid for direct assistant output but does not
+    # make an opaque encoded blob a credential.  Exclude phones before using
+    # the canonical redactor as the decoded-secret classifier.
+    credential_text = _PHONE_CANDIDATE_RE.sub("", text)
+    forced = redact_sensitive_text(credential_text, force=True)
+    return forced != credential_text or bool(_ENTERPRISE_TOKEN_RE.search(text))
+
+
+def _decode_base64_once(encoded: str) -> Optional[str]:
+    """Decode one standard or URL-safe Base64 layer, including omitted padding."""
+    padding = (-len(encoded)) % 4
+    if padding == 3:
+        # A Base64 payload can never have a one-character final quantum.
+        return None
+    try:
+        decoded = base64.b64decode(
+            encoded + ("=" * padding),
+            altchars=b"-_",
+            validate=True,
+        )
+        return decoded.decode("utf-8")
+    except (binascii.Error, UnicodeDecodeError, ValueError):
+        return None
+
+
+def _decode_hex_once(encoded: str) -> Optional[str]:
+    """Decode one hexadecimal layer when it contains valid UTF-8 text."""
+    try:
+        return bytes.fromhex(encoded).decode("utf-8")
+    except (ValueError, UnicodeDecodeError):
+        return None
+
+
+def _decode_percent_once(encoded: str) -> Optional[str]:
+    """Decode a fully percent-encoded byte sequence exactly once."""
+    try:
+        raw = bytes(int(encoded[index + 1:index + 3], 16) for index in range(0, len(encoded), 3))
+        return raw.decode("utf-8")
+    except (ValueError, UnicodeDecodeError):
+        return None
+
+
+def _redact_decoded_secret(
+    match: re.Match[str],
+    decoder: Callable[[str], Optional[str]],
+) -> str:
+    """Mask an encoded candidate only when its decoded text is secret-bearing."""
+    encoded = match.group(0)
+    decoded = decoder(encoded)
+    if decoded is None or not _looks_like_secret_text(decoded):
+        return encoded
+    return "[REDACTED ENCODED SECRET]"
 
 
 def _is_safe_metadata_command(command: str) -> bool:
@@ -291,15 +348,18 @@ class SecretPolicy:
         redacted = _BEARER_OR_TOKEN_RE.sub("[REDACTED]", redacted)
         redacted = _LABELED_API_KEY_RE.sub("[REDACTED]", redacted)
 
-        def _redact_encoded(match: re.Match[str]) -> str:
-            encoded = match.group(0)
-            try:
-                decoded = base64.b64decode(encoded, validate=True).decode("utf-8")
-            except (binascii.Error, UnicodeDecodeError, ValueError):
-                return encoded
-            return "[REDACTED ENCODED SECRET]" if _looks_like_secret_text(decoded) else encoded
-
-        return _BASE64_CANDIDATE_RE.sub(_redact_encoded, redacted)
+        redacted = _PERCENT_ENCODED_CANDIDATE_RE.sub(
+            lambda match: _redact_decoded_secret(match, _decode_percent_once),
+            redacted,
+        )
+        redacted = _HEX_CANDIDATE_RE.sub(
+            lambda match: _redact_decoded_secret(match, _decode_hex_once),
+            redacted,
+        )
+        return _BASE64_CANDIDATE_RE.sub(
+            lambda match: _redact_decoded_secret(match, _decode_base64_once),
+            redacted,
+        )
 
     def redact_value(
         self,

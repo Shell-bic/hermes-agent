@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import base64
-
 import pytest
 
 from agent.secret_policy import PathSensitivity, SecretPolicy
@@ -11,6 +9,7 @@ from tests.fixtures.secret_boundary import (
     FAKE_ENV_TEXT,
     FAKE_SECRET_VALUES,
     assert_fake_secrets_redacted,
+    fake_encoded_representations,
 )
 
 
@@ -112,13 +111,86 @@ def test_redaction_covers_all_fake_token_shapes(managed_policy):
     assert "standalone:" in redacted
 
 
-def test_redaction_covers_base64_encoded_fake_env(managed_policy):
-    encoded = base64.b64encode(FAKE_ENV_TEXT.encode("utf-8")).decode("ascii")
-
-    redacted = managed_policy.redact_text(f"encoded={encoded}")
+@pytest.mark.parametrize(
+    "encoding,encoded",
+    fake_encoded_representations(FAKE_ENV_TEXT).items(),
+)
+def test_redaction_covers_one_layer_encoded_fake_env(
+    managed_policy,
+    encoding,
+    encoded,
+):
+    redacted = managed_policy.redact_text(f"{encoding}={encoded}")
 
     assert encoded not in redacted
     assert "REDACTED" in redacted
+
+
+@pytest.mark.parametrize(
+    "encoding,encoded",
+    fake_encoded_representations(FAKE_SECRET_VALUES[0]).items(),
+)
+def test_redaction_covers_one_layer_encoded_fake_token(
+    managed_policy,
+    encoding,
+    encoded,
+):
+    redacted = managed_policy.redact_text(f"{encoding}={encoded}")
+
+    assert encoded not in redacted
+    assert "REDACTED ENCODED SECRET" in redacted
+
+
+def test_urlsafe_fixture_exercises_urlsafe_alphabet():
+    encoded = fake_encoded_representations(FAKE_SECRET_VALUES[0])["urlsafe_base64"]
+
+    assert "-" in encoded or "_" in encoded
+
+
+@pytest.mark.parametrize(
+    "encoded",
+    fake_encoded_representations(FAKE_SECRET_VALUES[1]).values(),
+)
+def test_redaction_covers_dynamically_joined_final_output(managed_policy, encoded):
+    fragments = [encoded[index:index + 5] for index in range(0, len(encoded), 5)]
+    final_output = "".join(fragments)
+
+    redacted = managed_policy.redact_text(f"joined={final_output}")
+
+    assert final_output not in redacted
+    assert "REDACTED ENCODED SECRET" in redacted
+
+
+@pytest.mark.parametrize(
+    "encoded",
+    fake_encoded_representations(FAKE_SECRET_VALUES[2]).values(),
+)
+def test_one_layer_encoded_token_is_removed_from_export_and_persistence(
+    managed_policy,
+    encoded,
+):
+    payload = {"content": f"result={encoded}", "nested": [encoded]}
+
+    exported = managed_policy.redact_export_value(payload)
+    persisted = managed_policy.redact_persisted_value(payload)
+
+    assert encoded not in str(exported)
+    assert encoded not in str(persisted)
+    assert exported["content"] == "result=[REDACTED ENCODED SECRET]"
+    assert persisted["nested"] == ["[REDACTED ENCODED SECRET]"]
+
+
+@pytest.mark.parametrize(
+    "plain_text",
+    [
+        "this is ordinary encoded output",
+        "0123456789abcdef0123456789abcdef",
+        "call +8613800138000 for ordinary support",
+    ],
+)
+def test_non_secret_one_layer_encodings_are_not_redacted(managed_policy, plain_text):
+    for encoded in fake_encoded_representations(plain_text).values():
+        assert managed_policy.redact_text(encoded) == encoded
 
 
 def test_managed_redaction_cannot_be_disabled(monkeypatch):
