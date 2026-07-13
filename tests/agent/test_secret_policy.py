@@ -128,3 +128,31 @@ def test_managed_redaction_cannot_be_disabled(monkeypatch):
     redacted = SecretPolicy().redact_text(FAKE_ENV_TEXT)
 
     assert_fake_secrets_redacted(redacted)
+
+
+def test_export_sensitive_keys_mask_non_string_leaves_without_changing_shape():
+    exported = SecretPolicy().redact_export_value(
+        {
+            "password": 1234,
+            "token": True,
+            "apiKey": "raw-api-key",
+            "gatewayToken": "raw-gateway-token",
+            "credential": {
+                "enabled": False,
+                "retries": 3,
+                "optional": None,
+            },
+            "token_count": 42,
+        }
+    )
+
+    assert exported["password"] == "[REDACTED]"
+    assert exported["token"] == "[REDACTED]"
+    assert exported["apiKey"] == "[REDACTED]"
+    assert exported["gatewayToken"] == "[REDACTED]"
+    assert exported["credential"] == {
+        "enabled": "[REDACTED]",
+        "retries": "[REDACTED]",
+        "optional": None,
+    }
+    assert exported["token_count"] == 42

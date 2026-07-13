@@ -6,6 +6,7 @@ are made.
 """
 
 import ast
+import base64
 import inspect
 import io
 import json
@@ -24,6 +25,10 @@ import run_agent
 from run_agent import AIAgent
 from agent.error_classifier import FailoverReason
 from agent.prompt_builder import DEFAULT_AGENT_IDENTITY
+from tests.fixtures.secret_boundary import (
+    FAKE_SECRET_ENV,
+    assert_fake_secrets_redacted,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -697,6 +702,53 @@ class TestSaveSessionLogRedactsSecrets:
         assert "gsk_abc123def456ghi789jkl012mno" not in parts[0]["text"]
         # Image part preserved untouched
         assert parts[1]["image_url"]["url"].startswith("data:image")
+
+    def test_managed_snapshot_recursively_redacts_all_message_payloads(
+        self,
+        agent,
+        tmp_path,
+        monkeypatch,
+    ):
+        monkeypatch.setenv("HERMES_ENTERPRISE_MANAGED", "1")
+        monkeypatch.setattr("agent.redact._REDACT_ENABLED", False)
+        encoded_secret = base64.b64encode(
+            FAKE_SECRET_ENV["COMPANY_GATEWAY_TOKEN"].encode("utf-8")
+        ).decode("ascii")
+        agent._session_json_enabled = True
+        agent.logs_dir = tmp_path
+        messages = [
+            {
+                "role": "assistant",
+                "content": f"content={FAKE_SECRET_ENV['COMPANY_GATEWAY_TOKEN']}",
+                "reasoning": FAKE_SECRET_ENV["HERMES_DASHBOARD_SESSION_TOKEN"],
+                "reasoning_content": FAKE_SECRET_ENV["DESKTOP_TOKEN"],
+                "tool_calls": [
+                    {
+                        "id": "call-snapshot",
+                        "type": "function",
+                        "function": {
+                            "name": "terminal",
+                            "arguments": json.dumps(
+                                {"api_key": FAKE_SECRET_ENV["OPENAI_API_KEY"]}
+                            ),
+                        },
+                        "result": {"stdout": encoded_secret},
+                    }
+                ],
+            }
+        ]
+
+        agent._save_session_log(messages)
+
+        snapshot_path = tmp_path / f"session_{agent.session_id}.json"
+        snapshot_text = snapshot_path.read_text(encoding="utf-8")
+        snapshot = json.loads(snapshot_text)
+        assert_fake_secrets_redacted(snapshot_text)
+        assert encoded_secret not in snapshot_text
+        stored_message = snapshot["messages"][0]
+        assert stored_message["role"] == "assistant"
+        assert stored_message["tool_calls"][0]["id"] == "call-snapshot"
+        assert stored_message["tool_calls"][0]["function"]["name"] == "terminal"
 
 
 class TestGetMessagesUpToLastAssistant:

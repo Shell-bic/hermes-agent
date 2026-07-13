@@ -135,6 +135,7 @@ from tools.browser_tool import cleanup_browser
 from agent.memory_manager import sanitize_context
 from agent.error_classifier import FailoverReason
 from agent.redact import redact_sensitive_text
+from agent.secret_policy import secret_policy
 from agent.model_metadata import (
     estimate_request_tokens_rough,  # noqa: F401  # re-exported for tests that mock.patch("run_agent.estimate_request_tokens_rough")
     is_local_endpoint,
@@ -2317,6 +2318,14 @@ class AIAgent:
                 "message_count": len(cleaned),
                 "messages": cleaned,
             }
+
+            # The optional JSON snapshot is a second persistence boundary
+            # beside state.db.  In enterprise managed mode it must apply the
+            # exact same recursive SecretPolicy pass as SQLite, including
+            # nested reasoning and tool argument/result strings.  Outside
+            # managed mode this is a no-op, preserving the established
+            # opt-in snapshot behavior above.
+            entry = secret_policy.redact_persisted_value(entry)
 
             atomic_json_write(
                 log_file,

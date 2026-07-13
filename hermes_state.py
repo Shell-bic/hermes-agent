@@ -24,6 +24,7 @@ import time
 from pathlib import Path
 
 from agent.memory_manager import sanitize_context
+from agent.secret_policy import secret_policy
 from hermes_constants import get_hermes_home
 from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar
 
@@ -54,24 +55,6 @@ _COMPRESSION_CHILD_SQL = (
 # compression continuations stay hidden).
 _LISTABLE_CHILD_SQL = f"(s.parent_session_id IS NULL OR {_BRANCH_CHILD_SQL.format(a='s')})"
 
-_EXPORT_REDACTED = "[REDACTED]"
-_EXPORT_SENSITIVE_KEY_RE = re.compile(
-    r"(api[_-]?key|access[_-]?token|refresh[_-]?token|gateway[_-]?token|desktop[_-]?token|"
-    r"authorization|secret|password|credential|ciphertext)",
-    re.IGNORECASE,
-)
-_EXPORT_REASONING_KEY_RE = re.compile(
-    r"^(thinking|reasoning|reasoning_content|reasoning_details|codex_reasoning_items)$",
-    re.IGNORECASE,
-)
-_EXPORT_SECRET_PATTERNS = (
-    re.compile(r"\b(?:gw|dsk|adm)_[A-Za-z0-9_-]{16,}\b"),
-    re.compile(r"\bsk-[A-Za-z0-9][A-Za-z0-9._-]{12,}\b"),
-    re.compile(r"\b(?:Bearer|token)\s+[A-Za-z0-9._~+/-]{16,}\b", re.IGNORECASE),
-    re.compile(r"\b(?:x-api-key|api-key|api_key)\s*[:=]\s*[A-Za-z0-9._~+/-]{12,}\b", re.IGNORECASE),
-)
-
-
 def _ephemeral_child_sql(alias: str = "s") -> str:
     """Subagent runs (cascade-delete targets), not branches or compression tips."""
     branch = _BRANCH_CHILD_SQL.format(a=alias)
@@ -81,32 +64,6 @@ def _ephemeral_child_sql(alias: str = "s") -> str:
         f" AND NOT ({branch})"
         f" AND NOT ({compression}))"
     )
-
-
-def _redact_export_text(value: str) -> str:
-    redacted = value
-    for pattern in _EXPORT_SECRET_PATTERNS:
-        redacted = pattern.sub(_EXPORT_REDACTED, redacted)
-    return redacted
-
-
-def _redact_session_export_value(value: Any, key: Optional[str] = None) -> Any:
-    if key and (_EXPORT_SENSITIVE_KEY_RE.search(key) or _EXPORT_REASONING_KEY_RE.search(key)):
-        return _EXPORT_REDACTED
-    if isinstance(value, dict):
-        return {
-            item_key: _redact_session_export_value(item_value, str(item_key))
-            for item_key, item_value in value.items()
-        }
-    if isinstance(value, list):
-        return [_redact_session_export_value(item) for item in value]
-    if isinstance(value, str):
-        return _redact_export_text(value)
-    return value
-
-
-def _redact_session_export(session: Dict[str, Any]) -> Dict[str, Any]:
-    return _redact_session_export_value(session)
 
 
 def _collect_delegate_child_ids(conn, parent_ids: List[str]) -> List[str]:
@@ -1332,6 +1289,9 @@ class SessionDB:
         cwd: str = None,
     ) -> None:
         """Shared INSERT OR IGNORE for session rows."""
+        stored_model_config = secret_policy.redact_persisted_value(model_config)
+        stored_system_prompt = secret_policy.redact_persisted_value(system_prompt)
+
         def _do(conn):
             conn.execute(
                 """INSERT OR IGNORE INTO sessions (id, source, user_id, model, model_config,
@@ -1342,8 +1302,8 @@ class SessionDB:
                     source,
                     user_id,
                     model,
-                    json.dumps(model_config) if model_config else None,
-                    system_prompt,
+                    json.dumps(stored_model_config) if stored_model_config else None,
+                    stored_system_prompt,
                     parent_session_id,
                     cwd,
                     time.time(),
@@ -1529,19 +1489,23 @@ class SessionDB:
         column unchanged.  Routes through _execute_write for the standard
         BEGIN IMMEDIATE + jitter-retry + lock guarantee.
         """
+        stored_model_config_json = secret_policy.redact_persisted_json(model_config_json)
+
         def _do(conn):
             conn.execute(
                 "UPDATE sessions SET model_config = ?, model = COALESCE(?, model) WHERE id = ?",
-                (model_config_json, model, session_id),
+                (stored_model_config_json, model, session_id),
             )
         self._execute_write(_do)
 
     def update_system_prompt(self, session_id: str, system_prompt: str) -> None:
         """Store the full assembled system prompt snapshot."""
+        stored_system_prompt = secret_policy.redact_persisted_value(system_prompt)
+
         def _do(conn):
             conn.execute(
                 "UPDATE sessions SET system_prompt = ? WHERE id = ?",
-                (system_prompt, session_id),
+                (stored_system_prompt, session_id),
             )
         self._execute_write(_do)
 
@@ -1593,6 +1557,7 @@ class SessionDB:
         # initial create_session() may have failed due to SQLite locking.
         # INSERT OR IGNORE is cheap and idempotent.
         self._insert_session_row(session_id, "unknown", model=model)
+        stored_billing_base_url = secret_policy.redact_persisted_value(billing_base_url)
         if absolute:
             sql = """UPDATE sessions SET
                    input_tokens = ?,
@@ -1648,7 +1613,7 @@ class SessionDB:
             cost_source,
             pricing_version,
             billing_provider,
-            billing_base_url,
+            stored_billing_base_url,
             billing_mode,
             model,
             api_call_count,
@@ -1830,6 +1795,8 @@ class SessionDB:
         Empty/whitespace-only strings are normalized to None (clearing the title).
         """
         title = self.sanitize_title(title)
+        title = secret_policy.redact_persisted_value(title)
+
         def _do(conn):
             if title:
                 # Check uniqueness (allow the same session to keep its own title)
@@ -2436,23 +2403,35 @@ class SessionDB:
         platform-specific flows like yuanbao's recall guard to redact a
         message by its platform-side identifier.
         """
+        stored_content_value = secret_policy.redact_persisted_value(content)
+        stored_reasoning = secret_policy.redact_persisted_value(reasoning)
+        stored_reasoning_content = secret_policy.redact_persisted_value(reasoning_content)
+        stored_reasoning_details = secret_policy.redact_persisted_value(reasoning_details)
+        stored_codex_reasoning_items = secret_policy.redact_persisted_value(
+            codex_reasoning_items
+        )
+        stored_codex_message_items = secret_policy.redact_persisted_value(
+            codex_message_items
+        )
+        stored_tool_calls = secret_policy.redact_persisted_value(tool_calls)
+
         # Serialize structured fields to JSON before entering the write txn
         reasoning_details_json = (
-            json.dumps(reasoning_details)
-            if reasoning_details else None
+            json.dumps(stored_reasoning_details)
+            if stored_reasoning_details else None
         )
         codex_items_json = (
-            json.dumps(codex_reasoning_items)
-            if codex_reasoning_items else None
+            json.dumps(stored_codex_reasoning_items)
+            if stored_codex_reasoning_items else None
         )
         codex_message_items_json = (
-            json.dumps(codex_message_items)
-            if codex_message_items else None
+            json.dumps(stored_codex_message_items)
+            if stored_codex_message_items else None
         )
-        tool_calls_json = json.dumps(tool_calls) if tool_calls else None
+        tool_calls_json = json.dumps(stored_tool_calls) if stored_tool_calls else None
         # Multimodal content (list of parts) must be JSON-encoded: sqlite3
         # cannot bind list/dict parameters directly.
-        stored_content = self._encode_content(content)
+        stored_content = self._encode_content(stored_content_value)
 
         message_timestamp = time.time()
         if timestamp is not None:
@@ -2466,8 +2445,10 @@ class SessionDB:
 
         # Pre-compute tool call count
         num_tool_calls = 0
-        if tool_calls is not None:
-            num_tool_calls = len(tool_calls) if isinstance(tool_calls, list) else 1
+        if stored_tool_calls is not None:
+            num_tool_calls = (
+                len(stored_tool_calls) if isinstance(stored_tool_calls, list) else 1
+            )
 
         def _do(conn):
             cursor = conn.execute(
@@ -2486,8 +2467,8 @@ class SessionDB:
                     message_timestamp,
                     token_count,
                     finish_reason,
-                    reasoning,
-                    reasoning_content,
+                    stored_reasoning,
+                    stored_reasoning_content,
                     reasoning_details_json,
                     codex_items_json,
                     codex_message_items_json,
@@ -2534,24 +2515,34 @@ class SessionDB:
             total_messages = 0
             total_tool_calls = 0
             for msg in messages:
-                role = msg.get("role", "unknown")
-                tool_calls = msg.get("tool_calls")
+                stored_msg = secret_policy.redact_persisted_value(msg)
+                role = stored_msg.get("role", "unknown")
+                tool_calls = stored_msg.get("tool_calls")
                 message_timestamp = now_ts
-                if msg.get("timestamp") is not None:
+                if stored_msg.get("timestamp") is not None:
                     try:
-                        ts_value = msg.get("timestamp")
+                        ts_value = stored_msg.get("timestamp")
                         if hasattr(ts_value, "timestamp"):
                             message_timestamp = float(ts_value.timestamp())
                         else:
                             message_timestamp = float(ts_value)
                     except (TypeError, ValueError):
-                        logger.debug("Ignoring invalid explicit message timestamp: %r", msg.get("timestamp"))
-                reasoning_details = msg.get("reasoning_details") if role == "assistant" else None
+                        logger.debug(
+                            "Ignoring invalid explicit message timestamp: %r",
+                            stored_msg.get("timestamp"),
+                        )
+                reasoning_details = (
+                    stored_msg.get("reasoning_details") if role == "assistant" else None
+                )
                 codex_reasoning_items = (
-                    msg.get("codex_reasoning_items") if role == "assistant" else None
+                    stored_msg.get("codex_reasoning_items")
+                    if role == "assistant"
+                    else None
                 )
                 codex_message_items = (
-                    msg.get("codex_message_items") if role == "assistant" else None
+                    stored_msg.get("codex_message_items")
+                    if role == "assistant"
+                    else None
                 )
 
                 reasoning_details_json = (
@@ -2567,7 +2558,7 @@ class SessionDB:
                 # Accept either `platform_message_id` (new explicit name) or
                 # `message_id` (yuanbao's existing convention on message dicts).
                 platform_msg_id = (
-                    msg.get("platform_message_id") or msg.get("message_id")
+                    stored_msg.get("platform_message_id") or stored_msg.get("message_id")
                 )
 
                 conn.execute(
@@ -2579,20 +2570,22 @@ class SessionDB:
                     (
                         session_id,
                         role,
-                        self._encode_content(msg.get("content")),
-                        msg.get("tool_call_id"),
+                        self._encode_content(stored_msg.get("content")),
+                        stored_msg.get("tool_call_id"),
                         tool_calls_json,
-                        msg.get("tool_name"),
+                        stored_msg.get("tool_name"),
                         message_timestamp,
-                        msg.get("token_count"),
-                        msg.get("finish_reason"),
-                        msg.get("reasoning") if role == "assistant" else None,
-                        msg.get("reasoning_content") if role == "assistant" else None,
+                        stored_msg.get("token_count"),
+                        stored_msg.get("finish_reason"),
+                        stored_msg.get("reasoning") if role == "assistant" else None,
+                        stored_msg.get("reasoning_content")
+                        if role == "assistant"
+                        else None,
                         reasoning_details_json,
                         codex_items_json,
                         codex_message_items_json,
                         platform_msg_id,
-                        1 if msg.get("observed") else 0,
+                        1 if stored_msg.get("observed") else 0,
                     ),
                 )
                 total_messages += 1
@@ -3767,7 +3760,7 @@ class SessionDB:
         if not session:
             return None
         messages = self.get_messages(session_id)
-        return _redact_session_export({**session, "messages": messages})
+        return secret_policy.redact_export_value({**session, "messages": messages})
 
     def export_all(self, source: str = None) -> List[Dict[str, Any]]:
         """
@@ -3778,7 +3771,9 @@ class SessionDB:
         results = []
         for session in sessions:
             messages = self.get_messages(session["id"])
-            results.append(_redact_session_export({**session, "messages": messages}))
+            results.append(
+                secret_policy.redact_export_value({**session, "messages": messages})
+            )
         return results
 
     def clear_messages(self, session_id: str) -> None:
@@ -4839,10 +4834,12 @@ class SessionDB:
 
     def fail_handoff(self, session_id: str, error: str) -> None:
         """Mark a handoff as failed and record the reason."""
+        stored_error = secret_policy.redact_persisted_value(error)
+
         def _do(conn):
             conn.execute(
                 "UPDATE sessions SET handoff_state = 'failed', "
                 "handoff_error = ? WHERE id = ?",
-                (error[:500], session_id),
+                (stored_error[:500], session_id),
             )
         self._execute_write(_do)

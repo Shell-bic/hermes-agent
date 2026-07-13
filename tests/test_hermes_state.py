@@ -1,11 +1,16 @@
 """Tests for hermes_state.py — SessionDB SQLite CRUD, FTS5 search, export."""
 
+import base64
 import json
 import sqlite3
 import time
 import pytest
 
 from hermes_state import SCHEMA_SQL, SCHEMA_VERSION, SessionDB
+from tests.fixtures.secret_boundary import (
+    FAKE_SECRET_ENV,
+    assert_fake_secrets_redacted,
+)
 
 
 class _NoFtsCursor(sqlite3.Cursor):
@@ -806,6 +811,274 @@ class TestMessageStorage:
         assert conv[0]["codex_reasoning_items"][0]["encrypted_content"] == "enc_blob_123"
 
 
+class TestManagedSecretPersistence:
+    @pytest.fixture(autouse=True)
+    def _managed_boundary(self, monkeypatch):
+        monkeypatch.setenv("HERMES_ENTERPRISE_MANAGED", "1")
+        # Managed persistence must remain mandatory even when the legacy
+        # display/log redaction toggle is disabled.
+        monkeypatch.setattr("agent.redact._REDACT_ENABLED", False)
+
+    @staticmethod
+    def _assert_no_fake_secret(value, encoded_secret):
+        serialized = json.dumps(value, ensure_ascii=False, default=str)
+        assert_fake_secrets_redacted(serialized)
+        assert encoded_secret not in serialized
+
+    def test_append_redacts_sqlite_and_both_fts_indexes(self, db):
+        encoded_secret = base64.b64encode(
+            FAKE_SECRET_ENV["COMPANY_GATEWAY_TOKEN"].encode("utf-8")
+        ).decode("ascii")
+        db.create_session(session_id="managed-append", source="cli")
+
+        message_id = db.append_message(
+            "managed-append",
+            role="assistant",
+            content=f"content={FAKE_SECRET_ENV['COMPANY_GATEWAY_TOKEN']}",
+            reasoning=f"reasoning={FAKE_SECRET_ENV['HERMES_DASHBOARD_SESSION_TOKEN']}",
+            reasoning_content=f"native={FAKE_SECRET_ENV['DESKTOP_TOKEN']}",
+            reasoning_details=[
+                {"summary": FAKE_SECRET_ENV["OPENAI_API_KEY"]},
+                {"encoded": encoded_secret},
+            ],
+            codex_reasoning_items=[
+                {"type": "reasoning", "encrypted_content": encoded_secret}
+            ],
+            codex_message_items=[
+                {
+                    "type": "message",
+                    "content": [
+                        {
+                            "type": "output_text",
+                            "text": FAKE_SECRET_ENV["DESKTOP_TOKEN"],
+                        }
+                    ],
+                }
+            ],
+            tool_calls=[
+                {
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {
+                        "name": "terminal",
+                        "arguments": json.dumps(
+                            {
+                                "command": "echo secret",
+                                "api_key": FAKE_SECRET_ENV["OPENAI_API_KEY"],
+                            }
+                        ),
+                    },
+                    "result": {
+                        "stdout": FAKE_SECRET_ENV["COMPANY_GATEWAY_TOKEN"],
+                        "encoded": encoded_secret,
+                    },
+                }
+            ],
+        )
+
+        raw_row = dict(
+            db._conn.execute(
+                "SELECT content, reasoning, reasoning_content, reasoning_details, "
+                "codex_reasoning_items, codex_message_items, tool_calls "
+                "FROM messages WHERE id = ?",
+                (message_id,),
+            ).fetchone()
+        )
+        self._assert_no_fake_secret(raw_row, encoded_secret)
+
+        restored = db.get_messages("managed-append")[0]
+        self._assert_no_fake_secret(restored, encoded_secret)
+        assert restored["role"] == "assistant"
+        assert restored["tool_calls"][0]["function"]["name"] == "terminal"
+        assert restored["tool_calls"][0]["id"] == "call-1"
+
+        assert db._fts_enabled is True
+        for table_name in ("messages_fts", "messages_fts_trigram"):
+            fts_row = db._conn.execute(
+                f"SELECT content FROM {table_name} WHERE rowid = ?",
+                (message_id,),
+            ).fetchone()
+            assert fts_row is not None
+            self._assert_no_fake_secret(fts_row["content"], encoded_secret)
+
+    def test_replace_and_rewind_never_restore_raw_secret(self, db):
+        encoded_secret = base64.b64encode(
+            FAKE_SECRET_ENV["DESKTOP_TOKEN"].encode("utf-8")
+        ).decode("ascii")
+        db.create_session(session_id="managed-replace", source="cli")
+        db.append_message("managed-replace", role="user", content="old")
+
+        db.replace_messages(
+            "managed-replace",
+            [
+                {
+                    "role": "user",
+                    "content": f"retry {FAKE_SECRET_ENV['DESKTOP_TOKEN']} {encoded_secret}",
+                },
+                {
+                    "role": "assistant",
+                    "content": "done",
+                    "tool_calls": [
+                        {
+                            "id": "call-2",
+                            "type": "function",
+                            "function": {
+                                "name": "terminal",
+                                "arguments": json.dumps(
+                                    {"token": FAKE_SECRET_ENV["COMPANY_GATEWAY_TOKEN"]}
+                                ),
+                            },
+                        }
+                    ],
+                },
+            ],
+        )
+
+        rows = db._conn.execute(
+            "SELECT id, content, tool_calls FROM messages "
+            "WHERE session_id = ? ORDER BY id",
+            ("managed-replace",),
+        ).fetchall()
+        self._assert_no_fake_secret([dict(row) for row in rows], encoded_secret)
+
+        rewind = db.rewind_to_message("managed-replace", rows[0]["id"])
+        self._assert_no_fake_secret(rewind, encoded_secret)
+        assert rewind["target_message"]["role"] == "user"
+        assert rewind["rewound_count"] == 2
+
+        inactive = db.get_messages("managed-replace", include_inactive=True)
+        self._assert_no_fake_secret(inactive, encoded_secret)
+        assert all(message["active"] == 0 for message in inactive)
+
+    def test_session_metadata_snapshots_redact_create_and_update(self, db):
+        encoded_secret = base64.b64encode(
+            FAKE_SECRET_ENV["OPENAI_API_KEY"].encode("utf-8")
+        ).decode("ascii")
+        db.create_session(
+            session_id="managed-meta",
+            source="cli",
+            model_config={
+                "provider": "company-gateway",
+                "nested": {"credential": FAKE_SECRET_ENV["COMPANY_GATEWAY_TOKEN"]},
+            },
+            system_prompt=f"system {FAKE_SECRET_ENV['DESKTOP_TOKEN']}",
+        )
+        db.update_session_meta(
+            "managed-meta",
+            json.dumps(
+                {
+                    "provider": "company-gateway",
+                    "nested": {"encoded": encoded_secret},
+                }
+            ),
+        )
+        db.update_system_prompt(
+            "managed-meta",
+            f"updated {FAKE_SECRET_ENV['HERMES_DASHBOARD_SESSION_TOKEN']}",
+        )
+
+        row = dict(
+            db._conn.execute(
+                "SELECT model_config, system_prompt FROM sessions WHERE id = ?",
+                ("managed-meta",),
+            ).fetchone()
+        )
+        self._assert_no_fake_secret(row, encoded_secret)
+        parsed_config = json.loads(row["model_config"])
+        assert parsed_config["provider"] == "company-gateway"
+        assert "nested" in parsed_config
+
+    def test_session_title_handoff_error_and_billing_url_are_redacted(self, db):
+        title_secret = FAKE_SECRET_ENV["COMPANY_GATEWAY_TOKEN"]
+        handoff_secret = FAKE_SECRET_ENV["HERMES_DASHBOARD_SESSION_TOKEN"]
+        billing_secret = FAKE_SECRET_ENV["DESKTOP_TOKEN"]
+        billing_url = (
+            f"https://service-user:{billing_secret}@gateway.example/v1"
+            f"?access_token={FAKE_SECRET_ENV['OPENAI_API_KEY']}"
+        )
+        db.create_session(session_id="managed-free-text", source="cli")
+
+        assert db.set_session_title(
+            "managed-free-text", f"Debug {title_secret}"
+        ) is True
+        db.fail_handoff(
+            "managed-free-text",
+            f"handoff failed with token {handoff_secret}",
+        )
+        db.update_token_counts(
+            "managed-free-text",
+            input_tokens=1,
+            output_tokens=1,
+            billing_base_url=billing_url,
+        )
+
+        row = dict(
+            db._conn.execute(
+                "SELECT title, handoff_state, handoff_error, billing_base_url "
+                "FROM sessions WHERE id = ?",
+                ("managed-free-text",),
+            ).fetchone()
+        )
+        assert_fake_secrets_redacted(json.dumps(row, ensure_ascii=False))
+        assert row["handoff_state"] == "failed"
+        assert row["title"].startswith("Debug ")
+        assert "handoff failed" in row["handoff_error"]
+        assert row["billing_base_url"].startswith("https://service-user:")
+
+
+def test_non_managed_message_persistence_keeps_existing_raw_semantics(db, monkeypatch):
+    monkeypatch.delenv("HERMES_ENTERPRISE_MANAGED", raising=False)
+    monkeypatch.setattr("agent.redact._REDACT_ENABLED", False)
+    secret = FAKE_SECRET_ENV["COMPANY_GATEWAY_TOKEN"]
+    db.create_session(session_id="personal", source="cli")
+    db.append_message(
+        "personal",
+        role="assistant",
+        content=f"content={secret}",
+        reasoning=f"reasoning={secret}",
+        tool_calls=[
+            {
+                "id": "call-raw",
+                "type": "function",
+                "function": {"name": "terminal", "arguments": json.dumps({"token": secret})},
+            }
+        ],
+    )
+
+    restored = db.get_messages("personal")[0]
+    assert restored["content"] == f"content={secret}"
+    assert restored["reasoning"] == f"reasoning={secret}"
+    assert secret in restored["tool_calls"][0]["function"]["arguments"]
+
+
+def test_non_managed_session_free_text_keeps_existing_raw_semantics(db, monkeypatch):
+    monkeypatch.delenv("HERMES_ENTERPRISE_MANAGED", raising=False)
+    monkeypatch.setattr("agent.redact._REDACT_ENABLED", False)
+    title = f"Debug {FAKE_SECRET_ENV['COMPANY_GATEWAY_TOKEN']}"
+    error = f"handoff failed with {FAKE_SECRET_ENV['HERMES_DASHBOARD_SESSION_TOKEN']}"
+    billing_url = (
+        f"https://user:{FAKE_SECRET_ENV['DESKTOP_TOKEN']}@gateway.example/v1"
+    )
+    db.create_session(session_id="personal-free-text", source="cli")
+
+    assert db.set_session_title("personal-free-text", title) is True
+    db.fail_handoff("personal-free-text", error)
+    db.update_token_counts(
+        "personal-free-text",
+        input_tokens=1,
+        output_tokens=1,
+        billing_base_url=billing_url,
+    )
+
+    row = db._conn.execute(
+        "SELECT title, handoff_error, billing_base_url FROM sessions WHERE id = ?",
+        ("personal-free-text",),
+    ).fetchone()
+    assert row["title"] == title
+    assert row["handoff_error"] == error
+    assert row["billing_base_url"] == billing_url
+
+
 # =========================================================================
 # FTS5 search
 # =========================================================================
@@ -1417,25 +1690,41 @@ class TestDeleteAndExport:
         gateway_token = "gw_abcdefghijklmnopqrstuvwxyz123456"
         api_key = "sk-testabcdefghijklmnopqrstuvwxyz"
         bearer = "Bearer abcdefghijklmnopqrstuvwxyz123456"
+        encoded_gateway_token = base64.b64encode(gateway_token.encode("utf-8")).decode("ascii")
         db.create_session(session_id="s1", source="cli", model="test")
         db.append_message(
             "s1",
             role="assistant",
-            content=f"Gateway token {gateway_token}; api key {api_key}; auth {bearer}",
+            content=(
+                f"Gateway token {gateway_token}; api key {api_key}; auth {bearer}; "
+                f"encoded {encoded_gateway_token}"
+            ),
             reasoning="internal chain of thought",
             reasoning_content="hidden decision text",
-            tool_calls=[{"name": "terminal", "args": {"gatewayToken": gateway_token}}],
+            tool_calls=[
+                {
+                    "id": "call-export",
+                    "name": "terminal",
+                    "args": {"gatewayToken": gateway_token},
+                    "result": {"stdout": encoded_gateway_token},
+                }
+            ],
         )
 
         export = db.export_session("s1")
         encoded = json.dumps(export, ensure_ascii=False)
+        reparsed = json.loads(encoded)
 
         assert gateway_token not in encoded
         assert api_key not in encoded
         assert bearer not in encoded
+        assert encoded_gateway_token not in encoded
         assert "internal chain of thought" not in encoded
         assert "hidden decision text" not in encoded
         assert "[REDACTED]" in encoded
+        assert reparsed["messages"][0]["role"] == "assistant"
+        assert reparsed["messages"][0]["tool_calls"][0]["id"] == "call-export"
+        assert reparsed["messages"][0]["tool_calls"][0]["name"] == "terminal"
         assert gateway_token in json.dumps(db.get_messages("s1"), ensure_ascii=False)
 
     def test_export_nonexistent(self, db):

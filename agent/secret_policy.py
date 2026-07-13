@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import json
 import os
 import re
 from dataclasses import dataclass
@@ -92,6 +93,14 @@ _SECRET_ENV_REFERENCE_RE = re.compile(
 )
 
 _ENTERPRISE_TOKEN_RE = re.compile(r"\b(?:gw|dsk|adm)_[A-Za-z0-9_-]{16,}\b")
+_BEARER_OR_TOKEN_RE = re.compile(
+    r"\b(?:Bearer|token)\s+[A-Za-z0-9._~+/-]{16,}\b",
+    re.IGNORECASE,
+)
+_LABELED_API_KEY_RE = re.compile(
+    r"\b(?:x-api-key|api-key|api_key)\s*[:=]\s*[A-Za-z0-9._~+/-]{12,}\b",
+    re.IGNORECASE,
+)
 _BASE64_CANDIDATE_RE = re.compile(
     r"(?<![A-Za-z0-9+/])(?:[A-Za-z0-9+/]{24,})(?:={0,2})(?![A-Za-z0-9+/=])"
 )
@@ -113,6 +122,17 @@ _SAFE_METADATA_FIELDS = {
     "mode",
     "name",
 }
+
+_EXPORT_SENSITIVE_KEY_RE = re.compile(
+    r"(^token$|api[_-]?key|access[_-]?token|refresh[_-]?token|gateway[_-]?token|"
+    r"desktop[_-]?token|authorization|secret|password|credential|ciphertext)",
+    re.IGNORECASE,
+)
+_EXPORT_REASONING_KEY_RE = re.compile(
+    r"^(thinking|reasoning|reasoning_content|reasoning_details|codex_reasoning_items)$",
+    re.IGNORECASE,
+)
+_REDACTED = "[REDACTED]"
 
 
 def _hermes_paths() -> tuple[Path, ...]:
@@ -268,6 +288,8 @@ class SecretPolicy:
             return redacted
 
         redacted = _ENTERPRISE_TOKEN_RE.sub("[REDACTED]", redacted)
+        redacted = _BEARER_OR_TOKEN_RE.sub("[REDACTED]", redacted)
+        redacted = _LABELED_API_KEY_RE.sub("[REDACTED]", redacted)
 
         def _redact_encoded(match: re.Match[str]) -> str:
             encoded = match.group(0)
@@ -278,6 +300,119 @@ class SecretPolicy:
             return "[REDACTED ENCODED SECRET]" if _looks_like_secret_text(decoded) else encoded
 
         return _BASE64_CANDIDATE_RE.sub(_redact_encoded, redacted)
+
+    def redact_value(
+        self,
+        value: Any,
+        *,
+        force: bool = False,
+        redact_sensitive_keys: bool = False,
+        key: Optional[str] = None,
+    ) -> Any:
+        """Recursively redact string leaves without changing JSON structure.
+
+        ``redact_sensitive_keys`` is the stronger export mode: known
+        credential and reasoning fields are masked even when their current
+        value does not match a token pattern.  Containers remain containers,
+        and their keys/order are preserved so callers can still serialize the
+        result as the same JSON shape.
+        """
+        sensitive_key = bool(
+            redact_sensitive_keys
+            and key
+            and (
+                _EXPORT_SENSITIVE_KEY_RE.search(key)
+                or _EXPORT_REASONING_KEY_RE.search(key)
+            )
+        )
+
+        if isinstance(value, dict):
+            return {
+                item_key: self.redact_value(
+                    item_value,
+                    force=force,
+                    redact_sensitive_keys=redact_sensitive_keys,
+                    key=str(item_key),
+                )
+                if not sensitive_key
+                else self._redact_value_shape(item_value)
+                for item_key, item_value in value.items()
+            }
+        if isinstance(value, list):
+            if sensitive_key:
+                return [self._redact_value_shape(item) for item in value]
+            return [
+                self.redact_value(
+                    item,
+                    force=force,
+                    redact_sensitive_keys=redact_sensitive_keys,
+                )
+                for item in value
+            ]
+        if isinstance(value, tuple):
+            if sensitive_key:
+                return tuple(self._redact_value_shape(item) for item in value)
+            return tuple(
+                self.redact_value(
+                    item,
+                    force=force,
+                    redact_sensitive_keys=redact_sensitive_keys,
+                )
+                for item in value
+            )
+        if isinstance(value, str):
+            return _REDACTED if sensitive_key else self.redact_text(value, force=force)
+        if sensitive_key and value is not None:
+            return _REDACTED
+        return value
+
+    def redact_persisted_value(self, value: Any) -> Any:
+        """Protect a persistence payload only inside the managed boundary.
+
+        Non-managed Hermes keeps its established raw SQLite semantics.  In
+        enterprise managed mode every string leaf is forced through the same
+        SecretPolicy pass, including nested tool arguments/results and
+        provider reasoning structures.
+        """
+        if not is_enterprise_managed():
+            return value
+        return self.redact_value(value, force=True)
+
+    def redact_persisted_json(self, value: Optional[str]) -> Optional[str]:
+        """Redact a JSON text payload while keeping it valid JSON."""
+        if value is None or not is_enterprise_managed():
+            return value
+        try:
+            decoded = json.loads(value)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            return self.redact_text(value, force=True)
+        redacted = self.redact_value(decoded, force=True)
+        return json.dumps(redacted, ensure_ascii=False)
+
+    def redact_export_value(self, value: Any) -> Any:
+        """Apply the canonical, always-on session-export policy."""
+        return self.redact_value(
+            value,
+            force=True,
+            redact_sensitive_keys=True,
+        )
+
+    def _redact_value_shape(self, value: Any) -> Any:
+        """Mask string leaves while preserving a sensitive field's shape."""
+        if isinstance(value, dict):
+            return {
+                item_key: self._redact_value_shape(item_value)
+                for item_key, item_value in value.items()
+            }
+        if isinstance(value, list):
+            return [self._redact_value_shape(item) for item in value]
+        if isinstance(value, tuple):
+            return tuple(self._redact_value_shape(item) for item in value)
+        if isinstance(value, str):
+            return _REDACTED
+        if value is None:
+            return None
+        return _REDACTED
 
 
 secret_policy = SecretPolicy()
