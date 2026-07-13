@@ -51,6 +51,7 @@ const { readWindowsUserEnvVar } = require('./windows-user-env.cjs')
 const { readDirForIpc } = require('./fs-read-dir.cjs')
 const { gitRootForIpc } = require('./git-root.cjs')
 const { worktreesForIpc } = require('./git-worktrees.cjs')
+const { requirePtyAllowed } = require('./pty-policy.cjs')
 const { OFFICIAL_REPO_HTTPS_URL, isOfficialSshRemote } = require('./update-remote.cjs')
 const { runRebuildWithRetry } = require('./update-rebuild.cjs')
 const {
@@ -6270,6 +6271,10 @@ ipcMain.handle('hermes:fs:gitRoot', async (_event, startPath) => gitRootForIpc(s
 ipcMain.handle('hermes:fs:worktrees', async (_event, cwds) => worktreesForIpc(cwds))
 
 ipcMain.handle('hermes:terminal:start', async (event, payload = {}) => {
+  // Fail before checking node-pty, copying process.env, or registering any
+  // raw PTY data callbacks. Managed mode has no administrator unlock yet.
+  requirePtyAllowed(process.env)
+
   if (!nodePty) {
     throw new Error('PTY support is unavailable. Reinstall desktop dependencies and restart Hermes.')
   }

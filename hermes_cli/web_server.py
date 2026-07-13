@@ -11008,6 +11008,15 @@ async def pty_ws(ws: WebSocket) -> None:
         await ws.close(code=4408, reason=_ws_close_reason(client_reason))
         return
 
+    # A full shell cannot enforce the enterprise secret boundary yet.  Keep
+    # this gate after authentication/peer validation to avoid disclosing
+    # policy state, but before accept, argv resolution, and spawn so the
+    # managed backend environment is never copied into a PTY child.
+    if is_enterprise_managed():
+        _log.info("pty refused: disabled by enterprise managed policy peer=%s", peer)
+        await ws.close(code=4403, reason="PTY disabled by enterprise managed policy")
+        return
+
     await ws.accept()
     _log.info("pty accepted peer=%s mode=%s cred=%s", peer, mode, cred)
 
