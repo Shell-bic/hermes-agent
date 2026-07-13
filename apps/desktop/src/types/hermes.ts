@@ -339,6 +339,16 @@ export interface SessionMessagesResponse {
   session_id: string
 }
 
+/** Backend-produced session export. Unlike the transcript endpoint, this
+ * contract has already passed through the server-side export redaction
+ * boundary before it reaches the desktop renderer. */
+export interface SessionExportResponse {
+  id: string
+  messages: SessionMessage[]
+  title?: null | string
+  [key: string]: unknown
+}
+
 export interface SessionResumeResponse {
   info?: SessionRuntimeInfo
   message_count: number

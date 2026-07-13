@@ -1,5 +1,5 @@
 import type { SessionInfo } from '@/hermes'
-import { getSessionMessages } from '@/hermes'
+import { getSessionExport } from '@/hermes'
 import { translateNow } from '@/i18n'
 import { notify, notifyError } from '@/store/notifications'
 
@@ -33,13 +33,15 @@ export async function exportSession(sessionId: string, params: Omit<ExportSessio
 
   try {
     const profile = params.profile ?? params.session?.profile
-    const { messages } = await getSessionMessages(sessionId, profile)
+    const exportedSession = await getSessionExport(sessionId, profile)
+    const { messages, ...session } = exportedSession
+    const exportedTitle = typeof session.title === 'string' ? session.title : null
 
     const payload = {
       exported_at: new Date().toISOString(),
-      session_id: sessionId,
-      title: params.title ?? null,
-      session: params.session ?? null,
+      session_id: typeof session.id === 'string' ? session.id : sessionId,
+      title: exportedTitle,
+      session,
       message_count: messages.length,
       messages
     }
@@ -48,7 +50,7 @@ export async function exportSession(sessionId: string, params: Omit<ExportSessio
     const downloadUrl = URL.createObjectURL(blob)
     const anchor = document.createElement('a')
     anchor.href = downloadUrl
-    anchor.download = sessionExportFilename(sessionId, params.title)
+    anchor.download = sessionExportFilename(sessionId, exportedTitle)
     anchor.click()
     URL.revokeObjectURL(downloadUrl)
 

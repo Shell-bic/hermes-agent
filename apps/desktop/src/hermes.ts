@@ -33,6 +33,7 @@ import type {
   ProfileSetupCommand,
   ProfileSoul,
   ProfilesResponse,
+  SessionExportResponse,
   SessionInfo,
   SessionMessagesResponse,
   SessionSearchResponse,
@@ -91,6 +92,7 @@ export type {
   ProfilesResponse,
   RpcEvent,
   SessionCreateResponse,
+  SessionExportResponse,
   SessionInfo,
   SessionMessage,
   SessionMessagesResponse,
@@ -234,6 +236,18 @@ export function getSessionMessages(id: string, profile?: string | null): Promise
   return window.hermesDesktop.api<SessionMessagesResponse>({
     ...(profile ? { profile } : {}),
     path: `/api/sessions/${encodeURIComponent(id)}/messages${suffix}`
+  })
+}
+
+// Downloads the server's export contract instead of rebuilding an export from
+// the raw transcript endpoint. The backend owns recursive secret and reasoning
+// redaction for this boundary.
+export function getSessionExport(id: string, profile?: string | null): Promise<SessionExportResponse> {
+  const suffix = profile ? `?profile=${encodeURIComponent(profile)}` : ''
+
+  return window.hermesDesktop.api<SessionExportResponse>({
+    ...(profile ? { profile } : {}),
+    path: `/api/sessions/${encodeURIComponent(id)}/export${suffix}`
   })
 }
 

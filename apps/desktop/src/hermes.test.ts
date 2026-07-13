@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-import { getSessionMessages, listAllProfileSessions, listSessions } from './hermes'
+import { getSessionExport, getSessionMessages, listAllProfileSessions, listSessions } from './hermes'
 
 const emptySessionsResponse = {
   limit: 0,
@@ -54,6 +54,17 @@ describe('Hermes REST session helpers', () => {
 
     expect(api).toHaveBeenCalledWith({
       path: '/api/sessions/session-1/messages?profile=xiaoxuxu',
+      profile: 'xiaoxuxu'
+    })
+  })
+
+  it('uses the backend-redacted export contract for cross-profile session exports', async () => {
+    api.mockResolvedValue({ id: 'session-1', messages: [] })
+
+    await getSessionExport('session-1', 'xiaoxuxu')
+
+    expect(api).toHaveBeenCalledWith({
+      path: '/api/sessions/session-1/export?profile=xiaoxuxu',
       profile: 'xiaoxuxu'
     })
   })
