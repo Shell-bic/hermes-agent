@@ -9,10 +9,10 @@ import {
   setCronSessions,
   setCurrentUsage,
   setGatewayState,
+  setMessages,
   setMessagingPlatformTotals,
   setMessagingSessions,
   setMessagingTruncated,
-  setMessages,
   setResumeExhaustedSessionId,
   setResumeFailedSessionId,
   setSelectedStoredSessionId,
@@ -39,6 +39,7 @@ export const INITIAL_ENTERPRISE_STATE: EnterpriseDesktopState = {
   modelProfiles: [],
   policyHash: null,
   policyVersion: null,
+  providerRuntime: null,
   protocolSnapshot: null,
   role: null,
   runtimeDefaults: {},
@@ -61,6 +62,7 @@ function applyEnterpriseState(state: EnterpriseDesktopState | null | undefined):
     ...INITIAL_ENTERPRISE_STATE,
     status: 'disabled' as const
   }
+
   const next = base.enabled && !base.uiPolicy
     ? {
         ...base,

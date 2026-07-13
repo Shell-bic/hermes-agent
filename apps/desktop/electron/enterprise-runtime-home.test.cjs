@@ -209,7 +209,217 @@ test('public enterprise state degrades older manifests without tool policy snaps
   assert.equal(state.toolPolicySnapshot, null)
   assert.equal(state.policyHash, null)
   assert.equal(state.generatedAt, null)
+  assert.equal(state.providerRuntime, null)
   assert.deepEqual(state.allowedModels, ['m1'])
+})
+
+test('public enterprise state allowlists provider runtime operational metadata', () => {
+  const state = publicEnterpriseState({
+    bootstrap: { user: { displayName: 'Ada' } },
+    manifest: manifest({
+      providerRuntime: {
+        presetKey: 'kimi-anthropic-compatible',
+        presetVersion: '1.0.0',
+        supportLevel: 'implemented-auto-verified',
+        executionMode: 'shadow',
+        endpointMode: 'translate',
+        protocolKey: 'anthropic_messages',
+        publicGatewayEndpoint: '/v1/messages',
+        effectivePolicyHash: 'A'.repeat(64),
+        runtimeHash: 'b'.repeat(64),
+        warnings: [
+          {
+            code: 'provider_preset_legacy_fallback',
+            safeSummary: 'A legacy profile was mapped to a safe compatibility preset.'
+          },
+          {
+            code: 'unsafe-warning',
+            safeSummary: 'Authorization: Bearer warning-secret-sentinel'
+          }
+        ],
+        auth: { headerName: 'X-Credential-Sentinel', credential: 'credential-sentinel' },
+        baseUrl: 'https://user:base-url-sentinel@gateway.example.com/v1?apiKey=query-sentinel',
+        rawPolicy: {
+          prompt: 'prompt-sentinel',
+          tools: [{ name: 'tool-schema-sentinel' }]
+        },
+        unknownFutureField: { secret: 'unknown-field-sentinel' }
+      }
+    })
+  })
+
+  assert.deepEqual(state.providerRuntime, {
+    presetKey: 'kimi-anthropic-compatible',
+    presetVersion: '1.0.0',
+    supportLevel: 'implemented-auto-verified',
+    executionMode: 'shadow',
+    endpointMode: 'translate',
+    protocolKey: 'anthropic_messages',
+    publicGatewayEndpoint: '/v1/messages',
+    effectivePolicyHash: 'a'.repeat(64),
+    runtimeHash: 'b'.repeat(64),
+    warnings: [
+      {
+        code: 'provider_preset_legacy_fallback',
+        safeSummary: 'A legacy profile was mapped to a safe compatibility preset.'
+      },
+      {
+        code: 'unsafe-warning',
+        safeSummary: 'Provider runtime policy warning.'
+      }
+    ]
+  })
+  const serialized = JSON.stringify(state.providerRuntime)
+  for (const sentinel of [
+    'warning-secret-sentinel',
+    'credential-sentinel',
+    'base-url-sentinel',
+    'query-sentinel',
+    'prompt-sentinel',
+    'tool-schema-sentinel',
+    'unknown-field-sentinel',
+    'headerName',
+    'rawPolicy'
+  ]) {
+    assert.equal(serialized.includes(sentinel), false)
+  }
+})
+
+test('provider runtime metadata bounds collections and rejects hostile scalar coercion', () => {
+  const bounded = publicEnterpriseState({
+    manifest: manifest({
+      providerRuntime: {
+        presetKey: 'openai-compatible',
+        publicGatewayEndpoint: `/${'x'.repeat(256)}`,
+        warnings: Array.from({ length: 24 }, (_, index) => ({
+          code: `safe-warning-${index}`,
+          safeSummary: `Safe warning ${index}.`
+        }))
+      }
+    })
+  }).providerRuntime
+
+  assert.equal(bounded.publicGatewayEndpoint, undefined)
+  assert.equal(bounded.warnings.length, 16)
+  assert.equal(bounded.warnings[15].code, 'safe-warning-15')
+
+  const hostile = publicEnterpriseState({
+    manifest: manifest({
+      providerRuntime: {
+        presetKey: 123,
+        presetVersion: { toString: () => '1.0.0' },
+        supportLevel: ['implemented-auto-verified'],
+        executionMode: { value: 'canonical' },
+        endpointMode: 42,
+        protocolKey: ['chat_completions'],
+        publicGatewayEndpoint: { path: '/v1/chat/completions' },
+        effectivePolicyHash: { value: 'a'.repeat(64) },
+        runtimeHash: 123,
+        warnings: [
+          { code: 123, safeSummary: 'Must be dropped.' },
+          { code: 'object-summary', safeSummary: { secret: 'summary-object-sentinel' } }
+        ]
+      }
+    })
+  }).providerRuntime
+
+  assert.deepEqual(hostile, {
+    warnings: [{ code: 'object-summary', safeSummary: 'Provider runtime policy warning.' }]
+  })
+  assert.equal(JSON.stringify(hostile).includes('summary-object-sentinel'), false)
+})
+
+test('current provider runtime follows profile id when same-model profile order changes', () => {
+  const profileA = {
+    id: 'profile-a',
+    apiMode: 'chat_completions',
+    model: 'shared-model',
+    providerRuntime: {
+      presetKey: 'openai-official-chat',
+      presetVersion: '1.0.0',
+      supportLevel: 'implemented-auto-verified',
+      executionMode: 'legacy',
+      endpointMode: 'strict',
+      protocolKey: 'chat_completions',
+      publicGatewayEndpoint: '/v1/chat/completions',
+      effectivePolicyHash: 'a'.repeat(64),
+      runtimeHash: 'b'.repeat(64),
+      warnings: []
+    }
+  }
+  const profileB = {
+    id: 'profile-b',
+    apiMode: 'anthropic_messages',
+    model: 'shared-model',
+    providerRuntime: {
+      presetKey: 'anthropic-official',
+      presetVersion: '1.0.0',
+      supportLevel: 'provider-certified',
+      executionMode: 'canonical',
+      endpointMode: 'translate',
+      protocolKey: 'anthropic_messages',
+      publicGatewayEndpoint: '/v1/messages',
+      effectivePolicyHash: 'c'.repeat(64),
+      runtimeHash: 'd'.repeat(64),
+      warnings: []
+    }
+  }
+
+  for (const modelProfiles of [[profileA, profileB], [profileB, profileA]]) {
+    const state = publicEnterpriseState({
+      manifest: manifest({
+        allowedModels: ['shared-model'],
+        currentModel: 'shared-model',
+        currentModelProfileId: 'profile-b',
+        defaultModel: 'shared-model',
+        defaultModelProfileId: 'profile-a',
+        modelProfiles,
+        providerRuntime: undefined
+      })
+    })
+
+    assert.equal(state.currentModelProfileId, 'profile-b')
+    assert.equal(state.apiMode, 'anthropic_messages')
+    assert.equal(state.providerRuntime.presetKey, 'anthropic-official')
+    assert.equal(state.providerRuntime.executionMode, 'canonical')
+    assert.equal(state.providerRuntime.endpointMode, 'translate')
+  }
+})
+
+test('unknown current profile id does not fall back to a same-model profile', () => {
+  const state = publicEnterpriseState({
+    manifest: manifest({
+      allowedModels: ['shared-model'],
+      currentModel: 'shared-model',
+      currentModelProfileId: 'missing-profile',
+      defaultModel: 'shared-model',
+      defaultModelProfileId: 'missing-profile',
+      modelProfiles: [
+        {
+          id: 'different-profile',
+          apiMode: 'anthropic_messages',
+          model: 'shared-model',
+          providerRuntime: {
+            presetKey: 'anthropic-official',
+            presetVersion: '1.0.0',
+            supportLevel: 'provider-certified',
+            executionMode: 'canonical',
+            endpointMode: 'strict',
+            protocolKey: 'anthropic_messages',
+            publicGatewayEndpoint: '/v1/messages',
+            effectivePolicyHash: 'a'.repeat(64),
+            runtimeHash: 'b'.repeat(64),
+            warnings: []
+          }
+        }
+      ],
+      providerRuntime: undefined
+    })
+  })
+
+  assert.equal(state.currentModelProfileId, null)
+  assert.equal(state.providerRuntime, null)
+  assert.equal(state.apiMode, 'chat_completions')
 })
 
 test('public enterprise state merges manifest current profile with fetched model profiles', () => {

@@ -34,6 +34,7 @@ function disabledState() {
     modelProfiles: [],
     policyHash: null,
     policyVersion: null,
+    providerRuntime: null,
     protocolSnapshot: null,
     role: null,
     runtimeDefaults: {},

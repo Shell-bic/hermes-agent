@@ -113,6 +113,18 @@ describe('ModelSettings', () => {
       currentModel: 'kimi-k2',
       defaultModel: 'kimi-k2',
       policyVersion: 'v1',
+      providerRuntime: {
+        presetKey: 'kimi-openai-compatible',
+        presetVersion: '1.0.0',
+        supportLevel: 'implemented-auto-verified',
+        executionMode: 'shadow',
+        endpointMode: 'translate',
+        protocolKey: 'chat_completions',
+        publicGatewayEndpoint: '/v1/chat/completions',
+        effectivePolicyHash: 'a'.repeat(64),
+        runtimeHash: 'b'.repeat(64),
+        warnings: [{ code: 'provider_preset_legacy_fallback', safeSummary: 'Safe compatibility fallback.' }]
+      },
       capabilities: { reasoning: true, context: 128000 },
       runtimeDefaults: { serviceTier: 'fast' },
       auxiliaryPolicy: { compression: 'follow-main' },
@@ -133,6 +145,15 @@ describe('ModelSettings', () => {
 
     expect(await screen.findByText('企业模型配置')).toBeTruthy()
     expect((await screen.findAllByText('企业 Kimi K2')).length).toBeGreaterThan(0)
+    expect(screen.getByText('ProviderRuntime')).toBeTruthy()
+    expect(screen.getByText('kimi-openai-compatible@1.0.0')).toBeTruthy()
+    expect(screen.getByText('shadow')).toBeTruthy()
+    expect(screen.getByText('translate')).toBeTruthy()
+    expect(screen.getByText('implemented-auto-verified')).toBeTruthy()
+    expect(screen.getByText('chat_completions')).toBeTruthy()
+    expect(screen.getByText('/v1/chat/completions')).toBeTruthy()
+    expect(screen.getByText(/effective a{12}/)).toBeTruthy()
+    expect(screen.getByText('Safe compatibility fallback.')).toBeTruthy()
     expect(screen.queryByRole('button', { name: 'Apply' })).toBeNull()
     expect(getGlobalModelInfo).not.toHaveBeenCalled()
     expect(getGlobalModelOptions).not.toHaveBeenCalled()

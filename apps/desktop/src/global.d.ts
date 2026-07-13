@@ -358,6 +358,33 @@ export interface EnterpriseModelProviderSummary {
   type: string | null
 }
 
+export type EnterpriseProviderRuntimeExecutionMode = 'canonical' | 'legacy' | 'shadow'
+
+export type EnterpriseProviderRuntimeEndpointMode = 'strict' | 'translate'
+
+export type EnterpriseProviderRuntimeSupportLevel =
+  | 'implemented-auto-verified'
+  | 'mock-only'
+  | 'provider-certified'
+
+export interface EnterpriseProviderRuntimeWarning {
+  code: string
+  safeSummary: string
+}
+
+export interface EnterpriseProviderRuntimeMetadata {
+  effectivePolicyHash?: string
+  endpointMode?: EnterpriseProviderRuntimeEndpointMode
+  executionMode?: EnterpriseProviderRuntimeExecutionMode
+  presetKey?: string
+  presetVersion?: string
+  protocolKey?: string
+  publicGatewayEndpoint?: string
+  runtimeHash?: string
+  supportLevel?: EnterpriseProviderRuntimeSupportLevel
+  warnings: EnterpriseProviderRuntimeWarning[]
+}
+
 export interface EnterpriseModelProfileSummary {
   apiFormat?: string | null
   apiMode?: string | null
@@ -372,6 +399,7 @@ export interface EnterpriseModelProfileSummary {
   name: string | null
   pricing?: Record<string, unknown>
   protocolKey?: string | null
+  providerRuntime?: EnterpriseProviderRuntimeMetadata | null
   provider?: EnterpriseModelProviderSummary | Record<string, unknown> | null
   providerName?: string | null
   providerType?: string | null
@@ -446,6 +474,7 @@ export interface EnterpriseDesktopState {
   modelProfiles: EnterpriseModelProfileSummary[]
   policyHash: null | string
   policyVersion: null | string
+  providerRuntime?: EnterpriseProviderRuntimeMetadata | null
   protocolSnapshot?: null | Record<string, unknown>
   role: unknown
   runtimeDefaults?: Record<string, unknown>

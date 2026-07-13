@@ -51,6 +51,8 @@ interface GatewayBootOptions {
   refreshSessions: () => Promise<void>
 }
 
+const POST_BOOT_RECONNECT_FAILURE_THRESHOLD = 6
+
 export function useGatewayBoot({
   enabled = true,
   handleGatewayEvent,
@@ -110,6 +112,8 @@ export function useGatewayBoot({
     let reconnecting = false
     let reconnectTimer: ReturnType<typeof setTimeout> | null = null
     let reconnectAttempt = 0
+    let reconnectFailureCount = 0
+    let reconnectFailureSurfaced = false
     // Surface "sign in again" once per disconnect episode, not on every backoff
     // tick — a stale OAuth ticket fails every attempt and would otherwise stack
     // identical error toasts (and their haptics). Reset on the next clean open.
@@ -164,6 +168,8 @@ export function useGatewayBoot({
         }
 
         reconnectAttempt = 0
+        reconnectFailureCount = 0
+        reconnectFailureSurfaced = false
         // Resync state that may have moved on the backend while we were asleep.
         await callbacksRef.current.refreshHermesConfig().catch(() => undefined)
         await callbacksRef.current.refreshSessions().catch(() => undefined)
@@ -172,9 +178,22 @@ export function useGatewayBoot({
         // again" message once instead of silently looping the backoff against a
         // ticket that can never succeed. Transport failures fall through to the
         // backoff in the finally block below.
-        if (!cancelled && isGatewayReauthRequired(err) && !reauthNotified) {
+        const reauthRequired = isGatewayReauthRequired(err)
+
+        if (!cancelled && reauthRequired && !reauthNotified) {
           reauthNotified = true
           notifyError(err, translateNow('boot.errors.gatewaySignInRequired'))
+        }
+
+        if (!cancelled && bootCompleted) {
+          reconnectFailureCount += 1
+
+          if (!reconnectFailureSurfaced && reconnectFailureCount >= POST_BOOT_RECONNECT_FAILURE_THRESHOLD) {
+            reconnectFailureSurfaced = true
+            failDesktopBoot(
+              translateNow(reauthRequired ? 'boot.errors.gatewaySignInRequired' : 'boot.errors.desktopBootFailed')
+            )
+          }
         }
       } finally {
         reconnecting = false
@@ -238,6 +257,8 @@ export function useGatewayBoot({
 
       if (st === 'open') {
         reconnectAttempt = 0
+        reconnectFailureCount = 0
+        reconnectFailureSurfaced = false
         reauthNotified = false
         clearReconnectTimer()
 
@@ -368,10 +389,12 @@ export function useGatewayBoot({
         })
         await ensureDefaultWorkspaceCwd()
         const remoteDefault = await desktopDefaultCwd().catch(() => null)
+
         if (remoteDefault?.cwd && !$activeSessionId.get() && !$currentCwd.get()) {
           setCurrentCwd(remoteDefault.cwd)
           setCurrentBranch(remoteDefault.branch || '')
         }
+
         await callbacksRef.current.refreshHermesConfig()
 
         if (cancelled) {

@@ -1,6 +1,7 @@
 import { act, cleanup, render } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
+import { translateNow } from '@/i18n'
 import { $desktopBoot } from '@/store/boot'
 import { $gatewayState } from '@/store/session'
 
@@ -68,13 +69,15 @@ class FakeWebSocket {
   }
 
   private emit(type: string, ev: unknown) {
-    for (const fn of this.listeners[type] ?? []) fn(ev)
+    for (const fn of this.listeners[type] ?? []) {
+      fn(ev)
+    }
   }
 }
 
-function fakeDesktop() {
+function fakeDesktop(authMode: 'oauth' | 'token' = 'token') {
   const conn = {
-    authMode: 'token' as const,
+    authMode,
     baseUrl: 'https://vps.example.com',
     profile: 'default',
     token: 't',
@@ -271,9 +274,11 @@ describe('useGatewayBoot remote reconnect loop (real hook, fake socket)', () => 
     FakeWebSocket.mode = 'fail'
     act(() => FakeWebSocket.instances[0].drop())
     await flushAsync()
+
     for (let i = 0; i < 8; i += 1) {
       await advanceBackoff()
     }
+
     expect($desktopBoot.get().error).toBeTruthy()
 
     // The remote comes back: next reconnect attempt opens.
@@ -282,5 +287,28 @@ describe('useGatewayBoot remote reconnect loop (real hook, fake socket)', () => 
 
     expect($gatewayState.get()).toBe('open')
     expect($desktopBoot.get().error).toBeNull()
+  })
+
+  it('keeps OAuth reconnect escalation recognizable without exposing the mint failure', async () => {
+    const desktop = fakeDesktop('oauth')
+
+    ;(window as { hermesDesktop?: unknown }).hermesDesktop = desktop
+    render(<Harness />)
+    await flushAsync()
+    expect($gatewayState.get()).toBe('open')
+
+    desktop.getGatewayWsUrl.mockRejectedValue(
+      new Error('sensitive mint failure at https://gateway.example.com/?token=do-not-render')
+    )
+    act(() => FakeWebSocket.instances[0].drop())
+    await flushAsync()
+
+    for (let i = 0; i < 8; i += 1) {
+      await advanceBackoff()
+    }
+
+    expect($desktopBoot.get().error).toBe(translateNow('boot.errors.gatewaySignInRequired'))
+    expect($desktopBoot.get().error).not.toContain('gateway.example.com')
+    expect($desktopBoot.get().error).not.toContain('do-not-render')
   })
 })

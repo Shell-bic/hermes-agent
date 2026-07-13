@@ -20,9 +20,29 @@ const NON_SECRET_TOKEN_FIELDS = new Set([
   'prompttokens',
   'totaltokens'
 ])
+const PROVIDER_RUNTIME_EXECUTION_MODES = new Set(['legacy', 'shadow', 'canonical'])
+const PROVIDER_RUNTIME_ENDPOINT_MODES = new Set(['strict', 'translate'])
+const PROVIDER_RUNTIME_SUPPORT_LEVELS = new Set([
+  'mock-only',
+  'implemented-auto-verified',
+  'provider-certified'
+])
+const PROVIDER_RUNTIME_TOKEN_PATTERN = /^[a-z0-9][a-z0-9._-]{0,127}$/i
+const PROVIDER_RUNTIME_HASH_PATTERN = /^[a-f0-9]{64}$/i
+const MAX_PROVIDER_RUNTIME_ENDPOINT_LENGTH = 256
+const MAX_PROVIDER_RUNTIME_WARNINGS = 16
+const UNSAFE_PROVIDER_RUNTIME_SUMMARY_PATTERN = /authorization|api[-_ ]?key|bearer\s+|credential|password|secret|token|prompt|tool(?:set|s)?\s*schema|https?:\/\//i
 
 function asArray(value) {
   return Array.isArray(value) ? value : []
+}
+
+function hasControlCharacters(value) {
+  return [...String(value || '')].some(character => {
+    const code = character.charCodeAt(0)
+
+    return code < 32 || code === 127
+  })
 }
 
 function scalarYaml(value) {
@@ -134,6 +154,7 @@ function normalizeModelProfile(profile) {
         name: profile.providerName || null,
         type: profile.providerType || null
       }
+  const providerRuntime = normalizeProviderRuntimeMetadata(profile.providerRuntime)
 
   return {
     apiFormat: profile.apiFormat || profile.transport || null,
@@ -149,6 +170,7 @@ function normalizeModelProfile(profile) {
     name: profile.name || profile.displayName || profile.model || profile.id || null,
     pricing: scrubSecretFields(profile.pricing || {}),
     ...(profile.protocolKey || profile.protocol_key ? { protocolKey: profile.protocolKey || profile.protocol_key } : {}),
+    ...(providerRuntime ? { providerRuntime } : {}),
     provider,
     providerName: profile.providerName || provider?.name || null,
     providerType: profile.providerType || provider?.type || null,
@@ -158,6 +180,103 @@ function normalizeModelProfile(profile) {
     ...(profile.streamingPolicy ? { streamingPolicy: scrubSecretFields(profile.streamingPolicy) } : {}),
     ...(profile.toolSchemaPolicy ? { toolSchemaPolicy: scrubSecretFields(profile.toolSchemaPolicy) } : {})
   }
+}
+
+function normalizeProviderRuntimeToken(value) {
+  if (typeof value !== 'string') {
+    return null
+  }
+
+  const normalized = value.trim()
+
+  return PROVIDER_RUNTIME_TOKEN_PATTERN.test(normalized) ? normalized : null
+}
+
+function normalizeProviderRuntimeHash(value) {
+  if (typeof value !== 'string') {
+    return null
+  }
+
+  const normalized = value.trim().toLowerCase()
+
+  return PROVIDER_RUNTIME_HASH_PATTERN.test(normalized) ? normalized : null
+}
+
+function normalizePublicGatewayEndpoint(value) {
+  if (typeof value !== 'string') {
+    return null
+  }
+
+  const normalized = value.trim()
+
+  if (
+    normalized.length > MAX_PROVIDER_RUNTIME_ENDPOINT_LENGTH ||
+    !normalized.startsWith('/') ||
+    normalized.startsWith('//') ||
+    normalized.includes('\\') ||
+    normalized.includes('?') ||
+    normalized.includes('#') ||
+    hasControlCharacters(normalized)
+  ) {
+    return null
+  }
+
+  return normalized
+}
+
+function normalizeProviderRuntimeWarning(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return null
+  }
+
+  const code = normalizeProviderRuntimeToken(value.code)
+  if (!code) {
+    return null
+  }
+
+  const candidate = typeof value.safeSummary === 'string' ? value.safeSummary.trim() : ''
+  const safeSummary = candidate &&
+      candidate.length <= 256 &&
+      !hasControlCharacters(candidate) &&
+      !UNSAFE_PROVIDER_RUNTIME_SUMMARY_PATTERN.test(candidate)
+    ? candidate
+    : 'Provider runtime policy warning.'
+
+  return { code, safeSummary }
+}
+
+function normalizeProviderRuntimeMetadata(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return null
+  }
+
+  const presetKey = normalizeProviderRuntimeToken(value.presetKey)
+  const presetVersion = normalizeProviderRuntimeToken(value.presetVersion)
+  const supportLevel = normalizeProviderRuntimeToken(value.supportLevel)
+  const executionMode = normalizeProviderRuntimeToken(value.executionMode)
+  const endpointMode = normalizeProviderRuntimeToken(value.endpointMode)
+  const protocolKey = normalizeProviderRuntimeToken(value.protocolKey)
+  const publicGatewayEndpoint = normalizePublicGatewayEndpoint(value.publicGatewayEndpoint)
+  const effectivePolicyHash = normalizeProviderRuntimeHash(value.effectivePolicyHash)
+  const runtimeHash = normalizeProviderRuntimeHash(value.runtimeHash)
+  const warnings = asArray(value.warnings)
+    .slice(0, MAX_PROVIDER_RUNTIME_WARNINGS)
+    .map(normalizeProviderRuntimeWarning)
+    .filter(Boolean)
+  const result = {
+    ...(presetKey ? { presetKey } : {}),
+    ...(presetVersion ? { presetVersion } : {}),
+    ...(supportLevel && PROVIDER_RUNTIME_SUPPORT_LEVELS.has(supportLevel) ? { supportLevel } : {}),
+    ...(executionMode && PROVIDER_RUNTIME_EXECUTION_MODES.has(executionMode) ? { executionMode } : {}),
+    ...(endpointMode && PROVIDER_RUNTIME_ENDPOINT_MODES.has(endpointMode) ? { endpointMode } : {}),
+    ...(protocolKey ? { protocolKey } : {}),
+    ...(publicGatewayEndpoint ? { publicGatewayEndpoint } : {}),
+    ...(effectivePolicyHash ? { effectivePolicyHash } : {}),
+    ...(runtimeHash ? { runtimeHash } : {}),
+    warnings
+  }
+
+  return Object.keys(result).length > 1 || warnings.length > 0 ? result : null
 }
 
 function apiModeFromApiFormat(raw) {
@@ -188,9 +307,12 @@ function resolveManifestApiMode(manifest) {
   const normalizedProfiles = asArray(manifest?.modelProfiles).map(normalizeModelProfile).filter(Boolean)
   const defaultModel = manifest?.defaultModel || asArray(manifest?.allowedModels)[0] || ''
   const currentModel = manifest?.currentModel || manifest?.selectedModel || defaultModel
-  const currentProfile = normalizedProfiles.find(profile => profile.model === currentModel || profile.id === currentModel)
-    || normalizedProfiles.find(profile => profile.isDefault)
-    || normalizedProfiles[0]
+  const currentModelProfileId = String(manifest?.currentModelProfileId || manifest?.defaultModelProfileId || '').trim()
+  const currentProfile = currentModelProfileId
+    ? normalizedProfiles.find(profile => String(profile.id || '').trim() === currentModelProfileId)
+    : normalizedProfiles.find(profile => profile.model === currentModel || profile.id === currentModel)
+      || normalizedProfiles.find(profile => profile.isDefault)
+      || normalizedProfiles[0]
   const apiMode = manifest?.apiMode || manifest?.api_mode || currentProfile?.apiMode
   if (apiMode) {
     return apiModeFromApiFormat(apiMode)
@@ -393,8 +515,13 @@ function publicEnterpriseState({ bootstrap = null, manifest = null, modelProfile
   const normalizedProfiles = mergedModelProfiles(manifest?.modelProfiles, modelProfiles)
   const defaultModel = manifest?.defaultModel || normalizedProfiles.find(profile => profile.isDefault)?.model || allowedModels[0] || null
   const currentModel = manifest?.currentModel || manifest?.selectedModel || defaultModel
-  const currentModelProfile =
-    normalizedProfiles.find(profile => profile.model === currentModel || profile.id === currentModel) || null
+  const currentModelProfileId = String(manifest?.currentModelProfileId || manifest?.defaultModelProfileId || '').trim()
+  const currentModelProfile = currentModelProfileId
+    ? normalizedProfiles.find(profile => String(profile.id || '').trim() === currentModelProfileId) || null
+    : normalizedProfiles.find(profile => profile.model === currentModel || profile.id === currentModel) || null
+  const providerRuntime = normalizeProviderRuntimeMetadata(manifest?.providerRuntime)
+    || currentModelProfile?.providerRuntime
+    || null
 
   return {
     allowedModels,
@@ -412,6 +539,7 @@ function publicEnterpriseState({ bootstrap = null, manifest = null, modelProfile
     generatedAt: manifest?.generatedAt || manifest?.toolPolicySnapshot?.generatedAt || null,
     policyHash: manifest?.policyHash || manifest?.toolPolicySnapshot?.policyHash || null,
     policyVersion: manifest?.policyVersion || bootstrap?.policyVersion || null,
+    providerRuntime,
     protocolSnapshot: scrubSecretFields(manifest?.protocolSnapshot || {}),
     role: resolveRole({ bootstrap, manifest }),
     runtimeDefaults: scrubSecretFields(manifest?.runtimeDefaults || {}),
@@ -476,6 +604,7 @@ function buildPolicySnapshot({ bootstrap = null, manifest = null, modelProfiles 
     generatedAt: publicState.generatedAt,
     policyHash: publicState.policyHash,
     policyVersion: manifest?.policyVersion || bootstrap?.policyVersion || null,
+    providerRuntime: publicState.providerRuntime,
     protocolSnapshot: publicState.protocolSnapshot,
     role: resolveRole({ bootstrap, manifest }),
     runtimeDefaults: publicState.runtimeDefaults,
@@ -556,6 +685,7 @@ module.exports = {
   enterpriseUserPathSegment,
   normalizeGatewayApiBaseUrl,
   normalizeEnterpriseUiPolicy,
+  normalizeProviderRuntimeMetadata,
   normalizeToolPolicySnapshot,
   publicEnterpriseState,
   readManagedConfigDisplayLanguage,

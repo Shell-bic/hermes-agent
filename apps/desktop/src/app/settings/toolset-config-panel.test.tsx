@@ -1,5 +1,5 @@
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { ToolsetConfig } from '@/types/hermes'
 
@@ -29,6 +29,21 @@ vi.mock('@/store/notifications', () => ({
 vi.mock('@/store/activity', () => ({
   upsertDesktopActionTask: vi.fn()
 }))
+
+beforeAll(() => {
+  const proto = window.HTMLElement.prototype as unknown as Record<string, () => unknown>
+
+  const stubs: Record<string, () => unknown> = {
+    hasPointerCapture: () => false,
+    releasePointerCapture: () => undefined,
+    scrollIntoView: () => undefined,
+    setPointerCapture: () => undefined
+  }
+
+  for (const [name, fn] of Object.entries(stubs)) {
+    proto[name] ??= fn
+  }
+})
 
 function config(overrides: Partial<ToolsetConfig> = {}): ToolsetConfig {
   return {
@@ -101,8 +116,12 @@ describe('ToolsetConfigPanel', () => {
     const elevenlabs = await screen.findByRole('button', { name: /ElevenLabs/ })
     fireEvent.click(elevenlabs)
 
-    // Click "Set" to reveal the input for the unset key.
-    fireEvent.click(await screen.findByRole('button', { name: 'Set' }))
+    // Credential actions moved behind the per-key menu.
+    fireEvent.pointerDown(await screen.findByRole('button', { name: 'Actions for ELEVENLABS_API_KEY' }), {
+      button: 0,
+      ctrlKey: false
+    })
+    fireEvent.click(await screen.findByRole('menuitem', { name: 'Set' }))
 
     const input = await screen.findByPlaceholderText('ElevenLabs API key')
     fireEvent.change(input, { target: { value: 'sk-test-123' } })

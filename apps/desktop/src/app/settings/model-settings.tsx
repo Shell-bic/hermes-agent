@@ -172,19 +172,28 @@ function enterpriseUserLabel(user: unknown): string {
   return typeof candidate === 'string' && candidate.trim() ? candidate.trim() : '已认证企业账号'
 }
 
+function compactRuntimeHash(value?: null | string): string | null {
+  if (!value) {
+    return null
+  }
+
+  return value.length > 16 ? `${value.slice(0, 12)}…` : value
+}
+
 function EnterpriseModelSettings() {
   const enterprise = useStore($enterprise)
   const [loggingOut, setLoggingOut] = useState(false)
   const profiles = enterprise.modelProfiles ?? []
-  const currentProfile = profiles.find(
-    profile =>
-      (enterprise.currentModelProfileId && profile.id === enterprise.currentModelProfileId) ||
-      (enterprise.currentModel && profile.model === enterprise.currentModel)
-  )
+
+  const currentProfile = enterprise.currentModelProfileId
+    ? profiles.find(profile => profile.id === enterprise.currentModelProfileId)
+    : profiles.find(profile => enterprise.currentModel && profile.model === enterprise.currentModel)
+
   const defaultProfile = profiles.find(profile => profile.isDefault || profile.model === enterprise.defaultModel)
   const capabilities = currentProfile?.capabilities ?? enterprise.capabilities
   const runtimeDefaults = currentProfile?.runtimeDefaults ?? enterprise.runtimeDefaults
   const auxiliaryPolicy = currentProfile?.auxiliaryPolicy ?? enterprise.auxiliaryPolicy
+  const providerRuntime = enterprise.providerRuntime ?? currentProfile?.providerRuntime
 
   async function handleLogout() {
     if (loggingOut) {
@@ -248,6 +257,36 @@ function EnterpriseModelSettings() {
             description="辅助任务模型策略由企业统一控制，未指定时跟随主模型。"
             title="辅助模型策略"
           />
+          {providerRuntime ? (
+            <ListRow
+              action={
+                <div className="flex flex-wrap justify-end gap-1.5">
+                  {providerRuntime.presetKey ? (
+                    <Pill>{[providerRuntime.presetKey, providerRuntime.presetVersion].filter(Boolean).join('@')}</Pill>
+                  ) : null}
+                  {providerRuntime.executionMode ? <Pill tone="primary">{providerRuntime.executionMode}</Pill> : null}
+                  {providerRuntime.endpointMode ? <Pill>{providerRuntime.endpointMode}</Pill> : null}
+                  {providerRuntime.supportLevel ? <Pill>{providerRuntime.supportLevel}</Pill> : null}
+                  {providerRuntime.protocolKey ? <Pill>{providerRuntime.protocolKey}</Pill> : null}
+                  {providerRuntime.publicGatewayEndpoint ? <Pill>{providerRuntime.publicGatewayEndpoint}</Pill> : null}
+                </div>
+              }
+              description={
+                <div className="grid gap-1">
+                  {providerRuntime.effectivePolicyHash ? (
+                    <span className="font-mono">effective {compactRuntimeHash(providerRuntime.effectivePolicyHash)}</span>
+                  ) : null}
+                  {providerRuntime.runtimeHash ? (
+                    <span className="font-mono">runtime {compactRuntimeHash(providerRuntime.runtimeHash)}</span>
+                  ) : null}
+                  {providerRuntime.warnings.map((warning, index) => (
+                    <span className="text-amber-300" key={`${warning.code}:${index}`}>{warning.safeSummary}</span>
+                  ))}
+                </div>
+              }
+              title="ProviderRuntime"
+            />
+          ) : null}
         </div>
       </section>
 
@@ -259,7 +298,7 @@ function EnterpriseModelSettings() {
               <ListRow
                 action={
                   <div className="flex flex-wrap justify-end gap-1.5">
-                    {profile.model === enterprise.currentModel ? <Pill tone="primary">当前</Pill> : null}
+                    {profile === currentProfile ? <Pill tone="primary">当前</Pill> : null}
                     {(profile.isDefault || profile.model === enterprise.defaultModel) ? <Pill>默认</Pill> : null}
                     {profile.apiFormat ? <Pill>{profile.apiFormat}</Pill> : null}
                   </div>
