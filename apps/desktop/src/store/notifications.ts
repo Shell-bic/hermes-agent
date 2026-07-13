@@ -1,6 +1,7 @@
 import { atom } from 'nanostores'
 
 import { translateNow } from '@/i18n'
+import { redactManagedText } from '@/lib/managed-redaction'
 
 export type NotificationKind = 'error' | 'warning' | 'info' | 'success'
 
@@ -107,10 +108,10 @@ export function notify(input: NotificationInput): string {
   const notification: AppNotification = {
     id,
     kind,
-    title: input.title,
-    message: input.message,
-    detail: input.detail,
-    action: input.action,
+    title: input.title === undefined ? undefined : redactManagedText(input.title),
+    message: redactManagedText(input.message),
+    detail: input.detail === undefined ? undefined : redactManagedText(input.detail),
+    action: input.action ? { ...input.action, label: redactManagedText(input.action.label) } : undefined,
     onDismiss: input.onDismiss,
     createdAt: Date.now()
   }

@@ -52,6 +52,7 @@ const { readDirForIpc } = require('./fs-read-dir.cjs')
 const { gitRootForIpc } = require('./git-root.cjs')
 const { worktreesForIpc } = require('./git-worktrees.cjs')
 const { requirePtyAllowed } = require('./pty-policy.cjs')
+const { isEnterpriseManagedEnv, redactManagedText } = require('./managed-redaction.cjs')
 const { OFFICIAL_REPO_HTTPS_URL, isOfficialSshRemote } = require('./update-remote.cjs')
 const { runRebuildWithRetry } = require('./update-rebuild.cjs')
 const {
@@ -343,6 +344,7 @@ const DESKTOP_UPDATE_CONFIG_PATH = path.join(app.getPath('userData'), 'updates.j
 const DESKTOP_PROFILE_CONFIG_PATH = path.join(app.getPath('userData'), 'active-profile.json')
 const ENTERPRISE_AUTH_STORE_PATH = path.join(app.getPath('userData'), 'enterprise', 'desktop-auth.json')
 const ENTERPRISE_RUNTIME_OPTIONS = resolveEnterpriseRuntimeOptions(process.env)
+const ENTERPRISE_MANAGED_OUTPUTS = ENTERPRISE_RUNTIME_OPTIONS.enabled || isEnterpriseManagedEnv(process.env)
 const enterpriseRuntime = createEnterpriseRuntime({
   authStore: createEnterpriseAuthStore({
     filePath: ENTERPRISE_AUTH_STORE_PATH,
@@ -981,7 +983,7 @@ function scheduleDesktopLogFlush() {
 }
 
 function rememberLog(chunk) {
-  const text = String(chunk || '').trim()
+  const text = redactManagedText(chunk, ENTERPRISE_MANAGED_OUTPUTS).trim()
   if (!text) return
   const lines = text.split(/\r?\n/).map(line => `[hermes] ${line}`)
   hermesLog.push(...lines)
@@ -5861,10 +5863,13 @@ ipcMain.handle('hermes:notify', (_event, payload) => {
   // and the body click still works.
   const actions = Array.isArray(payload?.actions) ? payload.actions : []
   const notification = new Notification({
-    title: payload?.title || 'Hermes',
-    body: payload?.body || '',
+    title: redactManagedText(payload?.title || 'Hermes', ENTERPRISE_MANAGED_OUTPUTS),
+    body: redactManagedText(payload?.body || '', ENTERPRISE_MANAGED_OUTPUTS),
     silent: Boolean(payload?.silent),
-    actions: actions.map(action => ({ type: 'button', text: String(action?.text || '') }))
+    actions: actions.map(action => ({
+      type: 'button',
+      text: redactManagedText(action?.text || '', ENTERPRISE_MANAGED_OUTPUTS)
+    }))
   })
   notification.on('click', () => {
     if (!mainWindow || mainWindow.isDestroyed()) return

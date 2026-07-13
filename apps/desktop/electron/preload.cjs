@@ -1,4 +1,7 @@
 const { contextBridge, ipcRenderer, webUtils } = require('electron')
+const { isEnterpriseManagedEnv, redactManagedText } = require('./managed-redaction.cjs')
+
+const ENTERPRISE_MANAGED_OUTPUTS = isEnterpriseManagedEnv(process.env)
 
 contextBridge.exposeInMainWorld('hermesDesktop', {
   getConnection: profile => ipcRenderer.invoke('hermes:connection', profile),
@@ -16,12 +19,14 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
   oauthLoginConnectionConfig: remoteUrl => ipcRenderer.invoke('hermes:connection-config:oauth-login', remoteUrl),
   oauthLogoutConnectionConfig: remoteUrl => ipcRenderer.invoke('hermes:connection-config:oauth-logout', remoteUrl),
   enterprise: {
+    managed: ENTERPRISE_MANAGED_OUTPUTS,
     login: payload => ipcRenderer.invoke('hermes:enterprise:login', payload),
     logout: () => ipcRenderer.invoke('hermes:enterprise:logout'),
     refresh: () => ipcRenderer.invoke('hermes:enterprise:refresh'),
     selectModel: model => ipcRenderer.invoke('hermes:enterprise:selectModel', model),
     status: () => ipcRenderer.invoke('hermes:enterprise:status')
   },
+  redactSensitiveText: value => redactManagedText(value, ENTERPRISE_MANAGED_OUTPUTS),
   profile: {
     get: () => ipcRenderer.invoke('hermes:profile:get'),
     set: name => ipcRenderer.invoke('hermes:profile:set', name)

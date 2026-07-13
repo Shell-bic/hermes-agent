@@ -12,6 +12,7 @@ import type {
 } from '@/global'
 import { useI18n } from '@/i18n'
 import { AlertTriangle, Check, ChevronDown, ChevronRight, Loader2 } from '@/lib/icons'
+import { redactManagedValue } from '@/lib/managed-redaction'
 import { cn } from '@/lib/utils'
 
 /**
@@ -282,7 +283,7 @@ export function DesktopInstallOverlay({ enabled = true }: DesktopInstallOverlayP
       .getBootstrapState()
       .then(snapshot => {
         if (!cancelled && snapshot) {
-          setState(snapshot)
+          setState(redactManagedValue(snapshot))
         }
       })
       .catch(() => {
@@ -290,7 +291,7 @@ export function DesktopInstallOverlay({ enabled = true }: DesktopInstallOverlayP
         // stays empty, app falls through to existing onboarding flow.
       })
 
-    const off = desktop.onBootstrapEvent(ev => setState(prev => applyEvent(prev, ev)))
+    const off = desktop.onBootstrapEvent(ev => setState(prev => applyEvent(prev, redactManagedValue(ev))))
 
     return () => {
       cancelled = true

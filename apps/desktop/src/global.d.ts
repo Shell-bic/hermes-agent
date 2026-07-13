@@ -35,12 +35,14 @@ declare global {
       oauthLoginConnectionConfig: (remoteUrl: string) => Promise<DesktopOauthLoginResult>
       oauthLogoutConnectionConfig: (remoteUrl?: string) => Promise<DesktopOauthLogoutResult>
       enterprise: {
+        readonly managed: boolean
         login: (payload: EnterpriseDesktopLoginInput) => Promise<EnterpriseDesktopState>
         logout: () => Promise<EnterpriseDesktopState>
         refresh: () => Promise<EnterpriseDesktopState>
         selectModel: (model: string) => Promise<EnterpriseDesktopState>
         status: () => Promise<EnterpriseDesktopState>
       }
+      redactSensitiveText: (value: unknown) => string
       profile: {
         get: () => Promise<DesktopActiveProfile>
         // Persists the desktop's profile choice and relaunches the local

@@ -11,8 +11,9 @@ import type { DesktopUpdateCommit, DesktopUpdateStage, DesktopUpdateStatus } fro
 import { useI18n } from '@/i18n'
 import { buildCommitChangelog, type CommitGroup } from '@/lib/commit-changelog'
 import { AlertCircle, Check, CheckCircle2, Copy, Terminal } from '@/lib/icons'
-import { cn } from '@/lib/utils'
+import { redactManagedText } from '@/lib/managed-redaction'
 import { resolveUpdateCopy, type UpdateTarget } from '@/lib/update-copy'
+import { cn } from '@/lib/utils'
 import {
   $backendUpdateApply,
   $backendUpdateChecking,
@@ -355,7 +356,7 @@ function ErrorView({ message, onDismiss, onRetry }: { message: string; onDismiss
       className="px-6 pb-6 pt-7 pr-8"
       description={
         <DialogDescription className="max-w-prose text-center text-sm leading-5 text-muted-foreground">
-          {message || u.errorBody}
+          {redactManagedText(message) || u.errorBody}
         </DialogDescription>
       }
       title={

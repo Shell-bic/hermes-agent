@@ -2,6 +2,7 @@ import { atom } from 'nanostores'
 
 import type { DesktopBootProgress } from '@/global'
 import { translateNow } from '@/i18n'
+import { redactManagedText } from '@/lib/managed-redaction'
 
 export interface DesktopBootState extends DesktopBootProgress {
   visible: boolean
@@ -36,7 +37,8 @@ export function applyDesktopBootProgress(progress: DesktopBootProgress) {
   $desktopBoot.set({
     ...current,
     ...progress,
-    error: progress.error ?? null,
+    error: progress.error === null || progress.error === undefined ? null : redactManagedText(progress.error),
+    message: redactManagedText(progress.message),
     progress: mergedProgress,
     visible: progress.running || mergedProgress < 100 || Boolean(progress.error)
   })
@@ -78,10 +80,11 @@ export function completeDesktopBoot(message = translateNow('boot.ready')) {
 
 export function failDesktopBoot(message: string) {
   const current = $desktopBoot.get()
+  const safeMessage = redactManagedText(message)
   $desktopBoot.set({
     ...current,
-    error: message,
-    message: translateNow('boot.desktopBootFailedWithMessage', message),
+    error: safeMessage,
+    message: translateNow('boot.desktopBootFailedWithMessage', safeMessage),
     phase: 'renderer.error',
     progress: clampProgress(current.progress),
     running: false,
