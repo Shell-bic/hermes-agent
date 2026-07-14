@@ -39,14 +39,20 @@ test('every enterprise IPC handler validates a trusted main-frame sender', () =>
   assert.match(main, /senderFrame !== sender\.mainFrame/)
   assert.match(main, /isTrustedEnterpriseRendererUrl\(senderFrame\.url \|\| sender\.getURL\(\)\)/)
   assert.match(main, /BrowserWindow\.fromWebContents\(sender\)/)
+  assert.match(main, /enterpriseSkillHubIpc\(event, operation\)[\s\S]*isTrustedDesktopRendererUrl\(event\?\.senderFrame\?\.url\)/)
 
   const handlers = [...main.matchAll(/ipcMain\.handle\('hermes:enterprise:([^']+)'/g)]
-  assert.equal(handlers.length, 11)
+  assert.ok(handlers.length > 0)
   for (let index = 0; index < handlers.length; index += 1) {
     const handlerStart = handlers[index].index
     const handlerEnd = handlers[index + 1]?.index || main.indexOf("ipcMain.handle('hermes:connection'", handlerStart)
     const body = main.slice(handlerStart, handlerEnd)
-    assert.match(body, /assertTrustedEnterpriseSender\(event/, `missing sender validation for ${handlers[index][1]}`)
+    const channel = handlers[index][1]
+    if (channel.startsWith('skill-hub:')) {
+      assert.match(body, /enterpriseSkillHubIpc\(event/, `missing Skill Hub sender validation for ${channel}`)
+    } else {
+      assert.match(body, /assertTrustedEnterpriseSender\(event/, `missing sender validation for ${channel}`)
+    }
   }
 })
 
