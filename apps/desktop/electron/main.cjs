@@ -1,6 +1,7 @@
 const {
   app,
   BrowserWindow,
+  WebContentsView,
   Menu,
   Notification,
   clipboard,
@@ -20,9 +21,8 @@ const crypto = require('node:crypto')
 const fs = require('node:fs')
 const http = require('node:http')
 const https = require('node:https')
-const net = require('node:net')
 const path = require('node:path')
-const { pathToFileURL } = require('node:url')
+const { fileURLToPath, pathToFileURL } = require('node:url')
 const { execFileSync, spawn } = require('node:child_process')
 const {
   detectRemoteDisplay,
@@ -90,10 +90,13 @@ const {
   resolveTimeoutMs
 } = require('./hardening.cjs')
 const { createEnterpriseAuthStore } = require('./enterprise-auth-store.cjs')
+const { resolveEnterpriseDesktopConfigPaths } = require('./enterprise-desktop-config.cjs')
 const { createEnterpriseGatewayClient } = require('./enterprise-gateway-client.cjs')
 const { createEnterpriseRuntime, resolveEnterpriseRuntimeOptions } = require('./enterprise-runtime.cjs')
 const { createEnterpriseSkillHub, publicError: publicEnterpriseSkillHubError } = require('./enterprise-skill-hub.cjs')
 const { isTrustedRendererUrl } = require('./renderer-trust.cjs')
+const { createEnterpriseWeComController } = require('./enterprise-wecom-controller.cjs')
+const { createEnterpriseWeComView } = require('./enterprise-wecom-view.cjs')
 
 let nodePty = null
 let nodePtyDir = null
@@ -345,7 +348,13 @@ const DESKTOP_UPDATE_CONFIG_PATH = path.join(app.getPath('userData'), 'updates.j
 // no --profile flag, so the backend honors active_profile / default.
 const DESKTOP_PROFILE_CONFIG_PATH = path.join(app.getPath('userData'), 'active-profile.json')
 const ENTERPRISE_AUTH_STORE_PATH = path.join(app.getPath('userData'), 'enterprise', 'desktop-auth.json')
-const ENTERPRISE_RUNTIME_OPTIONS = resolveEnterpriseRuntimeOptions(process.env)
+const ENTERPRISE_RUNTIME_OPTIONS = resolveEnterpriseRuntimeOptions(process.env, {
+  configPaths: resolveEnterpriseDesktopConfigPaths({
+    executablePath: process.execPath,
+    programData: process.env.PROGRAMDATA,
+    userDataPath: app.getPath('userData')
+  })
+})
 const ENTERPRISE_MANAGED_OUTPUTS = ENTERPRISE_RUNTIME_OPTIONS.enabled || isEnterpriseManagedEnv(process.env)
 const enterpriseAuthStore = createEnterpriseAuthStore({
   filePath: ENTERPRISE_AUTH_STORE_PATH,
@@ -876,6 +885,28 @@ function registerMediaProtocol() {
 }
 
 let mainWindow = null
+const enterpriseWeComView = createEnterpriseWeComView({
+  WebContentsView,
+  getHostWindow: () => mainWindow,
+  rememberLog
+})
+const enterpriseWeComController = createEnterpriseWeComController({
+  client: enterpriseRuntime.client,
+  onAuthenticated: async () => {
+    bootstrapFailure = null
+    await teardownPrimaryBackendAndWait()
+  },
+  onState: state => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('hermes:enterprise:login-state', state)
+    }
+  },
+  qrView: enterpriseWeComView,
+  rememberLog,
+  runtime: enterpriseRuntime
+})
+let enterpriseQuitCleanupPromise = null
+let enterpriseQuitReady = false
 let hermesProcess = null
 let connectionPromise = null
 // Additional per-profile backends, keyed by profile name. The PRIMARY backend
@@ -5447,6 +5478,9 @@ function createWindow() {
   mainWindow.on('enter-full-screen', () => sendWindowStateChanged(true))
   mainWindow.on('will-leave-full-screen', () => sendWindowStateChanged(false))
   mainWindow.on('leave-full-screen', () => sendWindowStateChanged(false))
+  mainWindow.on('closed', () => {
+    void enterpriseWeComController.dispose({ permanent: !IS_MAC })
+  })
 
   wireCommonWindowHandlers(mainWindow)
 
@@ -5501,19 +5535,92 @@ function createWindow() {
     mainWindow.loadURL(pathToFileURL(resolveRendererIndex()).toString())
   }
 
-  mainWindow.webContents.once('did-finish-load', () => {
+  mainWindow.webContents.once('did-finish-load', async () => {
     restorePersistedZoomLevel(mainWindow)
     broadcastBootProgress()
     sendWindowStateChanged()
-    if (!enterpriseRuntime.isEnabled() || enterpriseRuntime.hasStoredSession()) {
+    if (!enterpriseRuntime.isEnabled()) {
+      startHermes().catch(error => rememberLog(error.stack || error.message))
+      return
+    }
+
+    const state = await enterpriseRuntime.refreshPublicState()
+    if (state.authenticated) {
       startHermes().catch(error => rememberLog(error.stack || error.message))
     }
   })
 }
 
-ipcMain.handle('hermes:enterprise:status', async () => enterpriseRuntime.getPublicState())
-ipcMain.handle('hermes:enterprise:refresh', async () => enterpriseRuntime.refreshPublicState())
-ipcMain.handle('hermes:enterprise:login', async (_event, payload) => {
+function isTrustedEnterpriseRendererUrl(rawUrl) {
+  try {
+    const parsed = new URL(String(rawUrl || ''))
+    if (DEV_SERVER) {
+      return parsed.origin === new URL(DEV_SERVER).origin
+    }
+    return parsed.protocol === 'file:' && path.resolve(fileURLToPath(parsed)) === path.resolve(resolveRendererIndex())
+  } catch {
+    return false
+  }
+}
+
+function assertTrustedEnterpriseSender(event, { mainWindowOnly = false } = {}) {
+  const sender = event?.sender
+  const senderFrame = event?.senderFrame
+  const senderWindow = sender ? BrowserWindow.fromWebContents(sender) : null
+  if (
+    !senderWindow ||
+    senderWindow.isDestroyed() ||
+    (mainWindowOnly && sender !== mainWindow?.webContents) ||
+    !senderFrame ||
+    senderFrame !== sender.mainFrame ||
+    !isTrustedEnterpriseRendererUrl(senderFrame.url || sender.getURL())
+  ) {
+    const error = new Error('Enterprise authentication IPC is restricted to the trusted main renderer.')
+    error.code = 'untrusted-enterprise-ipc'
+    throw error
+  }
+}
+
+ipcMain.handle('hermes:enterprise:status', async event => {
+  assertTrustedEnterpriseSender(event)
+  return enterpriseRuntime.getPublicState()
+})
+ipcMain.handle('hermes:enterprise:refresh', async event => {
+  assertTrustedEnterpriseSender(event)
+  return enterpriseRuntime.refreshPublicState()
+})
+ipcMain.handle('hermes:enterprise:login-methods', async event => {
+  assertTrustedEnterpriseSender(event, { mainWindowOnly: true })
+  return enterpriseWeComController.initialize()
+})
+ipcMain.handle('hermes:enterprise:login-state', async event => {
+  assertTrustedEnterpriseSender(event, { mainWindowOnly: true })
+  return enterpriseWeComController.getPublicState()
+})
+ipcMain.handle('hermes:enterprise:login-method-select', async (event, method) => {
+  assertTrustedEnterpriseSender(event, { mainWindowOnly: true })
+  return enterpriseWeComController.selectMethod(method)
+})
+ipcMain.handle('hermes:enterprise:wecom-refresh', async event => {
+  assertTrustedEnterpriseSender(event, { mainWindowOnly: true })
+  return enterpriseWeComController.retry()
+})
+ipcMain.handle('hermes:enterprise:wecom-cancel', async event => {
+  assertTrustedEnterpriseSender(event, { mainWindowOnly: true })
+  return enterpriseWeComController.cancel({ nextStatus: 'qr-canceled', notifyRemote: true, preserveSelection: true })
+})
+ipcMain.handle('hermes:enterprise:wecom-bounds', async (event, bounds) => {
+  assertTrustedEnterpriseSender(event, { mainWindowOnly: true })
+  return enterpriseWeComController.setBounds(bounds || {})
+})
+ipcMain.handle('hermes:enterprise:login', async (event, payload) => {
+  assertTrustedEnterpriseSender(event)
+  const loginState = await enterpriseWeComController.selectMethod('password')
+  if (loginState.selectedMethod !== 'password' || loginState.status !== 'password-ready') {
+    const error = new Error('Enterprise authentication is already being completed.')
+    error.code = 'enterprise-login-busy'
+    throw error
+  }
   const state = await enterpriseRuntime.login(payload || {})
   bootstrapFailure = null
   await teardownPrimaryBackendAndWait()
@@ -5521,12 +5628,15 @@ ipcMain.handle('hermes:enterprise:login', async (_event, payload) => {
 })
 // Explicit manifest/default refresh only. Ordinary model picker hot-switches
 // through gateway config.set and must not tear down the running backend.
-ipcMain.handle('hermes:enterprise:selectModel', async (_event, model) => {
+ipcMain.handle('hermes:enterprise:selectModel', async (event, model) => {
+  assertTrustedEnterpriseSender(event)
   const state = await enterpriseRuntime.selectModel(model)
   bootstrapFailure = null
   return state
 })
-ipcMain.handle('hermes:enterprise:logout', async () => {
+ipcMain.handle('hermes:enterprise:logout', async event => {
+  assertTrustedEnterpriseSender(event)
+  await enterpriseWeComController.cancel({ force: true, nextStatus: 'idle', notifyRemote: true })
   const state = await enterpriseRuntime.logout()
   await teardownPrimaryBackendAndWait()
   return state
@@ -6823,7 +6933,21 @@ function configureSpellChecker() {
   }
 }
 
-app.on('before-quit', () => {
+app.on('before-quit', event => {
+  if (!enterpriseQuitReady) {
+    event.preventDefault()
+    if (!enterpriseQuitCleanupPromise) {
+      enterpriseQuitCleanupPromise = enterpriseWeComController
+        .dispose({ permanent: true })
+        .catch(error => rememberLog(`[enterprise] quit cleanup failed: ${error?.message || error}`))
+        .finally(() => {
+          enterpriseQuitReady = true
+          app.quit()
+        })
+    }
+    return
+  }
+
   // Quitting mid-install should stop the installer, not orphan it.
   if (bootstrapAbortController) {
     try {

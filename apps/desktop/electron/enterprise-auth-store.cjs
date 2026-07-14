@@ -1,26 +1,44 @@
 const fs = require('node:fs')
 const path = require('node:path')
 
+function isSecureStorageAvailable(safeStorage) {
+  if (!safeStorage?.isEncryptionAvailable?.()) {
+    return false
+  }
+
+  if (typeof safeStorage.getSelectedStorageBackend === 'function') {
+    try {
+      if (String(safeStorage.getSelectedStorageBackend() || '').trim().toLowerCase() === 'basic_text') {
+        return false
+      }
+    } catch {
+      // This Electron API is Linux-specific and may reject on other platforms.
+      // isEncryptionAvailable remains the platform contract outside Linux.
+    }
+  }
+
+  return true
+}
+
 function encryptValue(value, safeStorage) {
   const text = String(value || '')
 
   if (!text) {
-    return { encoding: 'plain', value: '' }
+    throw new Error('Cannot encrypt an empty enterprise desktop token.')
   }
 
-  if (safeStorage && safeStorage.isEncryptionAvailable?.()) {
-    try {
-      return {
-        encoding: 'safeStorage',
-        value: safeStorage.encryptString(text).toString('base64')
-      }
-    } catch {
-      // Fall through to plain so enterprise login still works on platforms
-      // where safeStorage exists but the OS keychain is temporarily unavailable.
+  if (!isSecureStorageAvailable(safeStorage)) {
+    throw new Error('Secure enterprise token storage is unavailable.')
+  }
+
+  try {
+    return {
+      encoding: 'safeStorage',
+      value: safeStorage.encryptString(text).toString('base64')
     }
+  } catch (error) {
+    throw new Error(`Secure enterprise token storage failed: ${error instanceof Error ? error.message : String(error)}`)
   }
-
-  return { encoding: 'plain', value: text }
 }
 
 function decryptValue(secret, safeStorage) {
@@ -31,15 +49,15 @@ function decryptValue(secret, safeStorage) {
   const value = String(secret.value || '')
   if (!value) return ''
 
-  if (secret.encoding === 'safeStorage') {
-    try {
-      return safeStorage?.decryptString(Buffer.from(value, 'base64')) || ''
-    } catch {
-      return ''
-    }
+  if (secret.encoding !== 'safeStorage' || !isSecureStorageAvailable(safeStorage)) {
+    return ''
   }
 
-  return value
+  try {
+    return safeStorage.decryptString(Buffer.from(value, 'base64')) || ''
+  } catch {
+    return ''
+  }
 }
 
 function sanitizeCachedSession(session) {
@@ -77,12 +95,21 @@ class EnterpriseAuthStore {
     const desktopToken = decryptValue(raw?.desktopToken, this.safeStorage)
 
     if (!desktopToken) {
+      if (raw?.desktopToken) {
+        this.clear()
+      }
+      return null
+    }
+
+    const expiresAt = raw.expiresAt || null
+    if (expiresAt && (!Number.isFinite(Date.parse(expiresAt)) || Date.parse(expiresAt) <= Date.now())) {
+      this.clear()
       return null
     }
 
     return {
       desktopToken,
-      expiresAt: raw.expiresAt || null,
+      expiresAt,
       user: raw.user || null
     }
   }
@@ -98,25 +125,40 @@ class EnterpriseAuthStore {
       throw new Error('Cannot persist an empty enterprise desktop token.')
     }
 
-    const payload = {
-      desktopToken: encryptValue(desktopToken, this.safeStorage),
-      expiresAt: session.expiresAt || null,
-      user: session.user || null,
-      updatedAt: new Date().toISOString()
+    const temporaryPath = `${this.filePath}.${process.pid}.tmp`
+
+    try {
+      const encryptedToken = encryptValue(desktopToken, this.safeStorage)
+      const payload = {
+        desktopToken: encryptedToken,
+        expiresAt: session.expiresAt || null,
+        user: session.user || null,
+        updatedAt: new Date().toISOString()
+      }
+
+      this.fs.mkdirSync(path.dirname(this.filePath), { recursive: true })
+      this.fs.writeFileSync(temporaryPath, JSON.stringify(payload, null, 2), { encoding: 'utf8', mode: 0o600 })
+      this.fs.renameSync(temporaryPath, this.filePath)
+
+      return sanitizeCachedSession(payload)
+    } catch (error) {
+      this.clearPath(temporaryPath)
+      this.clear()
+      throw error
     }
-
-    this.fs.mkdirSync(path.dirname(this.filePath), { recursive: true })
-    this.fs.writeFileSync(this.filePath, JSON.stringify(payload, null, 2), 'utf8')
-
-    return sanitizeCachedSession(payload)
   }
 
-  clear() {
+  clearPath(filePath) {
     try {
-      this.fs.rmSync(this.filePath, { force: true })
+      this.fs.rmSync(filePath, { force: true })
     } catch {
       // Missing or locked auth files are handled by the next login attempt.
     }
+  }
+
+  clear() {
+    this.clearPath(this.filePath)
+    this.clearPath(`${this.filePath}.${process.pid}.tmp`)
   }
 }
 
@@ -129,5 +171,6 @@ module.exports = {
   createEnterpriseAuthStore,
   decryptValue,
   encryptValue,
+  isSecureStorageAvailable,
   sanitizeCachedSession
 }

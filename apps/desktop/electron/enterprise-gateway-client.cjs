@@ -16,6 +16,16 @@ function normalizeEnterpriseGatewayBaseUrl(rawUrl) {
     throw new Error(`Enterprise gateway URL must be http:// or https://, got ${parsed.protocol}`)
   }
 
+  const hostname = parsed.hostname.toLowerCase()
+  const isLoopback =
+    hostname === 'localhost' ||
+    hostname.endsWith('.localhost') ||
+    hostname === '127.0.0.1' ||
+    hostname === '[::1]'
+  if (parsed.protocol !== 'https:' && !isLoopback) {
+    throw new Error('Enterprise gateway URL must use https:// unless it points to localhost.')
+  }
+
   parsed.hash = ''
   parsed.search = ''
   parsed.pathname = parsed.pathname.replace(/\/+$/, '')
@@ -45,13 +55,49 @@ function normalizeLoginResponse(payload) {
   }
 }
 
-class EnterpriseGatewayClient {
-  constructor({ baseUrl, fetchImpl = globalThis.fetch } = {}) {
-    this.baseUrl = normalizeEnterpriseGatewayBaseUrl(baseUrl)
-    this.fetchImpl = fetchImpl
+class EnterpriseGatewayError extends Error {
+  constructor(message, { code = 'gateway-error', status = 0 } = {}) {
+    super(message)
+    this.name = 'EnterpriseGatewayError'
+    this.code = String(code || 'gateway-error')
+    this.status = Number(status) || 0
+  }
+}
+
+const ENTERPRISE_LOGIN_METHODS = new Set(['password', 'wecom-qr'])
+
+function normalizeLoginMethodsResponse(payload) {
+  const rawMethods = Array.isArray(payload?.methods) ? payload.methods : []
+  const methods = []
+
+  for (const rawMethod of rawMethods) {
+    const id = String(typeof rawMethod === 'string' ? rawMethod : rawMethod?.id || '').trim()
+    const enabled = typeof rawMethod === 'string' ? true : rawMethod?.enabled === true
+
+    if (enabled && ENTERPRISE_LOGIN_METHODS.has(id) && !methods.includes(id)) {
+      methods.push(id)
+    }
   }
 
-  async requestJson(path, { method = 'GET', body, token } = {}) {
+  const requestedDefault = String(payload?.defaultMethod || '').trim()
+  const defaultMethod = methods.includes(requestedDefault) ? requestedDefault : methods[0] || null
+
+  return {
+    defaultMethod,
+    enterpriseDisplayName: String(payload?.enterpriseDisplayName || payload?.companyDisplayName || '').trim() || null,
+    methods,
+    weComAuthorizationOrigin: String(payload?.weComAuthorizationOrigin || '').trim() || null
+  }
+}
+
+class EnterpriseGatewayClient {
+  constructor({ baseUrl, fetchImpl = globalThis.fetch, timeoutMs = 10000 } = {}) {
+    this.baseUrl = normalizeEnterpriseGatewayBaseUrl(baseUrl)
+    this.fetchImpl = fetchImpl
+    this.timeoutMs = Math.max(100, Number(timeoutMs) || 10000)
+  }
+
+  async requestJson(path, { method = 'GET', body, signal, token } = {}) {
     if (typeof this.fetchImpl !== 'function') {
       throw new Error('Enterprise gateway client requires fetch.')
     }
@@ -67,13 +113,44 @@ class EnterpriseGatewayClient {
       headers.Authorization = `Bearer ${token}`
     }
 
-    const response = await this.fetchImpl(url, {
-      method,
-      headers,
-      body: body === undefined ? undefined : JSON.stringify(body)
-    })
+    const abortController = new AbortController()
+    let timedOut = false
+    const abortFromCaller = () => abortController.abort(signal?.reason)
+    signal?.addEventListener?.('abort', abortFromCaller, { once: true })
+    if (signal?.aborted) {
+      abortFromCaller()
+    }
+    const timeout = setTimeout(() => {
+      timedOut = true
+      abortController.abort()
+    }, this.timeoutMs)
+    timeout.unref?.()
 
-    const text = await response.text()
+    let response
+    let text
+    try {
+      response = await this.fetchImpl(url, {
+        method,
+        headers,
+        body: body === undefined ? undefined : JSON.stringify(body),
+        signal: abortController.signal
+      })
+      text = await response.text()
+    } catch {
+      if (abortController.signal.aborted) {
+        throw new EnterpriseGatewayError(
+          timedOut ? 'Enterprise gateway request timed out.' : 'Enterprise gateway request was canceled.',
+          { code: timedOut ? 'gateway-timeout' : 'request-canceled' }
+        )
+      }
+      throw new EnterpriseGatewayError('Enterprise gateway is unavailable.', {
+        code: 'gateway-offline'
+      })
+    } finally {
+      clearTimeout(timeout)
+      signal?.removeEventListener?.('abort', abortFromCaller)
+    }
+
     let payload = null
 
     if (text) {
@@ -85,11 +162,12 @@ class EnterpriseGatewayClient {
     }
 
     if (!response.ok) {
-      const message = payload?.message || payload?.error || `${response.status} ${response.statusText}`.trim()
-      const error = new Error(`Enterprise gateway request failed: ${message}`)
-      error.code = payload?.code || payload?.errorCode || 'enterprise_gateway_request_failed'
-      error.status = response.status
-      throw error
+      const message = payload?.detail || payload?.message || payload?.error || `${response.status} ${response.statusText}`.trim()
+      const code = payload?.code || payload?.errorCode || payload?.type || 'gateway-error'
+      throw new EnterpriseGatewayError(`Enterprise gateway request failed: ${message}`, {
+        code,
+        status: response.status
+      })
     }
 
     return payload
@@ -127,6 +205,60 @@ class EnterpriseGatewayClient {
         body: { username: user, password }
       })
     )
+  }
+
+  async loginMethods() {
+    return normalizeLoginMethodsResponse(await this.requestJson('/api/desktop/auth/methods'))
+  }
+
+  async startWeCom({ challenge, signal } = {}) {
+    const normalizedChallenge = String(challenge || '').trim()
+    if (!normalizedChallenge) {
+      throw new Error('Enterprise WeCom challenge is required.')
+    }
+
+    return this.requestJson('/api/desktop/auth/wecom/start', {
+      method: 'POST',
+      body: { challenge: normalizedChallenge },
+      signal
+    })
+  }
+
+  weComStatus(transactionId, { signal } = {}) {
+    const id = String(transactionId || '').trim()
+    if (!id) {
+      throw new Error('Enterprise WeCom transaction is required.')
+    }
+
+    return this.requestJson(`/api/desktop/auth/wecom/status/${encodeURIComponent(id)}`, { signal })
+  }
+
+  async redeemWeCom({ signal, transactionId, verifier } = {}) {
+    const id = String(transactionId || '').trim()
+    const normalizedVerifier = String(verifier || '').trim()
+    if (!id || !normalizedVerifier) {
+      throw new Error('Enterprise WeCom transaction and verifier are required.')
+    }
+
+    return normalizeLoginResponse(
+      await this.requestJson('/api/desktop/auth/wecom/redeem', {
+        method: 'POST',
+        body: { transactionId: id, verifier: normalizedVerifier },
+        signal
+      })
+    )
+  }
+
+  cancelWeCom(transactionId) {
+    const id = String(transactionId || '').trim()
+    if (!id) {
+      throw new Error('Enterprise WeCom transaction is required.')
+    }
+
+    return this.requestJson('/api/desktop/auth/wecom/cancel', {
+      method: 'POST',
+      body: { transactionId: id }
+    })
   }
 
   me(token) {
@@ -185,8 +317,11 @@ function createEnterpriseGatewayClient(options) {
 }
 
 module.exports = {
+  ENTERPRISE_LOGIN_METHODS,
+  EnterpriseGatewayError,
   EnterpriseGatewayClient,
   createEnterpriseGatewayClient,
+  normalizeLoginMethodsResponse,
   normalizeEnterpriseGatewayBaseUrl,
   normalizeLoginResponse,
   pickDesktopToken

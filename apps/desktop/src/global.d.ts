@@ -36,15 +36,22 @@ declare global {
       oauthLogoutConnectionConfig: (remoteUrl?: string) => Promise<DesktopOauthLogoutResult>
       enterprise: {
         readonly managed: boolean
+        cancelWeCom: () => Promise<EnterpriseLoginState>
         login: (payload: EnterpriseDesktopLoginInput) => Promise<EnterpriseDesktopState>
+        loginMethods: () => Promise<EnterpriseLoginState>
+        loginState: () => Promise<EnterpriseLoginState>
         logout: () => Promise<EnterpriseDesktopState>
+        onLoginState: (callback: (state: EnterpriseLoginState) => void) => () => void
         refresh: () => Promise<EnterpriseDesktopState>
+        refreshWeCom: () => Promise<EnterpriseLoginState>
+        selectLoginMethod: (method: EnterpriseLoginMethod) => Promise<EnterpriseLoginState>
         selectModel: (model: string) => Promise<EnterpriseDesktopState>
         skillHub: {
           detail: (key: string) => Promise<EnterpriseSkillHubItem>
           install: (payload: EnterpriseSkillHubInstallInput) => Promise<EnterpriseSkillHubInstallResult>
           list: (query?: EnterpriseSkillHubListQuery) => Promise<EnterpriseSkillHubPage>
         }
+        setWeComBounds: (bounds: EnterpriseWeComBounds) => Promise<EnterpriseLoginState>
         status: () => Promise<EnterpriseDesktopState>
       }
       redactSensitiveText: (value: unknown) => string
@@ -402,6 +409,41 @@ export interface EnterpriseSkillHubInstalledItem {
 export interface EnterpriseSkillHubInstallResult {
   installed: EnterpriseSkillHubInstalledItem
   item: EnterpriseSkillHubItem
+}
+
+export type EnterpriseLoginMethod = 'password' | 'wecom-qr'
+
+export type EnterpriseLoginStatus =
+  | 'gateway-offline'
+  | 'idle'
+  | 'methods-loading'
+  | 'out-of-scope'
+  | 'password-ready'
+  | 'qr-canceled'
+  | 'qr-error'
+  | 'qr-expired'
+  | 'qr-pending'
+  | 'qr-preparing'
+  | 'qr-verified'
+  | 'success'
+
+export interface EnterpriseLoginState {
+  defaultMethod: EnterpriseLoginMethod | null
+  enterpriseDisplayName: string | null
+  errorCode: string | null
+  expiresAt: string | null
+  methods: EnterpriseLoginMethod[]
+  selectedMethod: EnterpriseLoginMethod | null
+  status: EnterpriseLoginStatus
+  user: unknown
+}
+
+export interface EnterpriseWeComBounds {
+  height: number
+  visible: boolean
+  width: number
+  x: number
+  y: number
 }
 
 export type EnterpriseDesktopStatus = 'authenticated' | 'disabled' | 'error' | 'loading' | 'unauthenticated'

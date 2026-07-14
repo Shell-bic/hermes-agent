@@ -1,6 +1,13 @@
 import { atom } from 'nanostores'
 
-import type { EnterpriseDesktopLoginInput, EnterpriseDesktopState, EnterpriseUiPolicy } from '@/global'
+import type {
+  EnterpriseDesktopLoginInput,
+  EnterpriseDesktopState,
+  EnterpriseLoginMethod,
+  EnterpriseLoginState,
+  EnterpriseUiPolicy,
+  EnterpriseWeComBounds
+} from '@/global'
 import {
   setActiveSessionId,
   setAwaitingResponse,
@@ -56,6 +63,73 @@ export const ENTERPRISE_UI_POLICY_DEFAULT: EnterpriseUiPolicy = {
 }
 
 export const $enterprise = atom<EnterpriseDesktopState>(INITIAL_ENTERPRISE_STATE)
+
+export const INITIAL_ENTERPRISE_LOGIN_STATE: EnterpriseLoginState = {
+  defaultMethod: null,
+  enterpriseDisplayName: null,
+  errorCode: null,
+  expiresAt: null,
+  methods: [],
+  selectedMethod: null,
+  status: 'idle',
+  user: null
+}
+
+export const $enterpriseLogin = atom<EnterpriseLoginState>(INITIAL_ENTERPRISE_LOGIN_STATE)
+
+function applyEnterpriseLoginState(state: EnterpriseLoginState): EnterpriseLoginState {
+  $enterpriseLogin.set(state)
+
+  return state
+}
+
+function unavailableLoginState(): EnterpriseLoginState {
+  return {
+    ...INITIAL_ENTERPRISE_LOGIN_STATE,
+    errorCode: 'gateway-offline',
+    status: 'gateway-offline'
+  }
+}
+
+export async function initializeEnterpriseLogin(): Promise<EnterpriseLoginState> {
+  const bridge = window.hermesDesktop?.enterprise
+
+  if (!bridge) {
+    return applyEnterpriseLoginState(unavailableLoginState())
+  }
+
+  try {
+    return applyEnterpriseLoginState(await bridge.loginMethods())
+  } catch {
+    return applyEnterpriseLoginState(unavailableLoginState())
+  }
+}
+
+export function subscribeEnterpriseLogin(): () => void {
+  const bridge = window.hermesDesktop?.enterprise
+
+  if (!bridge?.onLoginState) {
+    return () => undefined
+  }
+
+  return bridge.onLoginState(state => applyEnterpriseLoginState(state))
+}
+
+export async function selectEnterpriseLoginMethod(method: EnterpriseLoginMethod): Promise<EnterpriseLoginState> {
+  return applyEnterpriseLoginState(await window.hermesDesktop.enterprise.selectLoginMethod(method))
+}
+
+export async function refreshEnterpriseWeCom(): Promise<EnterpriseLoginState> {
+  return applyEnterpriseLoginState(await window.hermesDesktop.enterprise.refreshWeCom())
+}
+
+export async function cancelEnterpriseWeCom(): Promise<EnterpriseLoginState> {
+  return applyEnterpriseLoginState(await window.hermesDesktop.enterprise.cancelWeCom())
+}
+
+export async function setEnterpriseWeComBounds(bounds: EnterpriseWeComBounds): Promise<void> {
+  await window.hermesDesktop.enterprise.setWeComBounds(bounds)
+}
 
 function applyEnterpriseState(state: EnterpriseDesktopState | null | undefined): EnterpriseDesktopState {
   const base = state || {
@@ -125,6 +199,7 @@ export async function loginEnterprise(input: EnterpriseDesktopLoginInput): Promi
 export async function logoutEnterprise(): Promise<EnterpriseDesktopState> {
   const state = await window.hermesDesktop.enterprise.logout()
   clearEnterpriseRuntimeSessionState()
+  $enterpriseLogin.set(INITIAL_ENTERPRISE_LOGIN_STATE)
 
   return applyEnterpriseState(state)
 }

@@ -28,9 +28,19 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
   oauthLogoutConnectionConfig: remoteUrl => ipcRenderer.invoke('hermes:connection-config:oauth-logout', remoteUrl),
   enterprise: {
     managed: ENTERPRISE_MANAGED_OUTPUTS,
+    cancelWeCom: () => ipcRenderer.invoke('hermes:enterprise:wecom-cancel'),
     login: payload => ipcRenderer.invoke('hermes:enterprise:login', payload),
+    loginMethods: () => ipcRenderer.invoke('hermes:enterprise:login-methods'),
+    loginState: () => ipcRenderer.invoke('hermes:enterprise:login-state'),
     logout: () => ipcRenderer.invoke('hermes:enterprise:logout'),
+    onLoginState: callback => {
+      const listener = (_event, state) => callback(state)
+      ipcRenderer.on('hermes:enterprise:login-state', listener)
+      return () => ipcRenderer.removeListener('hermes:enterprise:login-state', listener)
+    },
     refresh: () => ipcRenderer.invoke('hermes:enterprise:refresh'),
+    refreshWeCom: () => ipcRenderer.invoke('hermes:enterprise:wecom-refresh'),
+    selectLoginMethod: method => ipcRenderer.invoke('hermes:enterprise:login-method-select', method),
     selectModel: model => ipcRenderer.invoke('hermes:enterprise:selectModel', model),
     skillHub: {
       detail: key => ipcRenderer.invoke('hermes:enterprise:skill-hub:detail', key).then(unwrapEnterpriseSkillHub),
@@ -38,6 +48,7 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
         ipcRenderer.invoke('hermes:enterprise:skill-hub:install', payload).then(unwrapEnterpriseSkillHub),
       list: query => ipcRenderer.invoke('hermes:enterprise:skill-hub:list', query).then(unwrapEnterpriseSkillHub)
     },
+    setWeComBounds: bounds => ipcRenderer.invoke('hermes:enterprise:wecom-bounds', bounds),
     status: () => ipcRenderer.invoke('hermes:enterprise:status')
   },
   redactSensitiveText: value => redactManagedText(value, ENTERPRISE_MANAGED_OUTPUTS),

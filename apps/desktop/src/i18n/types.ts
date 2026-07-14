@@ -112,10 +112,25 @@ export interface Translations {
   enterpriseLogin: {
     title: string
     description: string
+    weComTab: string
+    passwordTab: string
+    weComTitle: string
+    weComDescription: string
+    preparingQr: string
+    pendingQr: string
+    verifiedQr: string
+    expiredQr: string
+    deniedQr: string
+    outOfScope: string
+    gatewayOffline: string
+    genericQrError: string
+    passwordError: string
+    expiresIn: (seconds: number) => string
     usernamePlaceholder: string
     passwordPlaceholder: string
     cachedAccount: (account: string) => string
     refresh: string
+    refreshQr: string
     signIn: string
     serviceUnavailable: string
   }

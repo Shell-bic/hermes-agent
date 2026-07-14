@@ -19,6 +19,83 @@ test('resolveEnterpriseRuntimeOptions enables managed mode from gateway url env'
   assert.deepEqual(resolveEnterpriseRuntimeOptions({}), { enabled: false, gatewayUrl: '' })
 })
 
+test('resolveEnterpriseRuntimeOptions loads machine config without requiring a terminal environment', () => {
+  const readFileSync = filePath => {
+    if (filePath !== 'machine.json') {
+      throw Object.assign(new Error('missing'), { code: 'ENOENT' })
+    }
+    return JSON.stringify({ schemaVersion: 1, enabled: true, gatewayUrl: 'https://machine-gateway.example.com/' })
+  }
+
+  assert.deepEqual(resolveEnterpriseRuntimeOptions({}, { configPaths: ['machine.json'], readFileSync }), {
+    enabled: true,
+    gatewayUrl: 'https://machine-gateway.example.com'
+  })
+})
+
+test('resolveEnterpriseRuntimeOptions keeps machine deployment config over user environment', () => {
+  const readFileSync = () => JSON.stringify({ schemaVersion: 1, gatewayUrl: 'https://machine.example.com' })
+
+  assert.deepEqual(
+    resolveEnterpriseRuntimeOptions(
+      { HERMES_ENTERPRISE_GATEWAY_URL: 'https://override.example.com' },
+      { configPaths: ['machine.json'], readFileSync }
+    ),
+    { enabled: true, gatewayUrl: 'https://machine.example.com' }
+  )
+})
+
+test('resolveEnterpriseRuntimeOptions uses environment only when no deployment config exists', () => {
+  const readFileSync = () => {
+    throw Object.assign(new Error('missing'), { code: 'ENOENT' })
+  }
+
+  assert.deepEqual(
+    resolveEnterpriseRuntimeOptions(
+      { HERMES_ENTERPRISE_GATEWAY_URL: 'https://dev-gateway.example.com/' },
+      { configPaths: ['machine.json', 'portable.json', 'user.json'], readFileSync }
+    ),
+    { enabled: true, gatewayUrl: 'https://dev-gateway.example.com' }
+  )
+})
+
+test('resolveEnterpriseRuntimeOptions lets an explicit disabled deployment config block environment fallback', () => {
+  const readFileSync = filePath => {
+    if (filePath === 'machine.json') {
+      return JSON.stringify({ schemaVersion: 1, enabled: false })
+    }
+    throw Object.assign(new Error('missing'), { code: 'ENOENT' })
+  }
+
+  assert.deepEqual(
+    resolveEnterpriseRuntimeOptions(
+      { HERMES_ENTERPRISE_GATEWAY_URL: 'https://user-override.example.com' },
+      { configPaths: ['machine.json', 'portable.json'], readFileSync }
+    ),
+    { enabled: false, gatewayUrl: '' }
+  )
+})
+
+test('resolveEnterpriseRuntimeOptions rejects unsafe environment gateway URLs', () => {
+  for (const [gatewayUrl, message] of [
+    ['http://10.0.0.5:5100', /must use https/],
+    ['https://user:password@gateway.example.com', /must not contain credentials/],
+    ['https://gateway.example.com?tenant=one', /must not contain a query or fragment/],
+    ['https://gateway.example.com#login', /must not contain a query or fragment/],
+    ['https://gateway.example.com/wecom', /must be an origin without a path/]
+  ]) {
+    assert.throws(() => resolveEnterpriseRuntimeOptions({ HERMES_ENTERPRISE_GATEWAY_URL: gatewayUrl }), message)
+  }
+
+  assert.throws(
+    () =>
+      resolveEnterpriseRuntimeOptions({
+        HERMES_DESKTOP_ENTERPRISE_GATEWAY_URL: 'https://legacy.example.com/unsafe-path'
+      }),
+    /must be an origin without a path/
+  )
+})
+
 test('enterprise unauthenticated state carries the default ui policy', () => {
   const state = unauthenticatedState()
 
@@ -103,6 +180,74 @@ test('enterprise runtime prepares managed launch without exposing gateway token 
     ['profiles', 'desktop-token'],
     ['manifest', 'desktop-token', { preferredModel: 'm1', preferredModelProfileId: 'm1' }]
   ])
+})
+
+test('enterprise runtime accepts a WeCom session through the same private session writer', async () => {
+  const writes = []
+  const runtime = createEnterpriseRuntime({
+    authStore: {
+      readSession: () => null,
+      writeSession: session => writes.push(session)
+    },
+    client: {},
+    enabled: true,
+    gatewayUrl: 'https://gw.example.com'
+  })
+
+  const state = await runtime.acceptLoginSession({
+    desktopToken: 'dsk_secret',
+    expiresAt: '2099-07-13T00:00:00Z',
+    user: { displayName: 'Ada' }
+  })
+  assert.equal(state.authenticated, true)
+  assert.deepEqual(state.user, { displayName: 'Ada' })
+  assert.equal(JSON.stringify(state).includes('dsk_secret'), false)
+  assert.equal(writes.length, 1)
+})
+
+test('enterprise runtime revokes a newly issued session when secure persistence fails', async () => {
+  const calls = []
+  const runtime = createEnterpriseRuntime({
+    authStore: {
+      clear: () => calls.push(['clear']),
+      writeSession: () => {
+        throw new Error('secure storage unavailable')
+      }
+    },
+    client: {
+      logout: async token => calls.push(['logout', token])
+    },
+    enabled: true,
+    gatewayUrl: 'https://gw.example.com'
+  })
+
+  await assert.rejects(
+    runtime.acceptLoginSession({ desktopToken: 'dsk_orphan', user: { displayName: 'Ada' } }),
+    /secure storage unavailable/
+  )
+  assert.deepEqual(calls, [['clear'], ['logout', 'dsk_orphan']])
+  assert.equal(runtime.getPublicState().authenticated, false)
+})
+
+test('enterprise runtime clears a rejected stored session instead of treating it as offline', async () => {
+  let cleared = 0
+  const runtime = createEnterpriseRuntime({
+    authStore: {
+      clear: () => (cleared += 1),
+      readSession: () => ({ desktopToken: 'dsk_stale' })
+    },
+    client: {
+      me: async () => {
+        throw Object.assign(new Error('Unauthorized'), { status: 401 })
+      }
+    },
+    enabled: true,
+    gatewayUrl: 'https://gw.example.com'
+  })
+
+  const state = await runtime.refreshPublicState()
+  assert.equal(state.authenticated, false)
+  assert.equal(cleared, 1)
 })
 
 test('enterprise runtime manifest body sends preferredModel only when selected', () => {
@@ -264,7 +409,9 @@ test('enterprise runtime selectModel validates policy and rewrites managed home 
           defaultModel: payload.manifest.defaultModel,
           enabled: true,
           lockedSurfaces: ['providers'],
-          modelProfiles: payload.manifest.modelProfiles.map(({ providerSecret, ...profile }) => profile),
+          modelProfiles: payload.manifest.modelProfiles.map(profile =>
+            Object.fromEntries(Object.entries(profile).filter(([key]) => key !== 'providerSecret'))
+          ),
           policyVersion: 'pv-2',
           role: null,
           runtimeDefaults: payload.manifest.runtimeDefaults,

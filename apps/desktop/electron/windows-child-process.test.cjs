@@ -11,14 +11,15 @@ function readElectronFile(name) {
   return fs.readFileSync(path.join(ELECTRON_DIR, name), 'utf8').replace(/\r\n/g, '\n')
 }
 
-function requireHiddenChildOptions(source, needle) {
-  const index = source.indexOf(needle)
-  assert.notEqual(index, -1, `missing call site: ${needle}`)
+function requireHiddenChildOptions(source, callSite) {
+  const match = source.match(callSite)
+  const index = match?.index ?? -1
+  assert.notEqual(index, -1, `missing call site: ${callSite}`)
   const snippet = source.slice(index, index + 700)
   assert.match(
     snippet,
     /hiddenWindowsChildOptions\(/,
-    `expected ${needle} to wrap child-process options with hiddenWindowsChildOptions`
+    `expected ${callSite} to wrap child-process options with hiddenWindowsChildOptions`
   )
 }
 
@@ -27,15 +28,15 @@ test('desktop background child processes opt into hidden Windows consoles', () =
 
   assert.match(source, /function hiddenWindowsChildOptions\(options = \{\}\)/)
 
-  requireHiddenChildOptions(source, "execFileSync(\n          'reg'")
-  requireHiddenChildOptions(source, 'execFileSync(pyExe')
-  requireHiddenChildOptions(source, 'spawn(resolveGitBinary()')
-  requireHiddenChildOptions(source, "execFileSync('taskkill'")
-  requireHiddenChildOptions(source, 'spawn(command, args')
-  requireHiddenChildOptions(source, "spawn('curl'")
-  requireHiddenChildOptions(source, 'spawn(backend.command, backend.args')
-  requireHiddenChildOptions(source, 'hermesProcess = spawn(backend.command, backend.args')
-  requireHiddenChildOptions(source, "spawn(py, ['-m', 'hermes_cli.main', 'uninstall', '--gui-summary']")
+  requireHiddenChildOptions(source, /execFileSync\(\s*'reg'/)
+  requireHiddenChildOptions(source, /execFileSync\(\s*pyExe,/)
+  requireHiddenChildOptions(source, /const child = spawn\(\s*resolveGitBinary\(\),/)
+  requireHiddenChildOptions(source, /execFileSync\(\s*'taskkill'/)
+  requireHiddenChildOptions(source, /child = spawn\(\s*command,\s*args,/)
+  requireHiddenChildOptions(source, /spawn\(\s*'curl',\s*args,/)
+  requireHiddenChildOptions(source, /const child = spawn\(\s*backend\.command,\s*backend\.args,/)
+  requireHiddenChildOptions(source, /hermesProcess = spawn\(\s*backend\.command,\s*backend\.args,/)
+  requireHiddenChildOptions(source, /const child = spawn\(\s*py,\s*\['-m', 'hermes_cli\.main', 'uninstall', '--gui-summary'\],/)
 })
 
 test('intentional or interactive desktop child processes stay documented', () => {
@@ -53,5 +54,5 @@ test('bootstrap PowerShell runner hides Windows console children', () => {
   const source = readElectronFile('bootstrap-runner.cjs')
 
   assert.match(source, /function hiddenWindowsChildOptions\(options = \{\}\)/)
-  requireHiddenChildOptions(source, 'spawn(ps, fullArgs')
+  requireHiddenChildOptions(source, /spawn\(\s*ps,\s*fullArgs,/)
 })

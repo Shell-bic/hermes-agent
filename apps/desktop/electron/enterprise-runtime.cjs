@@ -1,4 +1,8 @@
-const { createEnterpriseGatewayClient, normalizeEnterpriseGatewayBaseUrl } = require('./enterprise-gateway-client.cjs')
+const { createEnterpriseGatewayClient } = require('./enterprise-gateway-client.cjs')
+const {
+  findEnterpriseDesktopConfig,
+  normalizeEnterpriseDesktopGatewayUrl
+} = require('./enterprise-desktop-config.cjs')
 const {
   ENTERPRISE_UI_POLICY_DEFAULT,
   resolveManagedHermesHome,
@@ -7,13 +11,22 @@ const {
 
 const ENTERPRISE_PROFILE_PREFIX = 'enterprise-profile:'
 
-function resolveEnterpriseRuntimeOptions(env = process.env) {
-  const gatewayUrl = String(env.HERMES_ENTERPRISE_GATEWAY_URL || env.HERMES_DESKTOP_ENTERPRISE_GATEWAY_URL || '').trim()
-  const enabled = gatewayUrl.length > 0 || env.HERMES_ENTERPRISE_DESKTOP === '1'
+function resolveEnterpriseRuntimeOptions(env = process.env, { configPaths = [], readFileSync } = {}) {
+  const { config, configPath } = findEnterpriseDesktopConfig(configPaths, { readFileSync })
+  const hasDeploymentConfig = configPath !== null
+  const rawGatewayUrl = hasDeploymentConfig
+    ? config.gatewayUrl
+    : String(env.HERMES_ENTERPRISE_GATEWAY_URL || env.HERMES_DESKTOP_ENTERPRISE_GATEWAY_URL || '').trim()
+  const gatewayUrl = rawGatewayUrl
+    ? normalizeEnterpriseDesktopGatewayUrl(rawGatewayUrl, hasDeploymentConfig ? configPath : 'environment')
+    : ''
+  const enabled = hasDeploymentConfig
+    ? config.enabled
+    : gatewayUrl.length > 0 || env.HERMES_ENTERPRISE_DESKTOP === '1'
 
   return {
     enabled,
-    gatewayUrl: gatewayUrl ? normalizeEnterpriseGatewayBaseUrl(gatewayUrl) : ''
+    gatewayUrl
   }
 }
 
@@ -221,7 +234,25 @@ class EnterpriseRuntime {
     }
 
     const session = await this.client.login(credentials)
-    this.authStore.writeSession(session)
+    return this.acceptLoginSession(session)
+  }
+
+  async acceptLoginSession(session) {
+    if (!this.enabled) {
+      return disabledState()
+    }
+
+    try {
+      this.authStore.writeSession(session)
+    } catch (error) {
+      this.authStore.clear?.()
+      if (session?.desktopToken) {
+        await this.client.logout(session.desktopToken).catch(logoutError => {
+          this.rememberLog(`[enterprise] rejected session revoke failed: ${logoutError.message}`)
+        })
+      }
+      throw error
+    }
     this.lastPublicState = {
       ...unauthenticatedState(),
       authenticated: true,
@@ -275,6 +306,9 @@ class EnterpriseRuntime {
         user: me?.user || me?.account || session.user || null
       }
     } catch (error) {
+      if (error?.status === 401 || error?.status === 403) {
+        this.authStore.clear()
+      }
       this.lastPublicState = unauthenticatedState(error.message)
     }
 
