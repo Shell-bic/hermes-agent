@@ -15,6 +15,9 @@ class _DummyLockFile:
     def list_installed(self):
         return self._installed
 
+    def ensure_exists(self):
+        return None
+
 
 @pytest.fixture()
 def hub_env(monkeypatch, tmp_path):
@@ -55,7 +58,7 @@ def three_source_env(monkeypatch, hub_env):
     import tools.skills_sync as skills_sync
     import tools.skills_tool as skills_tool
 
-    monkeypatch.setattr(hub, "HubLockFile", lambda: _DummyLockFile([_HUB_ENTRY]))
+    monkeypatch.setattr(hub, "HubLockFile", lambda *_args: _DummyLockFile([_HUB_ENTRY]))
     monkeypatch.setattr(skills_tool, "_find_all_skills", lambda **_kwargs: list(_ALL_THREE_SKILLS))
     monkeypatch.setattr(skills_sync, "_read_manifest", lambda: dict(_BUILTIN_MANIFEST))
 
@@ -247,6 +250,20 @@ def test_do_update_reinstalls_outdated_skills(monkeypatch):
 
     assert installs == [("skills-sh/example/repo/hub-skill", "category", True)]
     assert "Updated 1 skill" in output
+
+
+def test_do_update_never_routes_enterprise_entries_to_public_force_install(monkeypatch):
+    output, installs = _capture_update(monkeypatch, [
+        {
+            "name": "managed-skill",
+            "identifier": "managed-skill",
+            "source": "enterprise",
+            "status": "update_available",
+        },
+    ])
+
+    assert installs == []
+    assert "No updates available" in output
 
 
 def test_handle_skills_slash_search_accepts_chatconsole_without_status_errors():
@@ -469,6 +486,44 @@ def _install_mocks(monkeypatch, tmp_path, source_factory, category_hint=""):
     monkeypatch.setattr(guard, "format_scan_report", lambda result: "scan ok")
     monkeypatch.setattr(guard, "should_allow_install", lambda result, force=False: (True, "ok"))
     return install_calls
+
+
+def test_public_force_install_refuses_enterprise_provenance(
+    monkeypatch, tmp_path, hub_env,
+):
+    import tools.skills_hub as hub
+
+    installs = _install_mocks(
+        monkeypatch,
+        tmp_path,
+        _make_url_bundle_fetcher(name="managed-skill", awaiting_name=False),
+    )
+    monkeypatch.setattr(
+        hub,
+        "HubLockFile",
+        lambda: type(
+            "Lock",
+            (),
+            {
+                "get_installed": lambda self, _name: {
+                    "source": "enterprise",
+                    "install_path": "enterprise/managed-skill",
+                }
+            },
+        )(),
+    )
+    sink = StringIO()
+    console = Console(file=sink, force_terminal=False, color_system=None)
+
+    do_install(
+        "https://example.com/managed-skill/SKILL.md",
+        console=console,
+        skip_confirm=True,
+        force=True,
+    )
+
+    assert installs == []
+    assert "Enterprise-managed skills cannot be replaced" in sink.getvalue()
 
 
 def test_url_install_uses_name_override_on_non_interactive_surface(monkeypatch, tmp_path, hub_env):

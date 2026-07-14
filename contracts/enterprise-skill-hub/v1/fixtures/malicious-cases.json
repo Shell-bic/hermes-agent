@@ -1,0 +1,13 @@
+[
+  { "id": "missing-skill-md", "kind": "archive", "expectedError": "invalid_package" },
+  { "id": "frontmatter-name-mismatch", "kind": "directory", "expectedError": "skill_name_mismatch" },
+  { "id": "path-traversal", "kind": "archive", "entry": "../outside.txt", "expectedError": "invalid_package" },
+  { "id": "absolute-posix-path", "kind": "archive", "entry": "/outside.txt", "expectedError": "invalid_package" },
+  { "id": "absolute-windows-drive", "kind": "archive", "entry": "C:/outside.txt", "expectedError": "invalid_package" },
+  { "id": "duplicate-case-collision", "kind": "archive", "entries": ["assets/A.txt", "assets/a.txt"], "expectedError": "invalid_package" },
+  { "id": "symlink-entry", "kind": "archive", "entry": "assets/link", "expectedError": "invalid_package" },
+  { "id": "too-many-files", "kind": "archive", "expectedError": "too_many_files" },
+  { "id": "file-too-large", "kind": "archive", "expectedError": "file_too_large" },
+  { "id": "extracted-content-too-large", "kind": "archive", "expectedError": "extracted_content_too_large" },
+  { "id": "artifact-hash-mismatch", "kind": "install", "expectedError": "artifact_hash_mismatch" }
+]

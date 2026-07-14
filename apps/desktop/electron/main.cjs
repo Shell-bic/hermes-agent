@@ -92,6 +92,8 @@ const {
 const { createEnterpriseAuthStore } = require('./enterprise-auth-store.cjs')
 const { createEnterpriseGatewayClient } = require('./enterprise-gateway-client.cjs')
 const { createEnterpriseRuntime, resolveEnterpriseRuntimeOptions } = require('./enterprise-runtime.cjs')
+const { createEnterpriseSkillHub, publicError: publicEnterpriseSkillHubError } = require('./enterprise-skill-hub.cjs')
+const { isTrustedRendererUrl } = require('./renderer-trust.cjs')
 
 let nodePty = null
 let nodePtyDir = null
@@ -345,19 +347,59 @@ const DESKTOP_PROFILE_CONFIG_PATH = path.join(app.getPath('userData'), 'active-p
 const ENTERPRISE_AUTH_STORE_PATH = path.join(app.getPath('userData'), 'enterprise', 'desktop-auth.json')
 const ENTERPRISE_RUNTIME_OPTIONS = resolveEnterpriseRuntimeOptions(process.env)
 const ENTERPRISE_MANAGED_OUTPUTS = ENTERPRISE_RUNTIME_OPTIONS.enabled || isEnterpriseManagedEnv(process.env)
+const enterpriseAuthStore = createEnterpriseAuthStore({
+  filePath: ENTERPRISE_AUTH_STORE_PATH,
+  safeStorage
+})
+const enterpriseGatewayClient = ENTERPRISE_RUNTIME_OPTIONS.gatewayUrl
+  ? createEnterpriseGatewayClient({ baseUrl: ENTERPRISE_RUNTIME_OPTIONS.gatewayUrl })
+  : null
 const enterpriseRuntime = createEnterpriseRuntime({
-  authStore: createEnterpriseAuthStore({
-    filePath: ENTERPRISE_AUTH_STORE_PATH,
-    safeStorage
-  }),
-  client: ENTERPRISE_RUNTIME_OPTIONS.gatewayUrl
-    ? createEnterpriseGatewayClient({ baseUrl: ENTERPRISE_RUNTIME_OPTIONS.gatewayUrl })
-    : null,
+  authStore: enterpriseAuthStore,
+  client: enterpriseGatewayClient,
   enabled: ENTERPRISE_RUNTIME_OPTIONS.enabled,
   gatewayUrl: ENTERPRISE_RUNTIME_OPTIONS.gatewayUrl,
   rememberLog,
   userDataPath: app.getPath('userData')
 })
+const enterpriseSkillHub = createEnterpriseSkillHub({
+  authStore: enterpriseAuthStore,
+  client: enterpriseGatewayClient,
+  localConnection: () => ensureBackend(primaryProfileKey())
+})
+
+function isTrustedDesktopRendererUrl(url) {
+  return isTrustedRendererUrl(url, {
+    devServer: DEV_SERVER,
+    rendererEntryUrl: DEV_SERVER ? null : pathToFileURL(resolveRendererIndex()).toString()
+  })
+}
+
+async function enterpriseSkillHubIpc(event, operation) {
+  if (!isTrustedDesktopRendererUrl(event?.senderFrame?.url)) {
+    rememberLog('[enterprise-skill-hub] rejected untrusted renderer IPC')
+    return {
+      error: {
+        code: 'enterprise_skill_hub_untrusted_renderer',
+        message: 'Enterprise Skill Hub is available only from the Hermes Desktop renderer.',
+        status: 403
+      },
+      ok: false
+    }
+  }
+  if (!enterpriseRuntime.isEnabled() || !enterpriseGatewayClient) {
+    return {
+      error: { code: 'enterprise_skill_hub_disabled', message: 'Enterprise Skill Hub is not configured.', status: null },
+      ok: false
+    }
+  }
+  try {
+    return { ok: true, value: await operation() }
+  } catch (error) {
+    rememberLog(`[enterprise-skill-hub] ${error?.code || 'error'} status=${error?.status || 'n/a'}`)
+    return { error: publicEnterpriseSkillHubError(error), ok: false }
+  }
+}
 
 function enterpriseAuthRequiredError() {
   const error = new Error('Enterprise sign-in is required before starting Hermes.')
@@ -5258,7 +5300,7 @@ function wireCommonWindowHandlers(win) {
     return { action: 'deny' }
   })
   win.webContents.on('will-navigate', (event, url) => {
-    if ((DEV_SERVER && url.startsWith(DEV_SERVER)) || (!DEV_SERVER && url.startsWith('file:'))) {
+    if (isTrustedDesktopRendererUrl(url)) {
       return
     }
 
@@ -5489,6 +5531,15 @@ ipcMain.handle('hermes:enterprise:logout', async () => {
   await teardownPrimaryBackendAndWait()
   return state
 })
+ipcMain.handle('hermes:enterprise:skill-hub:list', async (event, query) =>
+  enterpriseSkillHubIpc(event, () => enterpriseSkillHub.list(query || {}))
+)
+ipcMain.handle('hermes:enterprise:skill-hub:detail', async (event, key) =>
+  enterpriseSkillHubIpc(event, () => enterpriseSkillHub.detail(key))
+)
+ipcMain.handle('hermes:enterprise:skill-hub:install', async (event, payload) =>
+  enterpriseSkillHubIpc(event, () => enterpriseSkillHub.install(payload || {}))
+)
 
 ipcMain.handle('hermes:connection', async (_event, profile) => ensureBackend(profile))
 // Reconnect-after-wake recovery. A REMOTE primary backend has no child process,

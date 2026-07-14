@@ -551,9 +551,11 @@ export interface Translations {
   skills: {
     tabSkills: string
     tabToolsets: string
+    tabEnterprise: string
     all: string
     searchSkills: string
     searchToolsets: string
+    searchEnterprise: string
     refresh: string
     refreshing: string
     loading: string
@@ -561,6 +563,20 @@ export interface Translations {
     noSkillsDesc: string
     noToolsetsTitle: string
     noToolsetsDesc: string
+    noEnterpriseTitle: string
+    noEnterpriseDesc: string
+    enterpriseSignInTitle: string
+    enterpriseSignInDesc: string
+    enterpriseInstall: string
+    enterpriseInstalling: string
+    enterpriseInstalled: string
+    enterpriseUpdateAvailable: string
+    enterpriseUpdateUnsupported: string
+    enterpriseRevision: (revision: number) => string
+    enterpriseFiles: (count: number) => string
+    enterpriseLoadFailed: string
+    enterpriseInstallFailed: (name: string) => string
+    enterpriseInstallSucceeded: string
     noDescription: string
     skillGuidance: string
     toolCapability: string

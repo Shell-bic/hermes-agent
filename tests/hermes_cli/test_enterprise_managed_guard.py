@@ -166,6 +166,51 @@ def managed_tool_policy_gateway_capability_entries(tmp_path, monkeypatch):
 
 
 @pytest.fixture
+def managed_gateway_runtime_policy(tmp_path, monkeypatch):
+    """Match the policy shape written from a real Gateway runtime manifest."""
+
+    policy_path = tmp_path / "enterprise-gateway-runtime-policy.json"
+    policy_path.write_text(
+        json.dumps(
+            {
+                "allowedModels": ["allowed/model"],
+                "capabilities": {
+                    "reasoning": True,
+                    "tools": True,
+                    "contextWindowTokens": 131072,
+                },
+                "currentModel": "allowed/model",
+                "defaultModel": "allowed/model",
+                "role": [
+                    {
+                        "name": "default-employee",
+                        "capabilities": [
+                            "chat.completions",
+                            "messages",
+                            "skills.manage",
+                        ],
+                    }
+                ],
+                "toolPolicySnapshot": {
+                    "policyVersion": "tool-policy.v1+roles:v2",
+                    "skills": [
+                        {"key": "expense-review", "status": "available"},
+                    ],
+                    "capabilityFlags": [
+                        {"key": "capability.file.write", "status": "available"},
+                        {"key": "capability.terminal.shell", "status": "blocked"},
+                    ],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_ENTERPRISE_MANAGED", "1")
+    monkeypatch.setenv("HERMES_ENTERPRISE_TOOL_POLICY_FILE", str(policy_path))
+    return policy_path
+
+
+@pytest.fixture
 def managed_tool_policy_blocked_skill_capability(tmp_path, monkeypatch):
     policy_path = tmp_path / "enterprise-tool-policy-blocked-skill-capability.json"
     policy_path.write_text(
@@ -271,6 +316,55 @@ def test_gateway_capability_entries_default_unlisted_capabilities_to_allowed(
         json={"name": "local-mcp", "url": "http://localhost:9999/sse"},
     )
     assert mcp_resp.status_code == 200
+
+
+def test_gateway_runtime_role_capabilities_grant_coarse_skill_surface(
+    managed_gateway_runtime_policy,
+):
+    from hermes_cli.enterprise_policy import require_surface_allowed
+
+    require_surface_allowed("skills", capability="skills.manage")
+
+
+def test_gateway_runtime_role_capabilities_are_union_across_roles(
+    managed_gateway_runtime_policy,
+):
+    from hermes_cli.enterprise_policy import require_surface_allowed
+
+    policy = json.loads(managed_gateway_runtime_policy.read_text(encoding="utf-8"))
+    policy["role"] = [
+        {"name": "reader", "capabilities": ["messages"]},
+        {"name": "skill-manager", "capabilities": ["skills.manage"]},
+    ]
+    managed_gateway_runtime_policy.write_text(json.dumps(policy), encoding="utf-8")
+
+    require_surface_allowed("skills", capability="skills.manage")
+
+
+def test_gateway_runtime_role_capabilities_deny_ungranted_coarse_skill_surface(
+    managed_gateway_runtime_policy,
+):
+    from hermes_cli.enterprise_policy import EnterprisePolicyDenied, require_surface_allowed
+
+    policy = json.loads(managed_gateway_runtime_policy.read_text(encoding="utf-8"))
+    policy["role"][0]["capabilities"] = ["chat.completions", "messages"]
+    managed_gateway_runtime_policy.write_text(json.dumps(policy), encoding="utf-8")
+
+    with pytest.raises(EnterprisePolicyDenied, match="capability 'skills.manage' is disabled"):
+        require_surface_allowed("skills", capability="skills.manage")
+
+
+def test_legacy_top_level_capability_explicit_value_precedes_runtime_roles(
+    managed_gateway_runtime_policy,
+):
+    from hermes_cli.enterprise_policy import EnterprisePolicyDenied, require_surface_allowed
+
+    policy = json.loads(managed_gateway_runtime_policy.read_text(encoding="utf-8"))
+    policy["capabilities"]["skills.manage"] = False
+    managed_gateway_runtime_policy.write_text(json.dumps(policy), encoding="utf-8")
+
+    with pytest.raises(EnterprisePolicyDenied, match="capability 'skills.manage' is disabled"):
+        require_surface_allowed("skills", capability="skills.manage")
 
 
 def test_gateway_capability_entries_block_listed_skill_manage(

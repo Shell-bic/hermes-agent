@@ -40,6 +40,11 @@ declare global {
         logout: () => Promise<EnterpriseDesktopState>
         refresh: () => Promise<EnterpriseDesktopState>
         selectModel: (model: string) => Promise<EnterpriseDesktopState>
+        skillHub: {
+          detail: (key: string) => Promise<EnterpriseSkillHubItem>
+          install: (payload: EnterpriseSkillHubInstallInput) => Promise<EnterpriseSkillHubInstallResult>
+          list: (query?: EnterpriseSkillHubListQuery) => Promise<EnterpriseSkillHubPage>
+        }
         status: () => Promise<EnterpriseDesktopState>
       }
       redactSensitiveText: (value: unknown) => string
@@ -344,6 +349,59 @@ export interface DesktopOauthLogoutResult {
 export interface EnterpriseDesktopLoginInput {
   password: string
   username: string
+}
+
+export type EnterpriseSkillHubInstallState = 'installed' | 'not-installed' | 'update-not-supported'
+export type EnterpriseSkillHubPolicyStatus = EnterpriseToolPolicyStatus
+
+export interface EnterpriseSkillHubItem {
+  artifactSha256: string
+  artifactSizeBytes: number
+  category: string
+  currentRevision: number
+  declaredVersion: null | string
+  description: string
+  fileCount: number
+  installedArtifactSha256: null | string
+  installedRevision: null | number
+  installState: EnterpriseSkillHubInstallState
+  key: string
+  name: string
+  policyReason: null | string
+  policyStatus: EnterpriseSkillHubPolicyStatus
+  publishedAt: null | string
+}
+
+export interface EnterpriseSkillHubListQuery {
+  category?: string
+  page?: number
+  pageSize?: number
+  q?: string
+}
+
+export interface EnterpriseSkillHubPage {
+  items: EnterpriseSkillHubItem[]
+  page: number
+  pageSize: number
+  total: number
+}
+
+export interface EnterpriseSkillHubInstallInput {
+  key: string
+  revision: number
+}
+
+export interface EnterpriseSkillHubInstalledItem {
+  artifactSha256: string
+  key: string
+  name: string
+  revision: number
+  state: string
+}
+
+export interface EnterpriseSkillHubInstallResult {
+  installed: EnterpriseSkillHubInstalledItem
+  item: EnterpriseSkillHubItem
 }
 
 export type EnterpriseDesktopStatus = 'authenticated' | 'disabled' | 'error' | 'loading' | 'unauthenticated'

@@ -1122,20 +1122,60 @@ def _capability_value(name: str, policy: Optional[Mapping[str, Any]] = None) -> 
     if isinstance(caps, list):
         normalized = {str(item).strip().lower() for item in caps}
         return name.lower() in normalized
-    if not isinstance(caps, dict):
-        return None
-    raw = caps.get(name)
-    if raw is None:
-        raw = caps.get(name.replace(".", ":"))
-    if raw is None:
-        raw = caps.get(name.replace(".", "_"))
-    if isinstance(raw, bool):
-        return raw
-    if isinstance(raw, dict):
-        for key in ("enabled", "allowed", "allow"):
-            if isinstance(raw.get(key), bool):
-                return raw[key]
-    return None
+    if isinstance(caps, dict):
+        raw = caps.get(name)
+        if raw is None:
+            raw = caps.get(name.replace(".", ":"))
+        if raw is None:
+            raw = caps.get(name.replace(".", "_"))
+        if isinstance(raw, bool):
+            return raw
+        if isinstance(raw, dict):
+            for key in ("enabled", "allowed", "allow"):
+                if isinstance(raw.get(key), bool):
+                    return raw[key]
+
+    # Runtime manifests use ``capabilities`` for model features (reasoning,
+    # context window, and so on).  Coarse-grained management grants remain on
+    # the role records preserved in the managed policy snapshot.  Read those
+    # only when the legacy top-level field did not explicitly decide the
+    # requested capability.  Multiple roles are additive, matching Gateway's
+    # bootstrap capability union.
+    raw_roles = _policy_value_any(policy, "role", "roles")
+    if isinstance(raw_roles, dict):
+        roles = [raw_roles]
+    elif isinstance(raw_roles, list):
+        roles = [role for role in raw_roles if isinstance(role, dict)]
+    else:
+        roles = []
+
+    capability = name.lower()
+    saw_role_capabilities = False
+    for role in roles:
+        role_capabilities = role.get("capabilities")
+        if isinstance(role_capabilities, list):
+            saw_role_capabilities = True
+            normalized = {str(item).strip().lower() for item in role_capabilities}
+            if capability in normalized:
+                return True
+            continue
+        if not isinstance(role_capabilities, dict):
+            continue
+
+        saw_role_capabilities = True
+        raw = role_capabilities.get(name)
+        if raw is None:
+            raw = role_capabilities.get(name.replace(".", ":"))
+        if raw is None:
+            raw = role_capabilities.get(name.replace(".", "_"))
+        if raw is True:
+            return True
+        if isinstance(raw, dict) and any(
+            raw.get(key) is True for key in ("enabled", "allowed", "allow")
+        ):
+            return True
+
+    return False if saw_role_capabilities else None
 
 
 def denial_message(action: str, reason: str = "") -> str:

@@ -520,6 +520,14 @@ async def auth_middleware(request: Request, call_next):
     path = request.url.path
     if path.startswith("/api/") and path not in _PUBLIC_API_PATHS:
         if not _has_valid_session_token(request) and not _has_valid_query_token(request, path):
+            if path.startswith("/api/skills/enterprise/"):
+                return JSONResponse(
+                    status_code=401,
+                    content={
+                        "code": "desktop_session_required",
+                        "message": "A valid desktop session is required.",
+                    },
+                )
             return JSONResponse(
                 status_code=401,
                 content={"detail": "Unauthorized"},
@@ -8681,6 +8689,153 @@ async def prune_checkpoints():
 # actions whose logs the dashboard tails.  The already-installed skill list +
 # enable/disable toggle live in the existing /api/skills endpoints.
 # ---------------------------------------------------------------------------
+
+
+_ENTERPRISE_ARTIFACT_SHA256_HEADER = "X-Hermes-Artifact-Sha256"
+
+
+def _enterprise_install_error_response(exc):
+    """Map installer failures to the frozen public error-code contract."""
+
+    from tools.enterprise_skills import EnterpriseSkillInstallError
+
+    if not isinstance(exc, EnterpriseSkillInstallError):
+        _log.error(
+            "Unexpected enterprise skill installer failure type=%s",
+            type(exc).__name__,
+        )
+        return JSONResponse(
+            status_code=500,
+            content={"message": "Enterprise skill installation failed."},
+        )
+    if exc.status_code >= 500:
+        _log.error(
+            "Enterprise skill installer internal failure code=%s type=%s",
+            exc.code,
+            type(exc).__name__,
+        )
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={"message": "Enterprise skill installation failed."},
+        )
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"code": exc.code, "message": exc.message},
+    )
+
+
+@app.get("/api/skills/enterprise/installed")
+async def get_installed_enterprise_skills():
+    try:
+        _require_enterprise_surface(
+            "skills",
+            action="/api/skills/enterprise/installed",
+            capability="skills.manage",
+        )
+    except HTTPException as exc:
+        return JSONResponse(
+            status_code=403,
+            content={"code": "skill_policy_denied", "message": str(exc.detail)},
+        )
+
+    try:
+        from tools.enterprise_skills import list_installed_enterprise_skills
+        return await asyncio.to_thread(list_installed_enterprise_skills)
+    except Exception as exc:
+        return _enterprise_install_error_response(exc)
+
+
+@app.post("/api/skills/enterprise/install")
+async def install_enterprise_skill(
+    request: Request,
+    key: str = "",
+    revision: str = "",
+):
+    """Install a gateway-downloaded raw ZIP without gateway credentials."""
+
+    from tools.enterprise_skills import (
+        MAX_ARTIFACT_BYTES,
+        EnterpriseSkillInstallError,
+        install_enterprise_skill as _install,
+        validate_metadata,
+    )
+
+    expected_sha = request.headers.get(_ENTERPRISE_ARTIFACT_SHA256_HEADER, "")
+    try:
+        metadata = validate_metadata(key, revision, expected_sha)
+    except EnterpriseSkillInstallError as exc:
+        return _enterprise_install_error_response(exc)
+
+    try:
+        _require_enterprise_surface(
+            "skills",
+            action="/api/skills/enterprise/install",
+            capability="skills.manage",
+        )
+        _require_enterprise_skill(metadata.key, "/api/skills/enterprise/install")
+    except HTTPException as exc:
+        return JSONResponse(
+            status_code=403,
+            content={"code": "skill_policy_denied", "message": str(exc.detail)},
+        )
+
+    content_type = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+    if content_type != "application/zip":
+        return JSONResponse(
+            status_code=400,
+            content={"code": "invalid_package", "message": "Content-Type must be application/zip."},
+        )
+
+    raw_length = request.headers.get("content-length")
+    try:
+        content_length = int(raw_length) if raw_length is not None else -1
+    except ValueError:
+        content_length = -1
+    if content_length < 1:
+        return JSONResponse(
+            status_code=400,
+            content={"code": "invalid_package", "message": "A positive Content-Length is required."},
+        )
+    if content_length > MAX_ARTIFACT_BYTES:
+        return JSONResponse(
+            status_code=413,
+            content={"code": "artifact_too_large", "message": "Artifact exceeds the configured size limit."},
+        )
+
+    body = bytearray()
+    try:
+        async for chunk in request.stream():
+            body.extend(chunk)
+            if len(body) > MAX_ARTIFACT_BYTES:
+                return JSONResponse(
+                    status_code=413,
+                    content={"code": "artifact_too_large", "message": "Artifact exceeds the configured size limit."},
+                )
+    except Exception as exc:
+        _log.error(
+            "Failed while reading enterprise skill artifact body type=%s",
+            type(exc).__name__,
+        )
+        return JSONResponse(
+            status_code=400,
+            content={"code": "invalid_package", "message": "Artifact body could not be read."},
+        )
+    if len(body) != content_length:
+        return JSONResponse(
+            status_code=400,
+            content={"code": "invalid_package", "message": "Content-Length does not match the artifact body."},
+        )
+
+    try:
+        return await asyncio.to_thread(
+            _install,
+            bytes(body),
+            key=metadata.key,
+            revision=metadata.revision,
+            artifact_sha256=metadata.artifact_sha256,
+        )
+    except Exception as exc:
+        return _enterprise_install_error_response(exc)
 
 
 class SkillInstallRequest(BaseModel):

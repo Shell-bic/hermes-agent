@@ -86,10 +86,28 @@ class EnterpriseGatewayClient {
 
     if (!response.ok) {
       const message = payload?.message || payload?.error || `${response.status} ${response.statusText}`.trim()
-      throw new Error(`Enterprise gateway request failed: ${message}`)
+      const error = new Error(`Enterprise gateway request failed: ${message}`)
+      error.code = payload?.code || payload?.errorCode || 'enterprise_gateway_request_failed'
+      error.status = response.status
+      throw error
     }
 
     return payload
+  }
+
+  requestRaw(path, { method = 'GET', token } = {}) {
+    if (typeof this.fetchImpl !== 'function') {
+      throw new Error('Enterprise gateway client requires fetch.')
+    }
+
+    const url = `${this.baseUrl}${String(path || '').startsWith('/') ? path : '/' + path}`
+    return this.fetchImpl(url, {
+      method,
+      headers: {
+        Accept: 'application/zip',
+        ...(token ? { Authorization: `Bearer ${token}` } : {})
+      }
+    })
   }
 
   async login({ password, username } = {}) {
@@ -133,6 +151,32 @@ class EnterpriseGatewayClient {
       body,
       token
     })
+  }
+
+  skillHubSkills(token, query = {}) {
+    const params = new URLSearchParams()
+    const q = String(query.q || '').trim()
+    const category = String(query.category || '').trim()
+    if (q) params.set('q', q)
+    if (category) params.set('category', category)
+    if (query.page != null) params.set('page', String(query.page))
+    if (query.pageSize != null) params.set('pageSize', String(query.pageSize))
+    const suffix = params.size ? `?${params}` : ''
+    return this.requestJson(`/api/desktop/skill-hub/skills${suffix}`, { token })
+  }
+
+  skillHubSkill(token, key) {
+    const encodedKey = encodeURIComponent(String(key || '').trim())
+    return this.requestJson(`/api/desktop/skill-hub/skills/${encodedKey}`, { token })
+  }
+
+  downloadSkillPackage(token, key, revision) {
+    const encodedKey = encodeURIComponent(String(key || '').trim())
+    const encodedRevision = encodeURIComponent(String(revision || '').trim())
+    return this.requestRaw(
+      `/api/desktop/skill-hub/skills/${encodedKey}/packages/${encodedRevision}/download`,
+      { token }
+    )
   }
 }
 

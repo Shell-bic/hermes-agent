@@ -624,7 +624,12 @@ def scan_file(file_path: Path, rel_path: str = "") -> List[Finding]:
     return findings
 
 
-def scan_skill(skill_path: Path, source: str = "community") -> ScanResult:
+def scan_skill(
+    skill_path: Path,
+    source: str = "community",
+    *,
+    honor_ignore_files: bool = True,
+) -> ScanResult:
     """
     Scan all files in a skill directory for security threats.
 
@@ -644,6 +649,11 @@ def scan_skill(skill_path: Path, source: str = "community") -> ScanResult:
     Args:
         skill_path: Path to the skill directory (must contain SKILL.md)
         source: Source identifier for trust level resolution (e.g. "openai/skills")
+        honor_ignore_files: Whether ``.skillignore`` / ``.clawhubignore`` may
+            exclude files from the scan. Enterprise-delivered artifacts set
+            this to ``False`` so publisher-controlled ignore files cannot
+            weaken the install boundary. The default preserves public Hub and
+            local-skill behavior.
 
     Returns:
         ScanResult with verdict, findings, and trust metadata
@@ -654,7 +664,11 @@ def scan_skill(skill_path: Path, source: str = "community") -> ScanResult:
     all_findings: List[Finding] = []
 
     if skill_path.is_dir():
-        ignore = _load_skill_ignore(skill_path)
+        ignore = (
+            _load_skill_ignore(skill_path)
+            if honor_ignore_files
+            else (lambda _rel: False)
+        )
 
         # Structural checks first (honoring the ignore list)
         all_findings.extend(_check_structure(skill_path, ignore=ignore))
@@ -776,7 +790,14 @@ def content_hash(skill_path: Path) -> str:
     """
     h = hashlib.sha256()
     if skill_path.is_dir():
-        for f in sorted(skill_path.rglob("*")):
+        # Path ordering must match SkillBundle's ordinal POSIX-key ordering.
+        # WindowsPath ordering is case-insensitive and uses platform path
+        # semantics, which produced a different lock hash on Windows.
+        files = sorted(
+            skill_path.rglob("*"),
+            key=lambda path: path.relative_to(skill_path).as_posix(),
+        )
+        for f in files:
             if f.is_file():
                 try:
                     rel = f.relative_to(skill_path).as_posix()

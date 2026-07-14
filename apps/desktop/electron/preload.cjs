@@ -3,6 +3,14 @@ const { isEnterpriseManagedEnv, redactManagedText } = require('./managed-redacti
 
 const ENTERPRISE_MANAGED_OUTPUTS = isEnterpriseManagedEnv(process.env)
 
+function unwrapEnterpriseSkillHub(result) {
+  if (result?.ok) return result.value
+  const error = new Error(result?.error?.message || 'Enterprise Skill Hub request failed.')
+  error.code = result?.error?.code || 'enterprise_skill_hub_error'
+  error.status = result?.error?.status || null
+  throw error
+}
+
 contextBridge.exposeInMainWorld('hermesDesktop', {
   getConnection: profile => ipcRenderer.invoke('hermes:connection', profile),
   revalidateConnection: () => ipcRenderer.invoke('hermes:connection:revalidate'),
@@ -24,6 +32,12 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
     logout: () => ipcRenderer.invoke('hermes:enterprise:logout'),
     refresh: () => ipcRenderer.invoke('hermes:enterprise:refresh'),
     selectModel: model => ipcRenderer.invoke('hermes:enterprise:selectModel', model),
+    skillHub: {
+      detail: key => ipcRenderer.invoke('hermes:enterprise:skill-hub:detail', key).then(unwrapEnterpriseSkillHub),
+      install: payload =>
+        ipcRenderer.invoke('hermes:enterprise:skill-hub:install', payload).then(unwrapEnterpriseSkillHub),
+      list: query => ipcRenderer.invoke('hermes:enterprise:skill-hub:list', query).then(unwrapEnterpriseSkillHub)
+    },
     status: () => ipcRenderer.invoke('hermes:enterprise:status')
   },
   redactSensitiveText: value => redactManagedText(value, ENTERPRISE_MANAGED_OUTPUTS),

@@ -1,0 +1,71 @@
+{
+  "schemaVersion": 1,
+  "catalog": {
+    "skillRoot": "<CatalogRoot>/<key>",
+    "requiredRootFile": "SKILL.md",
+    "keyMustEqualFrontmatterName": true,
+    "keyMaxLength": 64,
+    "keyPattern": "^[\\p{L}\\p{N}._-]+$",
+    "windowsReservedNames": ["CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9"],
+    "rejectTrailingDotOrSpace": true
+  },
+  "limits": {
+    "maxArtifactBytes": 52428800,
+    "maxExtractedBytes": 209715200,
+    "maxFileBytes": 52428800,
+    "maxFileCount": 1000
+  },
+  "inventory": {
+    "pathSeparator": "/",
+    "pathOrder": "ordinal",
+    "caseCollisionComparison": "ordinal-ignore-case",
+    "fileSha256Encoding": "lowercase-hex",
+    "contentDigestRecord": "utf8(path) + 0x00 + ascii(lowercaseFileSha256) + 0x00 + ascii(sizeBytes) + 0x0a",
+    "contentDigest": "sha256(concatenated records in pathOrder)"
+  },
+  "artifact": {
+    "format": "zip",
+    "rootContainsSkillMd": true,
+    "entryTimestampUtc": "1980-01-01T00:00:00Z",
+    "entryOrder": "inventory.pathOrder",
+    "storageName": "<artifactSha256>.zip",
+    "downloadSha256Header": "X-Hermes-Artifact-Sha256",
+    "etag": "quoted artifactSha256"
+  },
+  "gatewayApi": {
+    "basePath": "/api/desktop/skill-hub",
+    "listEnvelopeFields": ["items", "page", "pageSize", "total"],
+    "skillFields": ["key", "name", "description", "category", "declaredVersion", "currentRevision", "artifactSha256", "artifactSizeBytes", "fileCount", "publishedAt", "policyStatus", "policyReason"],
+    "routes": [
+      "GET /skills?q=&category=&page=&pageSize=",
+      "GET /skills/{key}",
+      "GET /skills/{key}/packages/{revision}/download"
+    ]
+  },
+  "localInstallApi": {
+    "installedRoute": "GET /api/skills/enterprise/installed",
+    "installRoute": "POST /api/skills/enterprise/install?key=<urlencoded>&revision=<positive-integer>",
+    "installContentType": "application/zip",
+    "installBody": "raw zip bytes",
+    "artifactSha256Header": "X-Hermes-Artifact-Sha256",
+    "installedEnvelopeField": "items",
+    "installResponse": "one installedFields object",
+    "installedFields": ["key", "name", "revision", "artifactSha256", "state"]
+  },
+  "lock": {
+    "path": ".hub/lock.json",
+    "source": "enterprise",
+    "requiredFields": ["source", "key", "revision", "artifactSha256", "path"],
+    "pathFormat": "enterprise/<name>",
+    "writeMode": "temp-and-replace"
+  },
+  "errors": {
+    "400": ["invalid_skill_key", "invalid_package", "skill_name_mismatch", "artifact_hash_mismatch"],
+    "401": ["desktop_session_required"],
+    "403": ["skill_policy_denied"],
+    "404": ["skill_not_found", "package_not_found"],
+    "409": ["package_revision_changed", "skill_name_conflict", "update_not_supported"],
+    "413": ["artifact_too_large", "extracted_content_too_large", "file_too_large", "too_many_files"],
+    "422": ["skill_scan_rejected"]
+  }
+}

@@ -1,6 +1,8 @@
 """Tests for tools/skills_hub.py — source adapters, lock file, taps, dedup logic."""
 
 import json
+import multiprocessing
+from pathlib import Path
 import time
 from typing import List, Optional
 from unittest.mock import patch, MagicMock
@@ -30,6 +32,26 @@ from tools.skills_hub import (
     _skill_meta_to_dict,
     quarantine_bundle,
 )
+
+
+def _record_hub_lock_in_child(lock_path: str, name: str, start, results) -> None:
+    """Spawn-safe worker proving the sidecar lock merges independent writers."""
+
+    try:
+        start.wait(10)
+        HubLockFile(Path(lock_path)).record_install(
+            name=name,
+            source="github",
+            identifier=f"owner/repo/{name}",
+            trust_level="community",
+            scan_verdict="safe",
+            skill_hash=f"hash-{name}",
+            install_path=name,
+            files=["SKILL.md"],
+        )
+        results.put("")
+    except Exception as exc:  # pragma: no cover - asserted in the parent
+        results.put(repr(exc))
 
 
 # ---------------------------------------------------------------------------
@@ -1164,7 +1186,9 @@ class TestCheckForSkillUpdates:
         skill_dir.mkdir()
         (skill_dir / "SKILL.md").write_text("same content")
         (skill_dir / "references").mkdir()
-        (skill_dir / "references" / "checklist.md").write_text("- [ ] security\n")
+        (skill_dir / "references" / "checklist.md").write_text(
+            "- [ ] security\n", newline=""
+        )
 
         assert bundle_content_hash(bundle) == content_hash(skill_dir)
 
@@ -1227,7 +1251,9 @@ class TestCheckForSkillUpdates:
         skill_dir.mkdir()
         (skill_dir / "SKILL.md").write_bytes(b"# Demo Skill\n")
         (skill_dir / "references").mkdir()
-        (skill_dir / "references" / "checklist.md").write_text("- [ ] security\n")
+        (skill_dir / "references" / "checklist.md").write_text(
+            "- [ ] security\n", newline=""
+        )
 
         assert bundle_content_hash(bundle) == content_hash(skill_dir)
 
@@ -1280,6 +1306,21 @@ class TestCheckForSkillUpdates:
         results = check_for_skill_updates(lock=lock, sources=[source])
 
         assert results[0]["status"] == "up_to_date"
+
+    def test_skips_enterprise_provenance_without_contacting_public_sources(self):
+        lock = MagicMock()
+        lock.list_installed.return_value = [{
+            "name": "managed-skill",
+            "source": "enterprise",
+            "identifier": "managed-skill",
+            "content_hash": "enterprise-hash",
+            "install_path": "enterprise/managed-skill",
+        }]
+        source = MagicMock()
+        source.source_id.return_value = "github"
+
+        assert check_for_skill_updates(lock=lock, sources=[source]) == []
+        source.fetch.assert_not_called()
 
 
 class TestCreateSourceRouter:
@@ -1400,6 +1441,30 @@ class TestHubLockFile:
         assert len(installed) == 2
         names = {e["name"] for e in installed}
         assert names == {"s1", "s2"}
+
+    def test_cross_process_record_install_atomically_merges_all_entries(self, tmp_path):
+        context = multiprocessing.get_context("spawn")
+        start = context.Event()
+        results = context.Queue()
+        lock_path = tmp_path / "lock.json"
+        names = [f"skill-{index}" for index in range(4)]
+        processes = [
+            context.Process(
+                target=_record_hub_lock_in_child,
+                args=(str(lock_path), name, start, results),
+            )
+            for name in names
+        ]
+        for process in processes:
+            process.start()
+        start.set()
+        for process in processes:
+            process.join(30)
+            assert process.exitcode == 0
+
+        assert [results.get(timeout=5) for _ in processes] == [""] * len(processes)
+        assert set(HubLockFile(lock_path).load()["installed"]) == set(names)
+        assert not list(tmp_path.glob("lock.*.tmp"))
 
 
 # ---------------------------------------------------------------------------
@@ -1678,7 +1743,7 @@ class TestOptionalSkillSourceBinaryAssets:
             wav_bytes
         )
         (skill_dir / "assets" / "neutts-cli" / "samples" / "jo.txt").write_text(
-            "hello\n", encoding="utf-8"
+            "hello\n", encoding="utf-8", newline=""
         )
         pycache_dir = skill_dir / "assets" / "neutts-cli" / "src" / "neutts_cli" / "__pycache__"
         pycache_dir.mkdir(parents=True)
@@ -2158,6 +2223,48 @@ class TestInstallPathSafety:
         assert ok is False
         assert victim.exists()
         assert (victim / "important").read_text() == "don't delete me"
+
+    def test_uninstall_restores_directory_when_atomic_lock_write_fails(
+        self, tmp_path, isolated_skills_dir, patch_lock_file, monkeypatch
+    ):
+        from tools.skills_hub import uninstall_skill
+
+        skill_dir = isolated_skills_dir / "managed-skill"
+        skill_dir.mkdir()
+        (skill_dir / "SKILL.md").write_text("safe", encoding="utf-8")
+        lock_path = tmp_path / "lock.json"
+        lock_path.write_text(json.dumps({
+            "version": 1,
+            "installed": {
+                "managed-skill": {
+                    "source": "enterprise",
+                    "identifier": "managed-skill",
+                    "trust_level": "enterprise",
+                    "scan_verdict": "pass",
+                    "content_hash": "h",
+                    "install_path": "managed-skill",
+                    "files": ["SKILL.md"],
+                    "metadata": {},
+                    "installed_at": "now",
+                    "updated_at": "now",
+                }
+            },
+        }), encoding="utf-8")
+        patch_lock_file(lock_path)
+
+        def fail_save(_self, _data):
+            raise OSError("simulated lock write failure")
+
+        monkeypatch.setattr(HubLockFile, "save_locked", fail_save)
+
+        ok, message = uninstall_skill("managed-skill")
+
+        assert ok is False
+        assert "simulated lock write failure" in message
+        assert (skill_dir / "SKILL.md").read_text(encoding="utf-8") == "safe"
+        persisted = json.loads(lock_path.read_text(encoding="utf-8"))
+        assert "managed-skill" in persisted["installed"]
+        assert not list(isolated_skills_dir.glob(".managed-skill.hub-uninstall-*"))
 
     def test_install_from_quarantine_rejects_symlinks(self, tmp_path):
         """Skill install must not follow symlinks that leak file contents

@@ -133,7 +133,10 @@ class TestUninstallPathTraversal:
         skills_dir, hub_dir, victim = hub_setup
         # Create a "skill" that's actually a symlink to victim
         evil_link = skills_dir / "trapdoor"
-        evil_link.symlink_to(victim)
+        try:
+            evil_link.symlink_to(victim, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            pytest.skip("symlink creation unsupported on this platform")
 
         self._write_lock(hub_dir, {
             "trap": {

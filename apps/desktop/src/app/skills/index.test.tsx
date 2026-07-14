@@ -12,6 +12,9 @@ const toggleSkill = vi.fn()
 const toggleToolset = vi.fn()
 const getToolsetConfig = vi.fn()
 const selectToolsetProvider = vi.fn()
+const listEnterpriseSkills = vi.fn()
+const detailEnterpriseSkill = vi.fn()
+const installEnterpriseSkill = vi.fn()
 
 vi.mock('@/hermes', () => ({
   getSkillContent: (name: string) => getSkillContent(name),
@@ -28,6 +31,7 @@ vi.mock('@/hermes', () => ({
 
 // Notifications hit nanostores/timers we don't care about here.
 vi.mock('@/store/notifications', () => ({
+  dismissNotification: vi.fn(),
   notify: vi.fn(),
   notifyError: vi.fn()
 }))
@@ -75,7 +79,7 @@ function managedEnterpriseState(overrides: Record<string, unknown> = {}) {
   }
 }
 
-function renderSkills(tab: 'skills' | 'toolsets' = 'toolsets', locale: Locale = 'en') {
+function renderSkills(tab: 'enterprise' | 'skills' | 'toolsets' = 'toolsets', locale: Locale = 'en') {
   return import('./index').then(({ SkillsView }) =>
     render(
       <I18nProvider configClient={null} initialLocale={locale}>
@@ -88,6 +92,21 @@ function renderSkills(tab: 'skills' | 'toolsets' = 'toolsets', locale: Locale = 
 }
 
 beforeEach(() => {
+  listEnterpriseSkills.mockReset()
+  detailEnterpriseSkill.mockReset()
+  installEnterpriseSkill.mockReset()
+  Object.defineProperty(window, 'hermesDesktop', {
+    configurable: true,
+    value: {
+      enterprise: {
+        skillHub: {
+          detail: (key: string) => detailEnterpriseSkill(key),
+          install: (payload: unknown) => installEnterpriseSkill(payload),
+          list: (query: unknown) => listEnterpriseSkills(query)
+        }
+      }
+    }
+  })
   $enterprise.set(INITIAL_ENTERPRISE_STATE)
   getSkills.mockResolvedValue([])
   getSkillContent.mockResolvedValue({
@@ -99,6 +118,9 @@ beforeEach(() => {
   toggleSkill.mockResolvedValue({ ok: true, name: 'terminal', enabled: true })
   toggleToolset.mockResolvedValue({ ok: true, name: 'web', enabled: false })
   getToolsetConfig.mockResolvedValue({ has_category: false, active_provider: null, providers: [] })
+  listEnterpriseSkills.mockResolvedValue({ items: [], page: 1, pageSize: 100, total: 0 })
+  detailEnterpriseSkill.mockResolvedValue(null)
+  installEnterpriseSkill.mockResolvedValue(null)
 })
 
 afterEach(() => {
@@ -108,6 +130,271 @@ afterEach(() => {
 })
 
 describe('SkillsView toolset management', () => {
+  it('hides Enterprise Discovery outside enterprise mode', async () => {
+    await renderSkills('skills')
+
+    await screen.findByText('Guidance')
+    expect(screen.queryByText('Enterprise Discovery')).toBeNull()
+    expect(listEnterpriseSkills).not.toHaveBeenCalled()
+  })
+
+  it('shows a sign-in prompt without invoking Skill Hub for an unauthenticated enterprise user', async () => {
+    $enterprise.set({ ...INITIAL_ENTERPRISE_STATE, enabled: true, status: 'unauthenticated' })
+    await renderSkills('enterprise')
+
+    expect(await screen.findByText('Enterprise sign-in required')).toBeTruthy()
+    expect(screen.getByText('Enterprise Discovery')).toBeTruthy()
+    expect(listEnterpriseSkills).not.toHaveBeenCalled()
+  })
+
+  it('loads enterprise detail through the narrow Skill Hub bridge', async () => {
+    const item = {
+      artifactSha256: 'c'.repeat(64), artifactSizeBytes: 12, category: 'finance', currentRevision: 1,
+      declaredVersion: '1.0.0', description: 'Detailed enterprise workflow', fileCount: 2,
+      installedArtifactSha256: null, installedRevision: null, installState: 'not-installed', key: 'detail-skill',
+      name: 'detail-skill', policyReason: null, policyStatus: 'available', publishedAt: null
+    }
+
+    listEnterpriseSkills.mockResolvedValue({ items: [item], page: 1, pageSize: 100, total: 1 })
+    detailEnterpriseSkill.mockResolvedValue(item)
+    $enterprise.set(managedEnterpriseState())
+
+    await renderSkills('enterprise')
+    fireEvent.click(await screen.findByRole('button', { name: 'Show details for detail-skill' }))
+    await waitFor(() => expect(detailEnterpriseSkill).toHaveBeenCalledWith('detail-skill'))
+    expect(screen.getAllByText('Detailed enterprise workflow').length).toBeGreaterThanOrEqual(1)
+  })
+
+  it('filters enterprise discovery by search and category', async () => {
+    const item = (name: string, category: string) => ({
+      artifactSha256: 'd'.repeat(64),
+      artifactSizeBytes: 12,
+      category,
+      currentRevision: 1,
+      declaredVersion: null,
+      description: `${name} workflow`,
+      fileCount: 1,
+      installedArtifactSha256: null,
+      installedRevision: null,
+      installState: 'not-installed',
+      key: name,
+      name,
+      policyReason: null,
+      policyStatus: 'available',
+      publishedAt: null
+    })
+
+    listEnterpriseSkills.mockResolvedValue({
+      items: [item('invoice-alpha', 'finance'), item('support-beta', 'service')],
+      page: 1,
+      pageSize: 100,
+      total: 2
+    })
+    $enterprise.set(managedEnterpriseState())
+
+    await renderSkills('enterprise')
+    expect(await screen.findByText('invoice-alpha')).toBeTruthy()
+    const search = screen.getByPlaceholderText('Search enterprise skills...')
+
+    fireEvent.change(search, { target: { value: 'support' } })
+    expect(screen.queryByText('invoice-alpha')).toBeNull()
+    expect(screen.getByText('support-beta')).toBeTruthy()
+
+    fireEvent.change(search, { target: { value: '' } })
+    fireEvent.click(screen.getByRole('button', { name: /finance1/ }))
+    expect(screen.getByText('invoice-alpha')).toBeTruthy()
+    expect(screen.queryByText('support-beta')).toBeNull()
+  })
+
+  it('lists enterprise skills, disables policy-denied installs, and refreshes both lists after install', async () => {
+    const available = {
+      artifactSha256: 'a'.repeat(64),
+      artifactSizeBytes: 120,
+      category: 'finance',
+      currentRevision: 2,
+      declaredVersion: '1.0.0',
+      description: 'Review invoices',
+      fileCount: 3,
+      installedArtifactSha256: null,
+      installedRevision: null,
+      installState: 'not-installed',
+      key: 'invoice-review',
+      name: 'invoice-review',
+      policyReason: null,
+      policyStatus: 'available',
+      publishedAt: '2026-07-13T08:00:00Z'
+    }
+
+    const restricted = {
+      ...available,
+      key: 'restricted-skill',
+      name: 'restricted-skill',
+      policyReason: 'Admin approval required',
+      policyStatus: 'restricted'
+    }
+
+    const blocked = {
+      ...available,
+      key: 'blocked-skill',
+      name: 'blocked-skill',
+      policyReason: 'Blocked by company policy',
+      policyStatus: 'blocked'
+    }
+
+    const recommended = {
+      ...available,
+      key: 'recommended-skill',
+      name: 'recommended-skill',
+      policyReason: 'Recommended by your company',
+      policyStatus: 'recommended'
+    }
+
+    listEnterpriseSkills
+      .mockResolvedValueOnce({ items: [available, recommended, restricted, blocked], page: 1, pageSize: 100, total: 4 })
+      .mockResolvedValueOnce({
+        items: [
+          {
+            ...available,
+            installState: 'installed',
+            installedArtifactSha256: available.artifactSha256,
+            installedRevision: 2
+          },
+          recommended,
+          restricted,
+          blocked
+        ],
+        page: 1,
+        pageSize: 100,
+        total: 4
+      })
+
+    const installedItem = {
+      ...available,
+      installState: 'installed',
+      installedArtifactSha256: available.artifactSha256,
+      installedRevision: 2
+    }
+
+    installEnterpriseSkill.mockResolvedValue({ installed: {}, item: installedItem })
+    $enterprise.set(managedEnterpriseState())
+
+    await renderSkills('enterprise')
+
+    expect(await screen.findByText('invoice-review')).toBeTruthy()
+    const install = screen.getByRole('button', { name: 'Install invoice-review' })
+    expect(screen.getByRole('button', { name: 'Install recommended-skill' }).hasAttribute('disabled')).toBe(false)
+    expect(screen.getByRole('button', { name: 'Install restricted-skill' }).hasAttribute('disabled')).toBe(true)
+    expect(screen.getByRole('button', { name: 'Install blocked-skill' }).hasAttribute('disabled')).toBe(true)
+    expect(screen.getByText('Admin approval required')).toBeTruthy()
+    expect(screen.getByText('Blocked by company policy')).toBeTruthy()
+
+    fireEvent.click(install)
+    await waitFor(() => expect(installEnterpriseSkill).toHaveBeenCalledWith({ key: 'invoice-review', revision: 2 }))
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Installed invoice-review' })).toBeTruthy())
+    expect(listEnterpriseSkills).toHaveBeenCalledTimes(2)
+    expect(getSkills.mock.calls.length).toBeGreaterThan(1)
+  })
+
+  it('keeps a committed install successful when refresh fails and offers a retry', async () => {
+    const available = {
+      artifactSha256: 'e'.repeat(64),
+      artifactSizeBytes: 120,
+      category: 'finance',
+      currentRevision: 1,
+      declaredVersion: '1.0.0',
+      description: 'Review travel expenses',
+      fileCount: 2,
+      installedArtifactSha256: null,
+      installedRevision: null,
+      installState: 'not-installed',
+      key: 'expense-review',
+      name: 'expense-review',
+      policyReason: null,
+      policyStatus: 'available',
+      publishedAt: null
+    }
+
+    const installed = {
+      ...available,
+      installState: 'installed',
+      installedArtifactSha256: available.artifactSha256,
+      installedRevision: 1
+    }
+
+    const refreshError = new Error('Gateway refresh is temporarily unavailable.')
+
+    listEnterpriseSkills
+      .mockResolvedValueOnce({ items: [available], page: 1, pageSize: 100, total: 1 })
+      .mockRejectedValueOnce(refreshError)
+      .mockResolvedValueOnce({ items: [installed], page: 1, pageSize: 100, total: 1 })
+    installEnterpriseSkill.mockResolvedValue({ installed: {}, item: installed })
+    $enterprise.set(managedEnterpriseState())
+    const notifications = await import('@/store/notifications')
+
+    await renderSkills('enterprise')
+    fireEvent.click(await screen.findByRole('button', { name: 'Install expense-review' }))
+
+    expect(await screen.findByRole('button', { name: 'Installed expense-review' })).toBeTruthy()
+    await waitFor(() => {
+      expect(notifications.notify).toHaveBeenCalledWith(
+        expect.objectContaining({
+          kind: 'warning',
+          message: refreshError.message,
+          title: 'Enterprise skills failed to load'
+        })
+      )
+    })
+    expect(notifications.notifyError).not.toHaveBeenCalled()
+
+    const warning = vi.mocked(notifications.notify).mock.calls
+      .map(([input]) => input)
+      .find(input => input.kind === 'warning')
+
+    expect(warning?.action?.label).toBe('Refresh skills')
+    warning?.action?.onClick()
+
+    await waitFor(() => expect(listEnterpriseSkills).toHaveBeenCalledTimes(3))
+    expect(notifications.dismissNotification).toHaveBeenCalledWith('enterprise-skill-refresh:expense-review')
+  })
+
+  it('shows update-not-supported and readable conflict errors', async () => {
+    const base = {
+      artifactSha256: 'b'.repeat(64),
+      artifactSizeBytes: 100,
+      category: 'general',
+      currentRevision: 3,
+      declaredVersion: null,
+      description: 'Enterprise workflow',
+      fileCount: 1,
+      installedArtifactSha256: null,
+      installedRevision: null,
+      installState: 'not-installed',
+      key: 'conflict-skill',
+      name: 'conflict-skill',
+      policyReason: null,
+      policyStatus: 'available',
+      publishedAt: null
+    }
+
+    listEnterpriseSkills.mockResolvedValue({
+      items: [base, { ...base, key: 'newer-skill', name: 'newer-skill', installState: 'update-not-supported' }],
+      page: 1,
+      pageSize: 100,
+      total: 2
+    })
+    installEnterpriseSkill.mockRejectedValue(
+      Object.assign(new Error('A local skill already uses this name.'), { code: 'skill_name_conflict' })
+    )
+    $enterprise.set(managedEnterpriseState())
+
+    await renderSkills('enterprise')
+    expect(await screen.findByText('New version')).toBeTruthy()
+    expect(screen.getByText('Updates are not supported in this release.')).toBeTruthy()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Install conflict-skill' }))
+    expect(await screen.findByText('A local skill already uses this name.')).toBeTruthy()
+  })
+
   it('renders a switch for each toolset and toggles it off', async () => {
     getToolsets
       .mockResolvedValueOnce([toolset()])

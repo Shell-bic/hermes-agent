@@ -490,7 +490,7 @@ def do_install(identifier: str, category: str = "", force: bool = False,
     """
     from tools.skills_hub import (
         GitHubAuth, create_source_router, ensure_hub_dirs,
-        quarantine_bundle, install_from_quarantine, HubLockFile,
+        quarantine_bundle, install_from_quarantine, HubLockFile, HubLockFileError,
     )
     from tools.skills_guard import scan_skill, should_allow_install, format_scan_report
 
@@ -596,6 +596,12 @@ def do_install(identifier: str, category: str = "", force: bool = False,
     existing = lock.get_installed(bundle.name)
     if existing:
         c.print(f"[yellow]Warning:[/] '{bundle.name}' is already installed at {existing['install_path']}")
+        if existing.get("source") == "enterprise":
+            c.print(
+                "[bold red]Installation blocked:[/] Enterprise-managed skills "
+                "cannot be replaced by the public Skills Hub, including with --force.\n"
+            )
+            return
         if not force:
             c.print("Use --force to reinstall.\n")
             return
@@ -606,7 +612,7 @@ def do_install(identifier: str, category: str = "", force: bool = False,
     # Quarantine the bundle
     try:
         q_path = quarantine_bundle(bundle)
-    except ValueError as exc:
+    except (ValueError, HubLockFileError) as exc:
         c.print(f"[bold red]Installation blocked:[/] {exc}\n")
         from tools.skills_hub import append_audit_log
         append_audit_log("BLOCKED", bundle.name, bundle.source,
@@ -680,7 +686,7 @@ def do_install(identifier: str, category: str = "", force: bool = False,
     # Install
     try:
         install_dir = install_from_quarantine(q_path, bundle.name, category, bundle, result)
-    except ValueError as exc:
+    except (ValueError, HubLockFileError) as exc:
         c.print(f"[bold red]Installation blocked:[/] {exc}\n")
         shutil.rmtree(q_path, ignore_errors=True)
         from tools.skills_hub import append_audit_log
@@ -1009,7 +1015,11 @@ def do_update(name: Optional[str] = None, console: Optional[Console] = None) -> 
 
     c = console or _console
     lock = HubLockFile()
-    updates = [entry for entry in check_for_skill_updates(name=name) if entry.get("status") == "update_available"]
+    updates = [
+        entry for entry in check_for_skill_updates(name=name)
+        if entry.get("source") != "enterprise"
+        and entry.get("status") == "update_available"
+    ]
     if not updates:
         c.print("[dim]No updates available.[/]\n")
         return

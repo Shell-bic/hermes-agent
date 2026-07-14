@@ -20,8 +20,11 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
+import threading
 import time
 from abc import ABC, abstractmethod
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
@@ -2991,7 +2994,11 @@ class OptionalSkillSource(SkillSource):
                 and "__pycache__" not in f.parts
                 and f.suffix != ".pyc"
             ):
-                rel_path = str(f.relative_to(skill_dir))
+                # SkillBundle paths are archive-style identifiers and must be
+                # stable across platforms.  WindowsPath.__str__ uses `\\`,
+                # which breaks bundle/on-disk hash symmetry and nested asset
+                # lookup on Windows Desktop.
+                rel_path = f.relative_to(skill_dir).as_posix()
                 try:
                     files[rel_path] = f.read_bytes()
                 except OSError:
@@ -3147,23 +3154,137 @@ def _skill_meta_to_dict(meta: SkillMeta) -> dict:
 # Lock file management
 # ---------------------------------------------------------------------------
 
+
+_HUB_LOCK = threading.RLock()
+
+
+class HubLockFileError(RuntimeError):
+    """Fail-closed error while acquiring or parsing the shared Hub lock."""
+
+
+class _HubCrossProcessLock:
+    """One-byte advisory lock shared by public and enterprise Hub writers."""
+
+    def __init__(self, path: Path):
+        self.path = path
+        self._handle = None
+
+    def __enter__(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._handle = open(self.path, "a+b")
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                self._handle.seek(0, os.SEEK_END)
+                if self._handle.tell() == 0:
+                    self._handle.write(b"\0")
+                    self._handle.flush()
+                self._handle.seek(0)
+                msvcrt.locking(self._handle.fileno(), msvcrt.LK_LOCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(self._handle.fileno(), fcntl.LOCK_EX)
+        except Exception as exc:
+            self._handle.close()
+            self._handle = None
+            raise HubLockFileError("shared Hub lock is unavailable") from exc
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if self._handle is None:
+            return
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                self._handle.seek(0)
+                msvcrt.locking(self._handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(self._handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            self._handle.close()
+            self._handle = None
+
+
 class HubLockFile:
     """Manages skills/.hub/lock.json — tracks provenance of installed hub skills."""
 
     def __init__(self, path: Path = LOCK_FILE):
         self.path = path
 
-    def load(self) -> dict:
+    @property
+    def guard_path(self) -> Path:
+        return self.path.with_name(f"{self.path.name}.lock")
+
+    @contextmanager
+    def exclusive(self):
+        """Hold the process-local and cross-process lock for a full mutation."""
+
+        with _HUB_LOCK:
+            with _HubCrossProcessLock(self.guard_path):
+                yield self
+
+    @staticmethod
+    def _empty() -> dict:
+        return {"version": 1, "installed": {}}
+
+    def _load_unlocked(self, *, strict: bool) -> dict:
         if not self.path.exists():
-            return {"version": 1, "installed": {}}
+            return self._empty()
         try:
-            return json.loads(self.path.read_text())
-        except (json.JSONDecodeError, OSError):
-            return {"version": 1, "installed": {}}
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError, UnicodeDecodeError) as exc:
+            if strict:
+                raise HubLockFileError("existing Hub lock is unreadable") from exc
+            return self._empty()
+        if not isinstance(data, dict) or not isinstance(data.get("installed"), dict):
+            if strict:
+                raise HubLockFileError("existing Hub lock has an invalid schema")
+            return self._empty()
+        data.setdefault("version", 1)
+        return data
+
+    def load_locked(self, *, strict: bool = True) -> dict:
+        """Load while ``exclusive()`` is held by the caller."""
+
+        return self._load_unlocked(strict=strict)
+
+    def save_locked(self, data: dict) -> None:
+        """Atomically replace lock.json while ``exclusive()`` is held."""
+
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        fd, raw_temp = tempfile.mkstemp(
+            prefix=f"{self.path.stem}.", suffix=".tmp", dir=self.path.parent
+        )
+        temp_path = Path(raw_temp)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as stream:
+                json.dump(data, stream, indent=2, ensure_ascii=False)
+                stream.write("\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temp_path, self.path)
+        finally:
+            try:
+                temp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    def ensure_exists(self) -> None:
+        with self.exclusive():
+            if not self.path.exists():
+                self.save_locked(self._empty())
+
+    def load(self) -> dict:
+        return self._load_unlocked(strict=False)
 
     def save(self, data: dict) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+        with self.exclusive():
+            self.save_locked(data)
 
     def record_install(
         self,
@@ -3183,25 +3304,25 @@ class HubLockFile:
         # write time so the file never carries the bad state.
         safe_name = _validate_skill_name(name)
         safe_install_path = _normalize_lock_install_path(install_path, safe_name)
-        data = self.load()
-        data["installed"][safe_name] = {
-            "source": source,
-            "identifier": identifier,
-            "trust_level": trust_level,
-            "scan_verdict": scan_verdict,
-            "content_hash": skill_hash,
-            "install_path": safe_install_path,
-            "files": files,
-            "metadata": metadata or {},
-            "installed_at": datetime.now(timezone.utc).isoformat(),
-            "updated_at": datetime.now(timezone.utc).isoformat(),
-        }
-        self.save(data)
+        with self.exclusive():
+            data = self.load_locked(strict=True)
+            data["installed"][safe_name] = _hub_install_entry(
+                source=source,
+                identifier=identifier,
+                trust_level=trust_level,
+                scan_verdict=scan_verdict,
+                skill_hash=skill_hash,
+                install_path=safe_install_path,
+                files=files,
+                metadata=metadata,
+            )
+            self.save_locked(data)
 
     def record_uninstall(self, name: str) -> None:
-        data = self.load()
-        data["installed"].pop(name, None)
-        self.save(data)
+        with self.exclusive():
+            data = self.load_locked(strict=True)
+            data["installed"].pop(name, None)
+            self.save_locked(data)
 
     def get_installed(self, name: str) -> Optional[dict]:
         data = self.load()
@@ -3213,6 +3334,32 @@ class HubLockFile:
         for name, entry in data["installed"].items():
             result.append({"name": name, **entry})
         return result
+
+
+def _hub_install_entry(
+    *,
+    source: str,
+    identifier: str,
+    trust_level: str,
+    scan_verdict: str,
+    skill_hash: str,
+    install_path: str,
+    files: List[str],
+    metadata: Optional[Dict[str, Any]],
+) -> dict:
+    now = datetime.now(timezone.utc).isoformat()
+    return {
+        "source": source,
+        "identifier": identifier,
+        "trust_level": trust_level,
+        "scan_verdict": scan_verdict,
+        "content_hash": skill_hash,
+        "install_path": install_path,
+        "files": files,
+        "metadata": metadata or {},
+        "installed_at": now,
+        "updated_at": now,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -3289,8 +3436,7 @@ def ensure_hub_dirs() -> None:
     HUB_DIR.mkdir(parents=True, exist_ok=True)
     QUARANTINE_DIR.mkdir(exist_ok=True)
     INDEX_CACHE_DIR.mkdir(exist_ok=True)
-    if not LOCK_FILE.exists():
-        LOCK_FILE.write_text('{"version": 1, "installed": {}}\n')
+    HubLockFile(LOCK_FILE).ensure_exists()
     if not AUDIT_LOG.exists():
         AUDIT_LOG.touch()
     if not TAPS_FILE.exists():
@@ -3317,7 +3463,10 @@ def quarantine_bundle(bundle: SkillBundle) -> Path:
         if isinstance(file_content, bytes):
             file_dest.write_bytes(file_content)
         else:
-            file_dest.write_text(file_content, encoding="utf-8")
+            # Preserve the bundle's bytes across platforms.  The default text
+            # writer translates LF to CRLF on Windows, which makes the lock
+            # hash differ from bundle_content_hash and reports false updates.
+            file_dest.write_text(file_content, encoding="utf-8", newline="")
 
     return dest
 
@@ -3346,9 +3495,6 @@ def install_from_quarantine(
     # symlink-in-skills-tree redirects at install time so the lock entry's
     # path can never refer to a redirected target.
     install_dir = _resolve_lock_install_path(install_rel_path, safe_skill_name)
-
-    if install_dir.exists():
-        shutil.rmtree(install_dir)
 
     # Warn (but don't block) if SKILL.md is very large
     skill_md = quarantine_path / "SKILL.md"
@@ -3381,22 +3527,61 @@ def install_from_quarantine(
             f"Installed skill contains symlinks, which is not allowed: {rel}"
         )
 
-    install_dir.parent.mkdir(parents=True, exist_ok=True)
-    shutil.move(str(quarantine_path), str(install_dir))
-
-    # Record in lock file
     lock = HubLockFile()
-    lock.record_install(
-        name=safe_skill_name,
-        source=bundle.source,
-        identifier=bundle.identifier,
-        trust_level=bundle.trust_level,
-        scan_verdict=scan_result.verdict,
-        skill_hash=content_hash(install_dir),
-        install_path=str(install_dir.relative_to(SKILLS_DIR)),
-        files=list(bundle.files.keys()),
-        metadata=bundle.metadata,
+    backup_dir = install_dir.with_name(
+        f".{install_dir.name}.hub-backup-{os.getpid()}-{time.time_ns()}"
     )
+    moved = False
+    backed_up = False
+    committed = False
+    try:
+        with lock.exclusive():
+            data = lock.load_locked(strict=True)
+            existing = data["installed"].get(safe_skill_name)
+            if isinstance(existing, dict) and existing.get("source") == "enterprise":
+                raise ValueError(
+                    f"Refusing to replace enterprise-managed skill '{safe_skill_name}'"
+                )
+
+            install_dir.parent.mkdir(parents=True, exist_ok=True)
+            if install_dir.exists():
+                os.replace(install_dir, backup_dir)
+                backed_up = True
+            os.replace(quarantine_path, install_dir)
+            moved = True
+
+            safe_install_path = _normalize_lock_install_path(
+                str(install_dir.relative_to(SKILLS_DIR)), safe_skill_name
+            )
+            data["installed"][safe_skill_name] = _hub_install_entry(
+                source=bundle.source,
+                identifier=bundle.identifier,
+                trust_level=bundle.trust_level,
+                scan_verdict=scan_result.verdict,
+                skill_hash=content_hash(install_dir),
+                install_path=safe_install_path,
+                files=list(bundle.files.keys()),
+                metadata=bundle.metadata,
+            )
+            try:
+                lock.save_locked(data)
+                committed = True
+            except Exception:
+                if moved and install_dir.exists():
+                    shutil.rmtree(install_dir, ignore_errors=True)
+                    moved = False
+                if backed_up and backup_dir.exists():
+                    os.replace(backup_dir, install_dir)
+                    backed_up = False
+                raise
+    finally:
+        if not committed and moved and install_dir.exists():
+            shutil.rmtree(install_dir, ignore_errors=True)
+        if backed_up and backup_dir.exists():
+            if committed:
+                shutil.rmtree(backup_dir, ignore_errors=True)
+            elif not install_dir.exists():
+                os.replace(backup_dir, install_dir)
 
     append_audit_log(
         "INSTALL", safe_skill_name, bundle.source,
@@ -3410,29 +3595,62 @@ def install_from_quarantine(
 def uninstall_skill(skill_name: str) -> Tuple[bool, str]:
     """Remove a hub-installed skill. Refuses to remove builtins."""
     lock = HubLockFile()
-    entry = lock.get_installed(skill_name)
-    if not entry:
-        return False, f"'{skill_name}' is not a hub-installed skill (may be a builtin)"
-
-    # Validate the lock entry's install_path against the skill name. This is
-    # the destructive boundary — anything that falls through to the rmtree
-    # below MUST be inside SKILLS_DIR and MUST NOT be SKILLS_DIR itself
-    # (an empty/"."/"/" install_path would otherwise wipe the entire tree).
-    # _resolve_lock_install_path enforces a relative path ending in
-    # <skill_name>, rejects absolute/traversal paths, and walks the path
-    # component-by-component refusing symlink/junction redirects.
+    entry: Optional[dict] = None
+    backup_path: Optional[Path] = None
+    moved = False
     try:
-        install_path = _resolve_lock_install_path(
-            entry.get("install_path", ""), skill_name
-        )
-    except ValueError as exc:
-        return False, f"Refusing to uninstall '{skill_name}': {exc}"
+        with lock.exclusive():
+            data = lock.load_locked(strict=True)
+            raw_entry = data["installed"].get(skill_name)
+            if not isinstance(raw_entry, dict):
+                return False, f"'{skill_name}' is not a hub-installed skill (may be a builtin)"
+            entry = raw_entry
 
-    if install_path.exists():
-        shutil.rmtree(install_path)
+            # Validate the lock entry's install_path while the same lock used
+            # by public and enterprise installers is held. This is the
+            # destructive boundary: the resolved target must stay inside
+            # SKILLS_DIR, must not be SKILLS_DIR itself, and must not traverse
+            # a symlink/junction.
+            try:
+                install_path = _resolve_lock_install_path(
+                    entry.get("install_path", ""), skill_name
+                )
+            except ValueError as exc:
+                return False, f"Refusing to uninstall '{skill_name}': {exc}"
 
-    lock.record_uninstall(skill_name)
-    append_audit_log("UNINSTALL", skill_name, entry["source"], entry["trust_level"], "n/a", "user_request")
+            backup_path = install_path.with_name(
+                f".{install_path.name}.hub-uninstall-{os.getpid()}-{time.time_ns()}"
+            )
+            if install_path.exists():
+                os.replace(install_path, backup_path)
+                moved = True
+
+            data["installed"].pop(skill_name, None)
+            try:
+                lock.save_locked(data)
+            except Exception:
+                if moved and backup_path.exists() and not install_path.exists():
+                    os.replace(backup_path, install_path)
+                    moved = False
+                raise
+    except (HubLockFileError, OSError) as exc:
+        return False, f"Failed to uninstall '{skill_name}': {exc}"
+
+    if moved and backup_path is not None and backup_path.exists():
+        try:
+            shutil.rmtree(backup_path)
+        except OSError as exc:
+            logger.warning("Could not remove uninstall backup for %s: %s", skill_name, exc)
+
+    assert entry is not None
+    append_audit_log(
+        "UNINSTALL",
+        skill_name,
+        str(entry.get("source", "unknown")),
+        str(entry.get("trust_level", "unknown")),
+        "n/a",
+        "user_request",
+    )
 
     return True, f"Uninstalled '{skill_name}' from {entry['install_path']}"
 
@@ -3470,7 +3688,12 @@ def check_for_skill_updates(
 ) -> List[dict]:
     """Check installed hub skills for upstream changes."""
     lock = lock or HubLockFile()
-    installed = lock.list_installed()
+    # Enterprise revisions are controlled exclusively by the Enterprise
+    # Gateway. Public Hub check/update must never resolve or mutate them.
+    installed = [
+        entry for entry in lock.list_installed()
+        if entry.get("source") != "enterprise"
+    ]
     if name:
         installed = [entry for entry in installed if entry.get("name") == name]
 

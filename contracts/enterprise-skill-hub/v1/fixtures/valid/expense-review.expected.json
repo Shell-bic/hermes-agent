@@ -1,0 +1,17 @@
+{
+  "key": "expense-review",
+  "name": "expense-review",
+  "description": "Review employee expenses against company policy.",
+  "declaredVersion": "1.0.0",
+  "category": "finance",
+  "contentSha256": "447bcc4363b31ed7737e45dec17f1299dfd415ba5a3805da091e3fb5375d6279",
+  "fileCount": 5,
+  "totalBytes": 803,
+  "inventory": [
+    { "path": "SKILL.md", "sizeBytes": 225, "sha256": "bd2db9dc2f5f5fe8e1e3a2e65fd7d3f9db26e8caef0a933fca0eb3de3dd440a0" },
+    { "path": "assets/schema.json", "sizeBytes": 195, "sha256": "7d7568cefacfa92517a5e49534be68bed4e59f77d65318cc9c8f14448592019d" },
+    { "path": "references/checklist.md", "sizeBytes": 159, "sha256": "b3d3bf7e8ed34935bbd8a1e4a3d736c4564a414e41d671dd40a1501732df87af" },
+    { "path": "scripts/check.py", "sizeBytes": 159, "sha256": "6ddf809346d01ae4e9a7039a979d02ac93eb0d33973277914fcbb27f9c2ef6a1" },
+    { "path": "templates/report.md", "sizeBytes": 65, "sha256": "8f8faebb41d46bc7ebc0d8fe3d2eaa06070589d95ec3b64696d846dd4a3645ea" }
+  ]
+}

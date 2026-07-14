@@ -31,8 +31,9 @@ import {
   getToolsetDetail,
   shortCapabilitySummary
 } from './capability-details'
+import { EnterpriseDiscovery } from './enterprise-discovery'
 
-const SKILLS_MODES = ['skills', 'toolsets'] as const
+const SKILLS_MODES = ['skills', 'toolsets', 'enterprise'] as const
 type SkillsMode = (typeof SKILLS_MODES)[number]
 const POLICY_LOCKED_STATUSES = new Set<EnterpriseToolPolicyStatus>(['blocked', 'restricted'])
 
@@ -365,6 +366,7 @@ export function SkillsView({ setStatusbarItemGroup: _setStatusbarItemGroup, ...p
   const [expandedToolset, setExpandedToolset] = useState<string | null>(null)
   const [expandedCapability, setExpandedCapability] = useState<ExpandedCapability>(null)
   const [skillContent, setSkillContent] = useState<Record<string, SkillContentState>>({})
+  const [enterpriseRefreshKey, setEnterpriseRefreshKey] = useState(0)
 
   const refreshCapabilities = useCallback(async () => {
     setRefreshing(true)
@@ -391,6 +393,12 @@ export function SkillsView({ setStatusbarItemGroup: _setStatusbarItemGroup, ...p
   useEffect(() => {
     void refreshCapabilities()
   }, [refreshCapabilities])
+
+  useEffect(() => {
+    if (!enterprise.enabled && mode === 'enterprise') {
+      setMode('skills')
+    }
+  }, [enterprise.enabled, mode, setMode])
 
   const enterprisePolicySnapshot = enterprise.enabled && enterprise.authenticated ? enterprise.toolPolicySnapshot : null
 
@@ -567,14 +575,30 @@ export function SkillsView({ setStatusbarItemGroup: _setStatusbarItemGroup, ...p
         ) : undefined
       }
       onSearchChange={setQuery}
-      searchHidden={mode === 'skills' ? (effectiveSkills?.length ?? 0) === 0 : (effectiveToolsets?.length ?? 0) === 0}
-      searchPlaceholder={mode === 'skills' ? t.skills.searchSkills : t.skills.searchToolsets}
+      searchHidden={
+        mode === 'enterprise'
+          ? !enterprise.authenticated
+          : mode === 'skills'
+            ? (effectiveSkills?.length ?? 0) === 0
+            : (effectiveToolsets?.length ?? 0) === 0
+      }
+      searchPlaceholder={
+        mode === 'enterprise'
+          ? t.skills.searchEnterprise
+          : mode === 'skills'
+            ? t.skills.searchSkills
+            : t.skills.searchToolsets
+      }
       searchTrailingAction={
         <Button
           aria-label={refreshing ? t.skills.refreshing : t.skills.refresh}
           className="text-(--ui-text-tertiary) hover:bg-transparent hover:text-foreground"
           disabled={refreshing}
-          onClick={() => void refreshCapabilities()}
+          onClick={() => {
+            void refreshCapabilities()
+
+            if (mode === 'enterprise') {setEnterpriseRefreshKey(value => value + 1)}
+          }}
           size="icon-xs"
           title={refreshing ? t.skills.refreshing : t.skills.refresh}
           type="button"
@@ -592,11 +616,25 @@ export function SkillsView({ setStatusbarItemGroup: _setStatusbarItemGroup, ...p
           <TextTab active={mode === 'toolsets'} onClick={() => setMode('toolsets')}>
             {t.skills.tabToolsets} <TextTabMeta>{effectiveToolsets?.length || 0}</TextTabMeta>
           </TextTab>
+          {enterprise.enabled && (
+            <TextTab active={mode === 'enterprise'} onClick={() => setMode('enterprise')}>
+              {t.skills.tabEnterprise}
+            </TextTab>
+          )}
         </>
       }
     >
-      {!effectiveSkills || !effectiveToolsets ? (
+      {mode !== 'enterprise' && (!effectiveSkills || !effectiveToolsets) ? (
         <PageLoader label={t.skills.loading} />
+      ) : mode === 'enterprise' ? (
+        <EnterpriseDiscovery
+          authenticated={enterprise.authenticated}
+          onInstalled={async () => {
+            await refreshCapabilities()
+          }}
+          query={query}
+          refreshKey={enterpriseRefreshKey}
+        />
       ) : mode === 'skills' ? (
         <div className={cn('h-full overflow-y-auto py-3', PAGE_INSET_X)}>
           {visibleSkills.length === 0 ? (
@@ -668,7 +706,7 @@ export function SkillsView({ setStatusbarItemGroup: _setStatusbarItemGroup, ...p
           ) : (
             <div className="space-y-2">
               <div className="text-xs text-muted-foreground">
-                {t.skills.toolsetsEnabled(enabledToolsets, effectiveToolsets.length)}
+                {t.skills.toolsetsEnabled(enabledToolsets, effectiveToolsets?.length || 0)}
               </div>
               <div className="grid grid-cols-[repeat(auto-fit,minmax(240px,1fr))] gap-3">
                 {visibleToolsets.map(toolset => {

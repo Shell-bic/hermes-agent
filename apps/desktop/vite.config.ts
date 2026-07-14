@@ -1,7 +1,30 @@
+import fs from 'node:fs'
+import path from 'node:path'
+
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
 import tailwindcss from '@tailwindcss/vite'
-import path from 'path'
+
+const workspaceRoot = path.resolve(__dirname, '../..')
+
+function existingRealPath(directory: string): string | null {
+  try {
+    return fs.statSync(directory).isDirectory() ? fs.realpathSync.native(directory) : null
+  } catch {
+    return null
+  }
+}
+
+// Worktrees commonly reuse dependencies through node_modules junctions. Vite
+// authorizes served files by their real path, so allow only the two dependency
+// roots whose junction targets can live outside this worktree. Do not allow the
+// parent implementation checkout itself.
+const dependencyRealPaths = [
+  existingRealPath(path.join(workspaceRoot, 'node_modules')),
+  existingRealPath(path.join(__dirname, 'node_modules'))
+].filter((directory): directory is string => Boolean(directory))
+
+const serverFsAllow = [...new Set([workspaceRoot, ...dependencyRealPaths])]
 
 export default defineConfig({
   base: './',
@@ -45,6 +68,9 @@ export default defineConfig({
     dedupe: ['react', 'react-dom']
   },
   server: {
+    fs: {
+      allow: serverFsAllow
+    },
     host: '127.0.0.1',
     port: 5174,
     strictPort: true
