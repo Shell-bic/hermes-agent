@@ -1,3 +1,4 @@
+import { useStore } from '@nanostores/react'
 import { useEffect, useMemo, useState } from 'react'
 
 import { Badge } from '@/components/ui/badge'
@@ -7,6 +8,7 @@ import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from '
 import { TextTab, TextTabMeta } from '@/components/ui/text-tab'
 import type { EnterpriseSkillHubItem } from '@/global'
 import { useI18n } from '@/i18n'
+import { $enterprise, refreshEnterprisePolicy } from '@/store/enterprise'
 import { dismissNotification, notify, notifyError } from '@/store/notifications'
 
 import { PAGE_INSET_X } from '../layout-constants'
@@ -55,6 +57,7 @@ function policyClass(status: EnterpriseSkillHubItem['policyStatus']): string {
 
 export function EnterpriseDiscovery({ authenticated, onInstalled, query, refreshKey }: EnterpriseDiscoveryProps) {
   const { t } = useI18n()
+  const enterprise = useStore($enterprise)
   const [items, setItems] = useState<EnterpriseSkillHubItem[] | null>(null)
   const [activeCategory, setActiveCategory] = useState<string | null>(null)
   const [loading, setLoading] = useState(false)
@@ -63,6 +66,7 @@ export function EnterpriseDiscovery({ authenticated, onInstalled, query, refresh
   const [operationErrors, setOperationErrors] = useState<Record<string, OperationError>>({})
   const [detail, setDetail] = useState<EnterpriseSkillHubItem | null>(null)
   const [detailLoading, setDetailLoading] = useState(false)
+  const [refreshingPolicy, setRefreshingPolicy] = useState(false)
 
   useEffect(() => {
     if (!authenticated) {
@@ -119,6 +123,19 @@ export function EnterpriseDiscovery({ authenticated, onInstalled, query, refresh
 
   async function refreshList(): Promise<void> {
     setItems(await listAllEnterpriseSkills())
+  }
+
+  async function handleRefreshPolicy(): Promise<void> {
+    setRefreshingPolicy(true)
+
+    try {
+      await refreshEnterprisePolicy()
+      await Promise.all([refreshList(), onInstalled()])
+    } catch (error) {
+      notifyError(error, t.skills.enterpriseLoadFailed)
+    } finally {
+      setRefreshingPolicy(false)
+    }
   }
 
   async function refreshInstalledState(key: string): Promise<void> {
@@ -221,6 +238,35 @@ export function EnterpriseDiscovery({ authenticated, onInstalled, query, refresh
 
   return (
     <div className={`h-full overflow-y-auto py-3 ${PAGE_INSET_X}`}>
+      <div className="mb-3 flex min-w-0 items-center justify-between gap-3 rounded-md border border-(--ui-stroke-secondary) bg-(--ui-bg-secondary)/20 px-3 py-2">
+        <div className="min-w-0">
+          <div className="truncate text-xs font-medium">
+            {enterprise.policyRefreshStatus === 'stale'
+              ? t.skills.enterprisePolicyStale
+              : enterprise.policyRefreshStatus === 'failed'
+                ? t.skills.enterprisePolicyFailed
+                : enterprise.policyRefreshStatus === 'current'
+                  ? t.skills.enterprisePolicyCurrent
+                  : enterprise.policyRefreshStatus === 'refreshing'
+                    ? t.skills.enterprisePolicyRefreshing
+                    : t.skills.enterprisePolicyRefresh}
+          </div>
+          <div className={`mt-0.5 truncate text-[0.68rem] ${enterprise.policyRefreshError ? 'text-destructive' : 'text-(--ui-text-tertiary)'}`}>
+            {enterprise.policyRefreshError || enterprise.policyVersion || enterprise.policyHash || '—'}
+          </div>
+        </div>
+        <Button
+          aria-label={refreshingPolicy ? t.skills.enterprisePolicyRefreshing : t.skills.enterprisePolicyRefresh}
+          disabled={refreshingPolicy}
+          onClick={() => void handleRefreshPolicy()}
+          size="sm"
+          type="button"
+          variant="outline"
+        >
+          <Codicon name="refresh" size="0.875rem" spinning={refreshingPolicy} />
+          {refreshingPolicy ? t.skills.enterprisePolicyRefreshing : t.skills.enterprisePolicyRefresh}
+        </Button>
+      </div>
       {categories.length > 0 && (
         <div className="mb-3 flex flex-wrap gap-1.5">
           <TextTab active={activeCategory === null} onClick={() => setActiveCategory(null)}>

@@ -103,6 +103,14 @@ export interface SkillCommandDispatchResponse {
   message?: string
 }
 
+export interface BundleCommandDispatchResponse {
+  type: 'bundle'
+  name: string
+  message?: string
+  skills: string[]
+  missing: string[]
+}
+
 export interface SendCommandDispatchResponse {
   type: 'send'
   message: string
@@ -112,6 +120,7 @@ export type CommandDispatchResponse =
   | ExecCommandDispatchResponse
   | AliasCommandDispatchResponse
   | SkillCommandDispatchResponse
+  | BundleCommandDispatchResponse
   | SendCommandDispatchResponse
 
 export type SidebarNavId = 'artifacts' | 'command-center' | 'messaging' | 'new-session' | 'settings' | 'skills'

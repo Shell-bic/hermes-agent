@@ -32,6 +32,18 @@ const PROVIDER_RUNTIME_HASH_PATTERN = /^[a-f0-9]{64}$/i
 const MAX_PROVIDER_RUNTIME_ENDPOINT_LENGTH = 256
 const MAX_PROVIDER_RUNTIME_WARNINGS = 16
 const UNSAFE_PROVIDER_RUNTIME_SUMMARY_PATTERN = /authorization|api[-_ ]?key|bearer\s+|credential|password|secret|token|prompt|tool(?:set|s)?\s*schema|https?:\/\//i
+const TOOL_POLICY_STATUSES = new Set([
+  'available',
+  'blocked',
+  'defaultEnabled',
+  'recommended',
+  'restricted',
+  'teamShared',
+  'userCreated'
+])
+const TOOL_POLICY_KEY_PATTERN = /^[\p{L}\p{N}][\p{L}\p{N}._:-]{0,255}$/u
+const TOOL_POLICY_COLLECTIONS = ['skills', 'toolSets', 'tools', 'mcpServers', 'capabilityFlags']
+const ROLE_POLICY_VALUE_PATTERN = /^[\p{L}\p{N}][\p{L}\p{N}._:-]{0,255}$/u
 
 function asArray(value) {
   return Array.isArray(value) ? value : []
@@ -478,6 +490,257 @@ function normalizeToolPolicySnapshot(manifest) {
   })
 }
 
+function policyRefreshMetadata(policy) {
+  return {
+    generatedAt: String(policy?.generatedAt || policy?.toolPolicySnapshot?.generatedAt || '').trim() || null,
+    policyHash: String(policy?.policyHash || policy?.toolPolicySnapshot?.policyHash || '').trim() || null,
+    policyVersion: String(policy?.policyVersion || policy?.toolPolicySnapshot?.policyVersion || '').trim() || null
+  }
+}
+
+function hasValidToolPolicyItems(items) {
+  if (!Array.isArray(items)) {
+    return false
+  }
+
+  const seen = new Set()
+  for (const item of items) {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) {
+      return false
+    }
+
+    const key = item.key
+    if (typeof key !== 'string' || key !== key.trim() || !TOOL_POLICY_KEY_PATTERN.test(key)) {
+      return false
+    }
+
+    if (typeof item.status !== 'string' || !TOOL_POLICY_STATUSES.has(item.status)) {
+      return false
+    }
+
+    const canonicalKey = key.toLocaleLowerCase('en-US')
+    if (seen.has(canonicalKey)) {
+      return false
+    }
+    seen.add(canonicalKey)
+  }
+
+  return true
+}
+
+function hasSafePolicyMetadataValue(value, maxLength = 512) {
+  return typeof value === 'string' &&
+    value.length > 0 &&
+    value.length <= maxLength &&
+    value === value.trim() &&
+    !hasControlCharacters(value)
+}
+
+function hasConsistentPolicyMetadata(policy) {
+  const snapshot = policy?.toolPolicySnapshot
+  if (!snapshot || typeof snapshot !== 'object' || Array.isArray(snapshot)) {
+    return false
+  }
+
+  for (const field of ['generatedAt', 'policyHash']) {
+    const topLevel = policy[field]
+    const nested = snapshot[field]
+    if (
+      !hasSafePolicyMetadataValue(topLevel) ||
+      !hasSafePolicyMetadataValue(nested) ||
+      topLevel !== nested
+    ) {
+      return false
+    }
+  }
+
+  return hasSafePolicyMetadataValue(policy.policyVersion) &&
+    hasSafePolicyMetadataValue(snapshot.policyVersion)
+}
+
+function hasValidRolePolicyValues(values) {
+  if (!Array.isArray(values)) {
+    return false
+  }
+
+  const seen = new Set()
+  for (const value of values) {
+    if (
+      typeof value !== 'string' ||
+      value !== value.trim() ||
+      !ROLE_POLICY_VALUE_PATTERN.test(value) ||
+      seen.has(value)
+    ) {
+      return false
+    }
+    seen.add(value)
+  }
+
+  return true
+}
+
+function isValidManagedPolicySnapshot(policy, { bootstrapContract = false } = {}) {
+  if (!policy || typeof policy !== 'object' || Array.isArray(policy)) {
+    return false
+  }
+
+  if (!hasValidRolePolicyValues(policy.lockedSurfaces)) {
+    return false
+  }
+
+  if (bootstrapContract) {
+    if (!hasValidRolePolicyValues(policy.capabilities)) {
+      return false
+    }
+  } else if (Array.isArray(policy.capabilities)) {
+    if (!hasValidRolePolicyValues(policy.capabilities)) {
+      return false
+    }
+  } else if (!policy.capabilities || typeof policy.capabilities !== 'object') {
+    // Initial managed snapshots carry the model-capability record from the
+    // runtime manifest. Refreshed snapshots carry role capabilities as a list.
+    return false
+  }
+
+  const rawSnapshot = policy.toolPolicySnapshot
+  if (!hasConsistentPolicyMetadata(policy)) {
+    return false
+  }
+
+  for (const collection of TOOL_POLICY_COLLECTIONS) {
+    if (!hasValidToolPolicyItems(rawSnapshot[collection])) {
+      return false
+    }
+  }
+
+  const toolPolicySnapshot = normalizeToolPolicySnapshot({
+    generatedAt: policy.generatedAt,
+    policyHash: policy.policyHash,
+    policyVersion: policy.policyVersion,
+    toolPolicySnapshot: policy.toolPolicySnapshot
+  })
+  const metadata = policyRefreshMetadata(policy)
+
+  return Boolean(toolPolicySnapshot && metadata.generatedAt && metadata.policyHash && metadata.policyVersion)
+}
+
+function validateManagedBootstrap(bootstrap) {
+  if (!isValidManagedPolicySnapshot(bootstrap, { bootstrapContract: true })) {
+    const error = new Error('Enterprise policy bootstrap payload is invalid.')
+    error.code = 'enterprise_policy_payload_invalid'
+    throw error
+  }
+
+  return bootstrap
+}
+
+function readManagedPolicySnapshot({ fsImpl = fs, hermesHome } = {}) {
+  const policyPath = path.join(String(hermesHome || ''), 'enterprise-policy.json')
+
+  if (!hermesHome || !fsImpl.existsSync(policyPath)) {
+    return { policy: null, policyPath, reason: 'missing', valid: false }
+  }
+
+  try {
+    const policy = JSON.parse(fsImpl.readFileSync(policyPath, 'utf8'))
+
+    return isValidManagedPolicySnapshot(policy)
+      ? { policy, policyPath, reason: null, valid: true }
+      : { policy: null, policyPath, reason: 'invalid', valid: false }
+  } catch {
+    return { policy: null, policyPath, reason: 'invalid', valid: false }
+  }
+}
+
+function buildRefreshedPolicySnapshot({ bootstrap, currentPolicy = null } = {}) {
+  if (!bootstrap || typeof bootstrap !== 'object' || Array.isArray(bootstrap)) {
+    throw new Error('Enterprise policy bootstrap payload is required.')
+  }
+
+  validateManagedBootstrap(bootstrap)
+
+  const toolPolicySnapshot = normalizeToolPolicySnapshot({
+    generatedAt: bootstrap.generatedAt,
+    policyHash: bootstrap.policyHash,
+    policyVersion: bootstrap.policyVersion,
+    toolPolicySnapshot: bootstrap.toolPolicySnapshot
+  })
+  const metadata = policyRefreshMetadata({
+    generatedAt: bootstrap.generatedAt,
+    policyHash: bootstrap.policyHash,
+    policyVersion: bootstrap.policyVersion,
+    toolPolicySnapshot
+  })
+
+  const canonicalToolPolicySnapshot = {
+    ...toolPolicySnapshot,
+    generatedAt: metadata.generatedAt,
+    policyHash: metadata.policyHash
+  }
+
+  const base = isValidManagedPolicySnapshot(currentPolicy) ? scrubSecretFields(currentPolicy) : {}
+
+  return {
+    allowedModels: asArray(base.allowedModels).map(String).filter(Boolean),
+    auxiliaryPolicy: scrubSecretFields(base.auxiliaryPolicy || {}),
+    apiMode: base.apiMode || null,
+    capabilities: [...bootstrap.capabilities],
+    currentModel: base.currentModel || null,
+    currentModelProfileId: base.currentModelProfileId || null,
+    defaultModel: base.defaultModel || null,
+    generatedAt: metadata.generatedAt,
+    lockedSurfaces: [...bootstrap.lockedSurfaces],
+    manifestId: base.manifestId || null,
+    modelProfiles: asArray(base.modelProfiles),
+    modelRuntimeHash: base.modelRuntimeHash || null,
+    policyHash: metadata.policyHash,
+    policyVersion: metadata.policyVersion,
+    protocolSnapshot: scrubSecretFields(base.protocolSnapshot || {}),
+    providerRuntime: normalizeProviderRuntimeMetadata(base.providerRuntime),
+    role: resolveRole({ bootstrap }),
+    runtimeDefaults: scrubSecretFields(base.runtimeDefaults || {}),
+    runtimeLimits: scrubSecretFields(base.runtimeLimits || {}),
+    sessionId: base.sessionId || null,
+    toolPolicySnapshot: canonicalToolPolicySnapshot,
+    uiPolicy: normalizeEnterpriseUiPolicy({ bootstrap }),
+    user: scrubSecretFields(bootstrap.user || bootstrap.account || null)
+  }
+}
+
+function replaceManagedPolicySnapshot({ bootstrap, fsImpl = fs, hermesHome } = {}) {
+  if (!hermesHome) {
+    throw new Error('Managed Hermes home path is required.')
+  }
+
+  const current = readManagedPolicySnapshot({ fsImpl, hermesHome })
+  const policy = buildRefreshedPolicySnapshot({ bootstrap, currentPolicy: current.policy })
+  const policyPath = path.join(hermesHome, 'enterprise-policy.json')
+  const temporaryPath = path.join(
+    hermesHome,
+    `.enterprise-policy.${process.pid}.${Date.now()}.${Math.random().toString(16).slice(2)}.tmp`
+  )
+
+  fsImpl.mkdirSync(hermesHome, { recursive: true })
+  try {
+    fsImpl.writeFileSync(temporaryPath, JSON.stringify(policy, null, 2), { encoding: 'utf8', mode: 0o600 })
+    fsImpl.renameSync(temporaryPath, policyPath)
+  } catch (error) {
+    try {
+      if (fsImpl.existsSync(temporaryPath)) fsImpl.unlinkSync(temporaryPath)
+    } catch {
+      // Preserve the original write error; a leftover temp file is never used as policy.
+    }
+    throw error
+  }
+
+  return {
+    ...policyRefreshMetadata(policy),
+    policy,
+    policyPath,
+    replacedExistingPolicy: current.valid
+  }
+}
+
 function modelProfileKey(profile) {
   return String(profile?.id || profile?.model || profile?.name || '').trim()
 }
@@ -539,6 +802,9 @@ function publicEnterpriseState({ bootstrap = null, manifest = null, modelProfile
     generatedAt: manifest?.generatedAt || manifest?.toolPolicySnapshot?.generatedAt || null,
     policyHash: manifest?.policyHash || manifest?.toolPolicySnapshot?.policyHash || null,
     policyVersion: manifest?.policyVersion || bootstrap?.policyVersion || null,
+    policyRefreshError: null,
+    policyRefreshStatus: manifest?.policyHash || manifest?.toolPolicySnapshot?.policyHash ? 'current' : 'idle',
+    policyStale: false,
     providerRuntime,
     protocolSnapshot: scrubSecretFields(manifest?.protocolSnapshot || {}),
     role: resolveRole({ bootstrap, manifest }),
@@ -682,16 +948,21 @@ module.exports = {
   MANAGED_PROVIDER,
   buildManagedConfigYaml,
   buildPolicySnapshot,
+  buildRefreshedPolicySnapshot,
   enterpriseUserPathSegment,
   normalizeGatewayApiBaseUrl,
   normalizeEnterpriseUiPolicy,
   normalizeProviderRuntimeMetadata,
   normalizeToolPolicySnapshot,
+  policyRefreshMetadata,
   publicEnterpriseState,
+  readManagedPolicySnapshot,
   readManagedConfigDisplayLanguage,
   resolveRole,
   resolveManagedHermesHome,
+  replaceManagedPolicySnapshot,
   scrubSecretFields,
+  validateManagedBootstrap,
   writeManagedRuntimeHome,
   yamlBlock
 }

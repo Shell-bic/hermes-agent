@@ -119,6 +119,16 @@ function inlineErrorMessage(error: unknown, fallback: string): string {
   return (raw.match(/Error invoking remote method '[^']+': Error: (.+)$/)?.[1] ?? raw).replace(/^Error:\s*/, '').trim()
 }
 
+function isExplicitCommandDispatchFallback(error: unknown): boolean {
+  const message = inlineErrorMessage(error, '')
+  const code =
+    typeof error === 'object' && error !== null && 'code' in error
+      ? (error as { code?: unknown }).code
+      : undefined
+
+  return code === 4018 && /\buse command\.dispatch\b/i.test(message)
+}
+
 function isSessionNotFoundError(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error)
 
@@ -932,8 +942,15 @@ export function usePromptActions({
           renderSlashOutput(result?.warning ? `warning: ${result.warning}\n${body}` : body)
 
           return
-        } catch {
-          // Fall back to command.dispatch for skill/send/alias directives.
+        } catch (err) {
+          if (!isExplicitCommandDispatchFallback(err)) {
+            renderSlashOutput(`error: ${inlineErrorMessage(err, 'gateway request failed')}`)
+
+            return
+          }
+
+          // Only the gateway's stable 4018 directive authorizes the second
+          // hop for quick/Bundle/Skill and pending-input built-ins.
         }
 
         try {
@@ -963,7 +980,13 @@ export function usePromptActions({
 
           if (!message) {
             renderSlashOutput(
-              `/${name}: ${dispatch.type === 'skill' ? 'skill payload missing message' : 'empty message'}`
+              `/${name}: ${
+                dispatch.type === 'skill'
+                  ? 'skill payload missing message'
+                  : dispatch.type === 'bundle'
+                    ? 'bundle payload missing message'
+                    : 'empty message'
+              }`
             )
 
             return
@@ -971,6 +994,11 @@ export function usePromptActions({
 
           if (dispatch.type === 'skill') {
             renderSlashOutput(`⚡ loading skill: ${dispatch.name}`)
+          }
+
+          if (dispatch.type === 'bundle') {
+            const skipped = dispatch.missing.length ? `; skipped ${dispatch.missing.length} missing` : ''
+            renderSlashOutput(`⚡ loading skill bundle: ${dispatch.name} (${dispatch.skills.length} skills${skipped})`)
           }
 
           if (busyRef.current) {

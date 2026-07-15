@@ -5,7 +5,10 @@ const {
 } = require('./enterprise-desktop-config.cjs')
 const {
   ENTERPRISE_UI_POLICY_DEFAULT,
+  readManagedPolicySnapshot,
+  replaceManagedPolicySnapshot,
   resolveManagedHermesHome,
+  validateManagedBootstrap,
   writeManagedRuntimeHome
 } = require('./enterprise-runtime-home.cjs')
 
@@ -46,6 +49,9 @@ function disabledState() {
     modelRuntimeHash: null,
     modelProfiles: [],
     policyHash: null,
+    policyRefreshError: null,
+    policyRefreshStatus: 'idle',
+    policyStale: false,
     policyVersion: null,
     providerRuntime: null,
     protocolSnapshot: null,
@@ -179,6 +185,43 @@ function publicStateAllowsModel(state, model) {
   return profiles.some(profile => modelProfileValues(profile).includes(requested))
 }
 
+function policyRefreshFailureMessage(error) {
+  const status = Number(error?.status)
+
+  return Number.isInteger(status) && status >= 400 && status <= 599
+    ? `Enterprise policy refresh failed (HTTP ${status}).`
+    : 'Enterprise policy refresh failed.'
+}
+
+function policyRefreshFailureCategory(error) {
+  const status = Number(error?.status)
+  if (Number.isInteger(status) && status >= 400 && status <= 599) {
+    return 'http_error'
+  }
+
+  return error?.code === 'enterprise_policy_payload_invalid' ? 'payload_invalid' : 'io_error'
+}
+
+function publicStateWithPolicy(state, policy, refresh = {}) {
+  return {
+    ...state,
+    authenticated: true,
+    capabilities: policy.capabilities || {},
+    generatedAt: policy.generatedAt || null,
+    lockedSurfaces: Array.isArray(policy.lockedSurfaces) ? policy.lockedSurfaces : [],
+    policyHash: policy.policyHash || null,
+    policyRefreshError: refresh.error || null,
+    policyRefreshStatus: refresh.status || 'current',
+    policyStale: Boolean(refresh.stale),
+    policyVersion: policy.policyVersion || null,
+    role: policy.role || null,
+    status: 'authenticated',
+    toolPolicySnapshot: policy.toolPolicySnapshot || null,
+    uiPolicy: policy.uiPolicy || ENTERPRISE_UI_POLICY_DEFAULT,
+    user: policy.user || state.user || null
+  }
+}
+
 class EnterpriseRuntime {
   constructor({
     authStore,
@@ -187,6 +230,8 @@ class EnterpriseRuntime {
     gatewayUrl,
     homeWriter = writeManagedRuntimeHome,
     managedHermesHome,
+    policyReader = readManagedPolicySnapshot,
+    policyWriter = replaceManagedPolicySnapshot,
     rememberLog = () => {},
     userDataPath
   } = {}) {
@@ -196,10 +241,13 @@ class EnterpriseRuntime {
     this.client = client || (this.enabled && this.gatewayUrl ? createEnterpriseGatewayClient({ baseUrl: this.gatewayUrl }) : null)
     this.homeWriter = homeWriter
     this.managedHermesHome = managedHermesHome || ''
+    this.policyReader = policyReader
+    this.policyWriter = policyWriter
     this.userDataPath = userDataPath || ''
     this.rememberLog = rememberLog
     this.lastPublicState = this.enabled ? unauthenticatedState() : disabledState()
     this.lastLaunch = null
+    this.policyRefreshPromise = null
   }
 
   isEnabled() {
@@ -315,6 +363,77 @@ class EnterpriseRuntime {
     return this.lastPublicState
   }
 
+  refreshPolicy() {
+    if (this.policyRefreshPromise) {
+      return this.policyRefreshPromise
+    }
+
+    let operationWithCleanup
+    operationWithCleanup = this.refreshPolicyOnce().finally(() => {
+      if (this.policyRefreshPromise === operationWithCleanup) {
+        this.policyRefreshPromise = null
+      }
+    })
+    this.policyRefreshPromise = operationWithCleanup
+
+    return operationWithCleanup
+  }
+
+  async refreshPolicyOnce() {
+    if (!this.enabled) {
+      return disabledState()
+    }
+
+    const session = this.authStore.readSession()
+    if (!session?.desktopToken) {
+      this.lastPublicState = unauthenticatedState('Enterprise sign-in is required before refreshing policy.')
+      return this.lastPublicState
+    }
+
+    let hermesHome = this.lastLaunch?.hermesHome || this.managedHomeFor({ session })
+
+    try {
+      const bootstrap = await this.client.bootstrap(session.desktopToken)
+      hermesHome = this.managedHomeFor({ bootstrap, session })
+      const result = this.policyWriter({ bootstrap, hermesHome })
+      this.lastPublicState = publicStateWithPolicy(this.lastPublicState, result.policy, {
+        status: 'current',
+        stale: false
+      })
+      this.rememberLog('[enterprise-policy] refresh succeeded')
+    } catch (error) {
+      const cached = this.policyReader({ hermesHome })
+      const message = policyRefreshFailureMessage(error)
+      const category = policyRefreshFailureCategory(error)
+      const status = Number.isInteger(Number(error?.status)) ? Number(error.status) : 'n/a'
+
+      this.rememberLog(`[enterprise-policy] refresh failed category=${category} status=${status} lastKnownGood=${cached.valid}`)
+
+      if (cached.valid) {
+        this.lastPublicState = publicStateWithPolicy(this.lastPublicState, cached.policy, {
+          error: message,
+          status: 'stale',
+          stale: true
+        })
+      } else {
+        this.lastPublicState = {
+          ...this.lastPublicState,
+          authenticated: true,
+          generatedAt: null,
+          policyHash: null,
+          policyRefreshError: message,
+          policyRefreshStatus: 'failed',
+          policyStale: false,
+          policyVersion: null,
+          status: 'authenticated',
+          toolPolicySnapshot: null
+        }
+      }
+    }
+
+    return this.lastPublicState
+  }
+
   managedHomeFor({ bootstrap = null, session = null } = {}) {
     if (this.managedHermesHome) {
       return this.managedHermesHome
@@ -340,10 +459,9 @@ class EnterpriseRuntime {
       throw new Error('Enterprise sign-in is required before starting Hermes.')
     }
 
-    const [bootstrap, modelProfilesPayload] = await Promise.all([
-      this.client.bootstrap(session.desktopToken),
-      this.client.modelProfiles(session.desktopToken)
-    ])
+    const bootstrap = await this.client.bootstrap(session.desktopToken)
+    validateManagedBootstrap(bootstrap)
+    const modelProfilesPayload = await this.client.modelProfiles(session.desktopToken)
     const modelProfiles = extractModelProfilesResponse(modelProfilesPayload)
     const effectivePreferredModel = preferredModel || preferredModelFromPublicState(this.lastPublicState)
 
@@ -390,10 +508,9 @@ class EnterpriseRuntime {
       throw new Error(`Model is not allowed by enterprise policy: ${model}`)
     }
 
-    const [bootstrap, modelProfiles] = await Promise.all([
-      this.client.bootstrap(session.desktopToken),
-      this.client.modelProfiles(session.desktopToken)
-    ])
+    const bootstrap = await this.client.bootstrap(session.desktopToken)
+    validateManagedBootstrap(bootstrap)
+    const modelProfiles = await this.client.modelProfiles(session.desktopToken)
     const profiles = extractModelProfilesResponse(modelProfiles)
     const manifest = await this.client.runtimeManifest(
       session.desktopToken,
@@ -424,7 +541,10 @@ module.exports = {
   disabledState,
   extractModelProfilesResponse,
   publicStateAllowsModel,
+  policyRefreshFailureCategory,
   resolveEnterpriseRuntimeOptions,
   runtimeManifestRequestBody,
+  policyRefreshFailureMessage,
+  publicStateWithPolicy,
   unauthenticatedState
 }

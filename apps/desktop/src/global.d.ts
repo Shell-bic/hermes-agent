@@ -45,6 +45,7 @@ declare global {
         refresh: () => Promise<EnterpriseDesktopState>
         refreshWeCom: () => Promise<EnterpriseLoginState>
         selectLoginMethod: (method: EnterpriseLoginMethod) => Promise<EnterpriseLoginState>
+        refreshPolicy: () => Promise<EnterpriseDesktopState>
         selectModel: (model: string) => Promise<EnterpriseDesktopState>
         skillHub: {
           detail: (key: string) => Promise<EnterpriseSkillHubItem>
@@ -575,6 +576,9 @@ export interface EnterpriseDesktopState {
   modelRuntimeHash?: null | string
   modelProfiles: EnterpriseModelProfileSummary[]
   policyHash: null | string
+  policyRefreshError?: null | string
+  policyRefreshStatus?: 'current' | 'failed' | 'idle' | 'refreshing' | 'stale'
+  policyStale?: boolean
   policyVersion: null | string
   providerRuntime?: EnterpriseProviderRuntimeMetadata | null
   protocolSnapshot?: null | Record<string, unknown>

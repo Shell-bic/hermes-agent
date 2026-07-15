@@ -15,6 +15,7 @@ const selectToolsetProvider = vi.fn()
 const listEnterpriseSkills = vi.fn()
 const detailEnterpriseSkill = vi.fn()
 const installEnterpriseSkill = vi.fn()
+const refreshEnterprisePolicyBridge = vi.fn()
 
 vi.mock('@/hermes', () => ({
   getSkillContent: (name: string) => getSkillContent(name),
@@ -95,10 +96,12 @@ beforeEach(() => {
   listEnterpriseSkills.mockReset()
   detailEnterpriseSkill.mockReset()
   installEnterpriseSkill.mockReset()
+  refreshEnterprisePolicyBridge.mockReset()
   Object.defineProperty(window, 'hermesDesktop', {
     configurable: true,
     value: {
       enterprise: {
+        refreshPolicy: () => refreshEnterprisePolicyBridge(),
         skillHub: {
           detail: (key: string) => detailEnterpriseSkill(key),
           install: (payload: unknown) => installEnterpriseSkill(payload),
@@ -121,6 +124,10 @@ beforeEach(() => {
   listEnterpriseSkills.mockResolvedValue({ items: [], page: 1, pageSize: 100, total: 0 })
   detailEnterpriseSkill.mockResolvedValue(null)
   installEnterpriseSkill.mockResolvedValue(null)
+  refreshEnterprisePolicyBridge.mockResolvedValue(managedEnterpriseState({
+    policyRefreshStatus: 'current',
+    policyStale: false
+  }))
 })
 
 afterEach(() => {
@@ -163,6 +170,22 @@ describe('SkillsView toolset management', () => {
     fireEvent.click(await screen.findByRole('button', { name: 'Show details for detail-skill' }))
     await waitFor(() => expect(detailEnterpriseSkill).toHaveBeenCalledWith('detail-skill'))
     expect(screen.getAllByText('Detailed enterprise workflow').length).toBeGreaterThanOrEqual(1)
+  })
+
+  it('refreshes enterprise policy through the narrow bridge and exposes last-known-good status', async () => {
+    $enterprise.set(managedEnterpriseState({ policyRefreshStatus: 'current', policyStale: false }))
+    refreshEnterprisePolicyBridge.mockResolvedValue(managedEnterpriseState({
+      policyRefreshError: 'Enterprise policy refresh failed (HTTP 503).',
+      policyRefreshStatus: 'stale',
+      policyStale: true
+    }))
+
+    await renderSkills('enterprise')
+    fireEvent.click(await screen.findByRole('button', { name: 'Refresh enterprise policy' }))
+
+    await waitFor(() => expect(refreshEnterprisePolicyBridge).toHaveBeenCalledTimes(1))
+    expect(await screen.findByText('Using last-known-good enterprise policy')).toBeTruthy()
+    expect(screen.getByText('Enterprise policy refresh failed (HTTP 503).')).toBeTruthy()
   })
 
   it('filters enterprise discovery by search and category', async () => {

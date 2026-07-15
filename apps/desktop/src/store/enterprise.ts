@@ -45,6 +45,9 @@ export const INITIAL_ENTERPRISE_STATE: EnterpriseDesktopState = {
   modelRuntimeHash: null,
   modelProfiles: [],
   policyHash: null,
+  policyRefreshError: null,
+  policyRefreshStatus: 'idle',
+  policyStale: false,
   policyVersion: null,
   providerRuntime: null,
   protocolSnapshot: null,
@@ -194,6 +197,26 @@ export async function loginEnterprise(input: EnterpriseDesktopLoginInput): Promi
   const state = await window.hermesDesktop.enterprise.login(input)
 
   return applyEnterpriseState(state)
+}
+
+export async function refreshEnterprisePolicy(): Promise<EnterpriseDesktopState> {
+  const state = $enterprise.get()
+  applyEnterpriseState({
+    ...state,
+    policyRefreshError: null,
+    policyRefreshStatus: 'refreshing'
+  })
+
+  try {
+    return applyEnterpriseState(await window.hermesDesktop.enterprise.refreshPolicy())
+  } catch (error) {
+    return applyEnterpriseState({
+      ...state,
+      policyRefreshError: error instanceof Error ? error.message : String(error),
+      policyRefreshStatus: state.policyHash ? 'stale' : 'failed',
+      policyStale: Boolean(state.policyHash)
+    })
+  }
 }
 
 export async function logoutEnterprise(): Promise<EnterpriseDesktopState> {

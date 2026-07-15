@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest'
 
 import type { ComposerAttachment } from '@/store/composer'
 
-import { coerceThinkingText, optimisticAttachmentRef } from './chat-runtime'
+import { coerceThinkingText, optimisticAttachmentRef, parseCommandDispatch } from './chat-runtime'
 
 const DATA_URL = 'data:image/png;base64,iVBORw0KGgoAAAANS'
 
@@ -50,5 +50,37 @@ describe('coerceThinkingText', () => {
         "◉_◉ processing... I don't see any current rewritten thinking or next thinking to process. Could you provide the thinking content you'd like me to rewrite?"
       )
     ).toBe('')
+  })
+})
+
+describe('parseCommandDispatch', () => {
+  it('preserves a bundle as a distinct dispatch type', () => {
+    expect(
+      parseCommandDispatch({
+        type: 'bundle',
+        name: 'Review Pack',
+        message: 'expanded bundle message',
+        skills: ['review', 'tests'],
+        missing: ['optional']
+      })
+    ).toEqual({
+      type: 'bundle',
+      name: 'Review Pack',
+      message: 'expanded bundle message',
+      skills: ['review', 'tests'],
+      missing: ['optional']
+    })
+  })
+
+  it('rejects malformed bundle metadata', () => {
+    expect(
+      parseCommandDispatch({
+        type: 'bundle',
+        name: 'Review Pack',
+        message: 'expanded bundle message',
+        skills: ['review', 42],
+        missing: []
+      })
+    ).toBeNull()
   })
 })

@@ -592,6 +592,11 @@ export interface Translations {
     enterpriseLoadFailed: string
     enterpriseInstallFailed: (name: string) => string
     enterpriseInstallSucceeded: string
+    enterprisePolicyCurrent: string
+    enterprisePolicyFailed: string
+    enterprisePolicyRefresh: string
+    enterprisePolicyRefreshing: string
+    enterprisePolicyStale: string
     noDescription: string
     skillGuidance: string
     toolCapability: string

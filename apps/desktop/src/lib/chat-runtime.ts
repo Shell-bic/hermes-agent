@@ -243,6 +243,21 @@ export function parseCommandDispatch(raw: unknown): CommandDispatchResponse | nu
     case 'skill':
       return typeof row.name === 'string' ? { type: 'skill', name: row.name, message: str(row.message) } : null
 
+    case 'bundle':
+      return typeof row.name === 'string' &&
+        Array.isArray(row.skills) &&
+        row.skills.every((value) => typeof value === 'string') &&
+        Array.isArray(row.missing) &&
+        row.missing.every((value) => typeof value === 'string')
+        ? {
+            type: 'bundle',
+            name: row.name,
+            message: str(row.message),
+            skills: row.skills,
+            missing: row.missing
+          }
+        : null
+
     case 'send':
       return typeof row.message === 'string' ? { type: 'send', message: row.message } : null
 

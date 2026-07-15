@@ -41,6 +41,7 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
     refresh: () => ipcRenderer.invoke('hermes:enterprise:refresh'),
     refreshWeCom: () => ipcRenderer.invoke('hermes:enterprise:wecom-refresh'),
     selectLoginMethod: method => ipcRenderer.invoke('hermes:enterprise:login-method-select', method),
+    refreshPolicy: () => ipcRenderer.invoke('hermes:enterprise:refreshPolicy'),
     selectModel: model => ipcRenderer.invoke('hermes:enterprise:selectModel', model),
     skillHub: {
       detail: key => ipcRenderer.invoke('hermes:enterprise:skill-hub:detail', key).then(unwrapEnterpriseSkillHub),

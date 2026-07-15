@@ -10,7 +10,10 @@ const {
   enterpriseUserPathSegment,
   normalizeGatewayApiBaseUrl,
   publicEnterpriseState,
+  readManagedPolicySnapshot,
+  replaceManagedPolicySnapshot,
   resolveManagedHermesHome,
+  validateManagedBootstrap,
   writeManagedRuntimeHome
 } = require('./enterprise-runtime-home.cjs')
 
@@ -72,6 +75,49 @@ function manifest(overrides = {}) {
   }
 }
 
+function bootstrapPolicy(overrides = {}) {
+  const generatedAt = overrides.generatedAt || '2026-07-14T08:00:00Z'
+  const policyHash = overrides.policyHash || 'policy-hash-2'
+  const policyVersion = overrides.policyVersion || 'pv-2'
+  const baseSnapshot = manifest().toolPolicySnapshot
+  const nestedPolicyVersion = overrides.toolPolicySnapshot?.policyVersion || `tool-policy.v1+roles:${policyVersion}`
+
+  return {
+    capabilities: ['skills.manage'],
+    generatedAt,
+    lockedSurfaces: ['skills'],
+    policyHash,
+    policyVersion,
+    user: { displayName: 'Ada' },
+    ...overrides,
+    toolPolicySnapshot: {
+      ...baseSnapshot,
+      generatedAt,
+      policyHash,
+      policyVersion: nestedPolicyVersion,
+      ...(overrides.toolPolicySnapshot || {})
+    }
+  }
+}
+
+test('managed bootstrap validator accepts the Gateway dual-version contract and rejects invalid payloads locally', () => {
+  const valid = bootstrapPolicy({
+    policyVersion: 'role-policy.v1-abc123',
+    toolPolicySnapshot: { policyVersion: 'tool-policy.v1+roles:role-policy.v1-abc123' }
+  })
+
+  assert.equal(validateManagedBootstrap(valid), valid)
+  assert.throws(
+    () => validateManagedBootstrap({ ...valid, capabilities: ['skills.manage', 'skills.manage'] }),
+    error => {
+      assert.equal(error.code, 'enterprise_policy_payload_invalid')
+      assert.equal(error.message, 'Enterprise policy bootstrap payload is invalid.')
+      assert.equal(error.message.includes('skills.manage'), false)
+      return true
+    }
+  )
+})
+
 test('managed runtime home writes company-gateway config and token env only in private outputs', () => {
   const hermesHome = fs.mkdtempSync(path.join(os.tmpdir(), 'hermes-enterprise-home-'))
   const result = writeManagedRuntimeHome({
@@ -108,8 +154,8 @@ test('managed runtime home writes company-gateway config and token env only in p
 
   assert.match(config, /provider: "company-gateway"/)
   assert.match(config, /base_url: "https:\/\/gateway\.example\.com\/v1"/)
-  assert.match(config, /agent:\n  api_max_retries: 1/)
-  assert.match(config, /display:\n  language: "zh"/)
+  assert.match(config, /agent:\n {2}api_max_retries: 1/)
+  assert.match(config, /display:\n {2}language: "zh"/)
   assert.match(config, /api_mode: "chat_completions"/)
   assert.match(env, /COMPANY_GATEWAY_TOKEN="gateway-secret"/)
   assert.equal(result.env[GATEWAY_TOKEN_ENV], 'gateway-secret')
@@ -192,6 +238,223 @@ test('managed runtime home writes company-gateway config and token env only in p
   assert.deepEqual(result.publicState.lockedSurfaces, ['providers', 'env'])
   assert.deepEqual(result.publicState.uiPolicy, { defaultLocale: 'zh', allowLanguageChange: true, lockedLocale: false })
   assert.deepEqual(policy.uiPolicy, { defaultLocale: 'zh', allowLanguageChange: true, lockedLocale: false })
+})
+
+test('managed policy refresh atomically replaces only enterprise-policy.json', () => {
+  const hermesHome = fs.mkdtempSync(path.join(os.tmpdir(), 'hermes-enterprise-policy-refresh-'))
+  writeManagedRuntimeHome({
+    bootstrap: { user: { displayName: 'Ada' } },
+    hermesHome,
+    manifest: manifest()
+  })
+  const configPath = path.join(hermesHome, 'config.yaml')
+  const envPath = path.join(hermesHome, '.env')
+  const configBefore = fs.readFileSync(configPath, 'utf8')
+  const envBefore = fs.readFileSync(envPath, 'utf8')
+
+  const result = replaceManagedPolicySnapshot({
+    bootstrap: bootstrapPolicy(),
+    hermesHome
+  })
+
+  const policy = JSON.parse(fs.readFileSync(path.join(hermesHome, 'enterprise-policy.json'), 'utf8'))
+  assert.equal(result.policyVersion, 'pv-2')
+  assert.equal(result.policyHash, 'policy-hash-2')
+  assert.equal(result.generatedAt, '2026-07-14T08:00:00Z')
+  assert.deepEqual(policy.allowedModels, ['gpt-4.1', 'claude-sonnet'])
+  assert.equal(policy.policyVersion, 'pv-2')
+  assert.deepEqual(policy.lockedSurfaces, ['skills'])
+  assert.equal(fs.readFileSync(configPath, 'utf8'), configBefore)
+  assert.equal(fs.readFileSync(envPath, 'utf8'), envBefore)
+  assert.deepEqual(fs.readdirSync(hermesHome).filter(name => name.endsWith('.tmp')), [])
+  assert.equal(readManagedPolicySnapshot({ hermesHome }).valid, true)
+})
+
+test('managed policy reader rejects missing and locally damaged snapshots', () => {
+  const hermesHome = fs.mkdtempSync(path.join(os.tmpdir(), 'hermes-enterprise-policy-invalid-'))
+  assert.deepEqual(readManagedPolicySnapshot({ hermesHome }).reason, 'missing')
+  fs.writeFileSync(path.join(hermesHome, 'enterprise-policy.json'), '{not-json', 'utf8')
+  const damaged = readManagedPolicySnapshot({ hermesHome })
+  assert.equal(damaged.valid, false)
+  assert.equal(damaged.reason, 'invalid')
+})
+
+test('managed policy reader rejects semantic catalog damage and metadata mismatch', () => {
+  const hermesHome = fs.mkdtempSync(path.join(os.tmpdir(), 'hermes-enterprise-policy-semantic-damage-'))
+  const policyPath = path.join(hermesHome, 'enterprise-policy.json')
+  const valid = bootstrapPolicy()
+  const mutations = [
+    policy => { delete policy.toolPolicySnapshot.capabilityFlags },
+    policy => { policy.toolPolicySnapshot.skills[0].status = 'arbitrary' },
+    policy => { policy.toolPolicySnapshot.skills[0].key = '' },
+    policy => { policy.toolPolicySnapshot.skills.push({ ...policy.toolPolicySnapshot.skills[0], key: 'TERMINAL' }) },
+    policy => { policy.toolPolicySnapshot.policyVersion = '' },
+    policy => { policy.policyVersion = ' role-version-with-whitespace ' },
+    policy => { policy.toolPolicySnapshot.policyHash = 'different-hash' },
+    policy => { policy.toolPolicySnapshot.generatedAt = '2026-07-14T09:00:00Z' },
+    policy => { delete policy.lockedSurfaces },
+    policy => { policy.lockedSurfaces = null },
+    policy => { policy.lockedSurfaces = 'skills' },
+    policy => { policy.lockedSurfaces = ['skills', 'skills'] },
+    policy => { policy.lockedSurfaces = ['../skills'] },
+    policy => { policy.lockedSurfaces = ['skills/legacy'] },
+    policy => { policy.lockedSurfaces = ['skills\\legacy'] },
+    policy => { policy.lockedSurfaces = ['.skills'] },
+    policy => { policy.lockedSurfaces = ['skills\u0000legacy'] },
+    policy => { policy.lockedSurfaces = [`s${'x'.repeat(256)}`] },
+    policy => { policy.lockedSurfaces = ['__proto__'] },
+    policy => { delete policy.capabilities },
+    policy => { policy.capabilities = null },
+    policy => { policy.capabilities = ['skills.manage', 'skills.manage'] },
+    policy => { policy.capabilities = [' skills.manage '] },
+    policy => { policy.capabilities = ['skills/manage'] },
+    policy => { policy.capabilities = ['skills\\manage'] },
+    policy => { policy.capabilities = ['.skills.manage'] },
+    policy => { policy.capabilities = ['skills\nmanage'] },
+    policy => { policy.capabilities = [`c${'x'.repeat(256)}`] },
+    policy => { policy.capabilities = ['__proto__'] }
+  ]
+
+  for (const mutate of mutations) {
+    const damaged = structuredClone(valid)
+    mutate(damaged)
+    fs.writeFileSync(policyPath, JSON.stringify(damaged), 'utf8')
+    assert.equal(readManagedPolicySnapshot({ hermesHome }).valid, false)
+  }
+})
+
+test('managed policy refresh rejects invalid role policy arrays without replacing last-known-good', () => {
+  const hermesHome = fs.mkdtempSync(path.join(os.tmpdir(), 'hermes-enterprise-policy-role-arrays-'))
+  writeManagedRuntimeHome({
+    bootstrap: { user: { displayName: 'Ada' } },
+    hermesHome,
+    manifest: manifest()
+  })
+  const policyPath = path.join(hermesHome, 'enterprise-policy.json')
+  const original = fs.readFileSync(policyPath)
+  const mutations = [
+    policy => { delete policy.lockedSurfaces },
+    policy => { policy.lockedSurfaces = null },
+    policy => { policy.lockedSurfaces = 'skills' },
+    policy => { policy.lockedSurfaces = { key: 'skills' } },
+    policy => { policy.lockedSurfaces = ['skills', 'skills'] },
+    policy => { policy.lockedSurfaces = ['../skills'] },
+    policy => { policy.lockedSurfaces = ['skills/legacy'] },
+    policy => { policy.lockedSurfaces = ['skills\\legacy'] },
+    policy => { policy.lockedSurfaces = ['.skills'] },
+    policy => { policy.lockedSurfaces = ['skills\u0000legacy'] },
+    policy => { policy.lockedSurfaces = [`s${'x'.repeat(256)}`] },
+    policy => { policy.lockedSurfaces = ['__proto__'] },
+    policy => { policy.lockedSurfaces = [' skills '] },
+    policy => { policy.lockedSurfaces = [42] },
+    policy => { delete policy.capabilities },
+    policy => { policy.capabilities = null },
+    policy => { policy.capabilities = 'skills.manage' },
+    policy => { policy.capabilities = { 'skills.manage': true } },
+    policy => { policy.capabilities = ['skills.manage', 'skills.manage'] },
+    policy => { policy.capabilities = ['../skills.manage'] },
+    policy => { policy.capabilities = ['skills/manage'] },
+    policy => { policy.capabilities = ['skills\\manage'] },
+    policy => { policy.capabilities = ['.skills.manage'] },
+    policy => { policy.capabilities = ['skills\nmanage'] },
+    policy => { policy.capabilities = [`c${'x'.repeat(256)}`] },
+    policy => { policy.capabilities = ['__proto__'] },
+    policy => { policy.capabilities = [' skills.manage '] },
+    policy => { policy.capabilities = [42] }
+  ]
+
+  for (const mutate of mutations) {
+    const invalid = bootstrapPolicy()
+    mutate(invalid)
+    assert.throws(
+      () => replaceManagedPolicySnapshot({ bootstrap: invalid, hermesHome }),
+      /bootstrap payload is invalid/
+    )
+    assert.deepEqual(fs.readFileSync(policyPath), original)
+  }
+})
+
+test('managed policy refresh preserves Unicode safe unknown role policy values through 256 characters', () => {
+  const hermesHome = fs.mkdtempSync(path.join(os.tmpdir(), 'hermes-enterprise-policy-unknown-values-'))
+  const maximumCapability = `A${'界'.repeat(255)}`
+  const maximumLockedSurface = `9${'域'.repeat(255)}`
+  const bootstrap = bootstrapPolicy({
+    capabilities: ['历史能力.财务', maximumCapability],
+    lockedSurfaces: ['旧版界面', maximumLockedSurface]
+  })
+
+  const result = replaceManagedPolicySnapshot({ bootstrap, hermesHome })
+  const policy = JSON.parse(fs.readFileSync(result.policyPath, 'utf8'))
+
+  assert.deepEqual(policy.capabilities, ['历史能力.财务', maximumCapability])
+  assert.deepEqual(policy.lockedSurfaces, ['旧版界面', maximumLockedSurface])
+  assert.equal(readManagedPolicySnapshot({ hermesHome }).valid, true)
+})
+
+test('managed policy refresh preserves distinct role and tool-policy version domains', () => {
+  const hermesHome = fs.mkdtempSync(path.join(os.tmpdir(), 'hermes-enterprise-policy-version-domains-'))
+  const bootstrap = bootstrapPolicy({
+    policyVersion: 'role-policy.v1-abc123',
+    toolPolicySnapshot: { policyVersion: 'tool-policy.v1+roles:role-policy.v1-abc123' }
+  })
+
+  const result = replaceManagedPolicySnapshot({ bootstrap, hermesHome })
+  const policy = JSON.parse(fs.readFileSync(result.policyPath, 'utf8'))
+
+  assert.equal(policy.policyVersion, 'role-policy.v1-abc123')
+  assert.equal(policy.toolPolicySnapshot.policyVersion, 'tool-policy.v1+roles:role-policy.v1-abc123')
+  assert.equal(readManagedPolicySnapshot({ hermesHome }).valid, true)
+})
+
+test('managed policy refresh rejects bootstrap metadata mismatch without replacing last-known-good', () => {
+  const hermesHome = fs.mkdtempSync(path.join(os.tmpdir(), 'hermes-enterprise-policy-bootstrap-mismatch-'))
+  writeManagedRuntimeHome({
+    bootstrap: { user: { displayName: 'Ada' } },
+    hermesHome,
+    manifest: manifest()
+  })
+  const policyPath = path.join(hermesHome, 'enterprise-policy.json')
+  const original = fs.readFileSync(policyPath, 'utf8')
+  const mismatched = bootstrapPolicy()
+  mismatched.toolPolicySnapshot.policyHash = 'nested-mismatch'
+
+  assert.throws(
+    () => replaceManagedPolicySnapshot({ bootstrap: mismatched, hermesHome }),
+    /bootstrap payload is invalid/
+  )
+  assert.equal(fs.readFileSync(policyPath, 'utf8'), original)
+})
+
+test('managed policy refresh preserves the original file when atomic rename fails', () => {
+  const hermesHome = fs.mkdtempSync(path.join(os.tmpdir(), 'hermes-enterprise-policy-rename-failure-'))
+  writeManagedRuntimeHome({
+    bootstrap: { user: { displayName: 'Ada' } },
+    hermesHome,
+    manifest: manifest()
+  })
+  const policyPath = path.join(hermesHome, 'enterprise-policy.json')
+  const original = fs.readFileSync(policyPath, 'utf8')
+  const fsImpl = {
+    existsSync: fs.existsSync,
+    mkdirSync: fs.mkdirSync,
+    readFileSync: fs.readFileSync,
+    renameSync: () => {
+      throw new Error('simulated atomic rename failure')
+    },
+    unlinkSync: fs.unlinkSync,
+    writeFileSync: fs.writeFileSync
+  }
+
+  assert.throws(
+    () => replaceManagedPolicySnapshot({
+      bootstrap: bootstrapPolicy(),
+      fsImpl,
+      hermesHome
+    }),
+    /simulated atomic rename failure/
+  )
+  assert.equal(fs.readFileSync(policyPath, 'utf8'), original)
+  assert.deepEqual(fs.readdirSync(hermesHome).filter(name => name.endsWith('.tmp')), [])
 })
 
 test('public enterprise state degrades older manifests without tool policy snapshot', () => {
@@ -577,7 +840,7 @@ test('managed config preserves an existing supported explicit display language',
   })
 
   const config = fs.readFileSync(path.join(hermesHome, 'config.yaml'), 'utf8')
-  assert.match(config, /display:\n  language: "ja"/)
+  assert.match(config, /display:\n {2}language: "ja"/)
 })
 
 test('managed config falls back to zh when existing display language is unsupported', () => {
@@ -592,7 +855,7 @@ test('managed config falls back to zh when existing display language is unsuppor
   })
 
   const config = fs.readFileSync(path.join(hermesHome, 'config.yaml'), 'utf8')
-  assert.match(config, /display:\n  language: "zh"/)
+  assert.match(config, /display:\n {2}language: "zh"/)
 })
 
 test('managed runtime home is scoped by enterprise user identity', () => {

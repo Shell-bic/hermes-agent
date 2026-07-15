@@ -4,8 +4,10 @@ export interface CommandsCatalogSection {
 }
 
 export interface CommandsCatalogLike {
+  bundle_count?: number
   categories?: CommandsCatalogSection[]
   pairs?: [string, string][]
+  plugin_count?: number
   skill_count?: number
   warning?: string
 }

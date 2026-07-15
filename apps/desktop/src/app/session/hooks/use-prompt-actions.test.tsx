@@ -1,4 +1,5 @@
 import { cleanup, render, waitFor } from '@testing-library/react'
+import { JsonRpcGatewayError } from '@hermes/shared'
 import type { MutableRefObject } from 'react'
 import { useEffect, useRef } from 'react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
@@ -408,6 +409,105 @@ describe('usePromptActions desktop slash pickers', () => {
     expect(requestGateway).not.toHaveBeenCalled()
     expect($currentModel.get()).toBe('enterprise/allowed')
     expect($currentProvider.get()).toBe('company-gateway')
+  })
+
+  it('keeps desktop action and unavailable roots out of dynamic backend dispatch', async () => {
+    const requestGateway = vi.fn(async (method: string) =>
+      (method === 'commands.catalog' ? { pairs: [] } : {}) as never
+    )
+
+    let handle: HarnessHandle | null = null
+    render(<Harness onReady={h => (handle = h)} refreshSessions={async () => undefined} requestGateway={requestGateway} />)
+
+    await handle!.submitText('/help')
+    await handle!.submitText('/new')
+    await handle!.submitText('/approve')
+
+    expect(requestGateway).toHaveBeenCalledWith('commands.catalog', {
+      session_id: RUNTIME_SESSION_ID
+    })
+    expect(requestGateway).not.toHaveBeenCalledWith('slash.exec', expect.anything())
+    expect(requestGateway).not.toHaveBeenCalledWith('command.dispatch', expect.anything())
+  })
+})
+
+describe('usePromptActions slash fallback boundary', () => {
+  afterEach(() => {
+    cleanup()
+    vi.restoreAllMocks()
+  })
+
+  it.each([
+    ['my-quick', 'quick command'],
+    ['review-pack', 'bundle command'],
+    ['case-skill', 'skill command'],
+    ['retry', 'pending-input command']
+  ])('uses command.dispatch only for an explicit 4018 %s fallback', async (command, reason) => {
+    const methods: string[] = []
+    const requestGateway = vi.fn(async (method: string) => {
+      methods.push(method)
+      if (method === 'slash.exec') {
+        throw new JsonRpcGatewayError(`${reason}: use command.dispatch for /${command}`, 4018)
+      }
+      if (method === 'command.dispatch') {
+        return { type: 'exec', output: 'fallback complete' } as never
+      }
+
+      return {} as never
+    })
+
+    let handle: HarnessHandle | null = null
+    render(<Harness onReady={h => (handle = h)} refreshSessions={async () => undefined} requestGateway={requestGateway} />)
+
+    expect(await handle!.submitText(`/${command} KeepCase ARG`)).toBe(true)
+    expect(methods).toEqual(['slash.exec', 'command.dispatch'])
+  })
+
+  it.each([
+    'gateway exploded',
+    '503: slash worker start failed',
+    'transport closed',
+    'request timeout'
+  ])('does not redispatch a generic slash.exec failure: %s', async errorMessage => {
+    const methods: string[] = []
+    const requestGateway = vi.fn(async (method: string) => {
+      methods.push(method)
+      if (method === 'slash.exec') {
+        throw new Error(errorMessage)
+      }
+
+      return {} as never
+    })
+
+    let handle: HarnessHandle | null = null
+    render(<Harness onReady={h => (handle = h)} refreshSessions={async () => undefined} requestGateway={requestGateway} />)
+
+    expect(await handle!.submitText('/generic-extension KeepCase ARG')).toBe(true)
+    expect(methods).toEqual(['slash.exec'])
+    expect(requestGateway).not.toHaveBeenCalledWith('command.dispatch', expect.anything())
+  })
+
+  it.each([
+    ['missing code', new Error('4018: bundle command: use command.dispatch for /forged')],
+    ['wrong code', new JsonRpcGatewayError('4018: bundle command: use command.dispatch for /forged', 5030)],
+    ['missing fallback message', new JsonRpcGatewayError('ordinary gateway failure', 4018)]
+  ])('does not redispatch a text-forged fallback with %s', async (_label, gatewayError) => {
+    const methods: string[] = []
+    const requestGateway = vi.fn(async (method: string) => {
+      methods.push(method)
+      if (method === 'slash.exec') {
+        throw gatewayError
+      }
+
+      return {} as never
+    })
+
+    let handle: HarnessHandle | null = null
+    render(<Harness onReady={h => (handle = h)} refreshSessions={async () => undefined} requestGateway={requestGateway} />)
+
+    expect(await handle!.submitText('/forged KeepCase ARG')).toBe(true)
+    expect(methods).toEqual(['slash.exec'])
+    expect(requestGateway).not.toHaveBeenCalledWith('command.dispatch', expect.anything())
   })
 })
 

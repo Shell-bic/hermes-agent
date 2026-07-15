@@ -5589,6 +5589,10 @@ ipcMain.handle('hermes:enterprise:refresh', async event => {
   assertTrustedEnterpriseSender(event)
   return enterpriseRuntime.refreshPublicState()
 })
+ipcMain.handle('hermes:enterprise:refreshPolicy', async event => {
+  assertTrustedEnterpriseSender(event)
+  return enterpriseRuntime.refreshPolicy()
+})
 ipcMain.handle('hermes:enterprise:login-methods', async event => {
   assertTrustedEnterpriseSender(event, { mainWindowOnly: true })
   return enterpriseWeComController.initialize()
