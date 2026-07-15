@@ -1031,6 +1031,17 @@ def _parse_wake_gate(script_output: str) -> bool:
 
 
 def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
+    """Assemble one Cron prompt under a frozen enterprise Skill policy."""
+    from hermes_cli.enterprise_policy import skill_policy_operation
+
+    with skill_policy_operation():
+        return _build_job_prompt_with_policy(job, prerun_script=prerun_script)
+
+
+def _build_job_prompt_with_policy(
+    job: dict,
+    prerun_script: Optional[tuple] = None,
+) -> str:
     """Build the effective prompt for a cron job, optionally loading one or more skills first.
 
     Args:
@@ -1158,11 +1169,33 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
             user_prompt=user_prompt,
         )
 
-    from tools.skills_tool import skill_view
+    from tools.skills_tool import skill_runtime_preflight, skill_view
     from tools.skill_usage import bump_use
-    from agent.skill_bundles import build_bundle_invocation_message, resolve_bundle_command_key
+    from agent.skill_bundles import (
+        build_bundle_invocation_message,
+        preflight_bundle_skills,
+        resolve_bundle_command_key,
+    )
+
+    # Authorize the complete Cron Skill set before loading the first body or
+    # triggering preprocessing, environment, credential, or usage side effects.
+    for skill_name in skill_names:
+        bundle_key = resolve_bundle_command_key(skill_name.lstrip("/"))
+        if bundle_key:
+            preflight_bundle_skills(bundle_key)
+            continue
+        preflight = json.loads(skill_runtime_preflight(skill_name))
+        if (
+            not preflight.get("success")
+            and preflight.get("errorCode") == "enterprise_skill_policy_denied"
+        ):
+            from hermes_cli.enterprise_policy import EnterpriseSkillPolicyDenied
+
+            raise EnterpriseSkillPolicyDenied(preflight)
 
     parts = []
+    resolved_parts: list[list[str] | str] = []
+    usage_names: list[str] = []
     skipped: list[str] = []
     for skill_name in skill_names:
         # Cron jobs historically accepted only skill names here, but the CLI/gateway
@@ -1175,12 +1208,12 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
                 bundle_key,
                 user_instruction="",
                 task_id=str(job.get("id") or "") or None,
+                bump_usage=False,
             )
             if bundle_payload:
                 bundle_message, _loaded_bundle_skills, _missing_bundle_skills = bundle_payload
-                if parts:
-                    parts.append("")
-                parts.append(bundle_message)
+                resolved_parts.append(bundle_message)
+                usage_names.extend(_loaded_bundle_skills)
                 continue
             logger.warning(
                 "Cron job '%s': bundle '%s' could not load any skills, skipping",
@@ -1197,27 +1230,39 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
             skipped.append(skill_name)
             continue
         if not loaded.get("success"):
+            if loaded.get("errorCode") == "enterprise_skill_policy_denied":
+                from hermes_cli.enterprise_policy import EnterpriseSkillPolicyDenied
+
+                raise EnterpriseSkillPolicyDenied(loaded)
             error = loaded.get("error") or f"Failed to load skill '{skill_name}'"
             logger.warning("Cron job '%s': skill not found, skipping — %s", job.get("name", job.get("id")), error)
             skipped.append(skill_name)
             continue
 
-        # Bump usage so the curator sees this skill as actively used.
-        try:
-            bump_use(skill_name)
-        except Exception:
-            logger.debug("Cron job: failed to bump skill usage for '%s'", skill_name, exc_info=True)
-
         content = str(loaded.get("content") or "").strip()
-        if parts:
-            parts.append("")
-        parts.extend(
+        resolved_parts.append(
             [
                 f'[IMPORTANT: The user has invoked the "{skill_name}" skill, indicating they want you to follow its instructions. The full skill content is loaded below.]',
                 "",
                 content,
             ]
         )
+        usage_names.append(str(loaded.get("name") or skill_name))
+
+    # No enterprise policy denial occurred for any member. Only now publish
+    # message blocks and usage side effects, so Cron assembly is all-or-none.
+    for usage_name in usage_names:
+        try:
+            bump_use(usage_name)
+        except Exception:
+            logger.debug("Cron job: failed to bump skill usage for '%s'", usage_name, exc_info=True)
+    for resolved_part in resolved_parts:
+        if parts:
+            parts.append("")
+        if isinstance(resolved_part, list):
+            parts.extend(resolved_part)
+        else:
+            parts.append(resolved_part)
 
     if skipped:
         notice = (

@@ -444,6 +444,14 @@ class PluginContext:
                 self.manifest.name,
             )
             return
+        if not callable(handler):
+            logger.warning(
+                "Plugin '%s' tried to register command '/%s' with a non-callable "
+                "handler. Skipping.",
+                self.manifest.name,
+                clean,
+            )
+            return
 
         # Reject if it conflicts with a built-in command
         try:
@@ -1924,8 +1932,9 @@ def get_plugin_context_engine():
 
 def get_plugin_command_handler(name: str) -> Optional[Callable]:
     """Return the handler for a plugin-registered slash command, or ``None``."""
-    entry = _ensure_plugins_discovered()._plugin_commands.get(name)
-    return entry["handler"] if entry else None
+    entry = _ensure_plugins_discovered()._plugin_commands.get(name.lower())
+    handler = entry.get("handler") if isinstance(entry, dict) else None
+    return handler if callable(handler) else None
 
 
 _PLUGIN_COMMAND_AWAIT_TIMEOUT_SECS = 30.0
@@ -1983,7 +1992,14 @@ def get_plugin_commands() -> Dict[str, dict]:
     Triggers idempotent plugin discovery so callers can use plugin commands
     before any explicit discover_plugins() call.
     """
-    return _ensure_plugins_discovered()._plugin_commands
+    commands = _ensure_plugins_discovered()._plugin_commands
+    return {
+        name: entry
+        for name, entry in commands.items()
+        if isinstance(name, str)
+        and isinstance(entry, dict)
+        and callable(entry.get("handler"))
+    }
 
 
 def get_plugin_auxiliary_tasks() -> List[Dict[str, Any]]:

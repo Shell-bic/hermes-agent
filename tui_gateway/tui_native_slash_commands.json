@@ -1,0 +1,76 @@
+{
+  "commands": [
+    {
+      "name": "compact",
+      "aliases": [],
+      "description": "Toggle compact display mode",
+      "category": "TUI"
+    },
+    {
+      "name": "details",
+      "aliases": ["detail"],
+      "description": "Control agent detail visibility",
+      "category": "TUI"
+    },
+    {
+      "name": "fortune",
+      "aliases": [],
+      "description": "Show a local fortune",
+      "category": "TUI"
+    },
+    {
+      "name": "heapdump",
+      "aliases": [],
+      "description": "Write a V8 heap snapshot and memory diagnostics",
+      "category": "TUI"
+    },
+    {
+      "name": "logs",
+      "aliases": [],
+      "description": "Show recent gateway log lines",
+      "category": "TUI"
+    },
+    {
+      "name": "mem",
+      "aliases": [],
+      "description": "Show live V8 heap and RSS numbers",
+      "category": "TUI"
+    },
+    {
+      "name": "mouse",
+      "aliases": ["scroll"],
+      "description": "Set mouse tracking preset [on|off|toggle|wheel|buttons|all]",
+      "category": "TUI"
+    },
+    {
+      "name": "replay",
+      "aliases": [],
+      "description": "Replay a completed spawn tree",
+      "category": "TUI"
+    },
+    {
+      "name": "replay-diff",
+      "aliases": [],
+      "description": "Diff two completed spawn trees",
+      "category": "TUI"
+    },
+    {
+      "name": "sessions",
+      "aliases": ["session"],
+      "description": "Switch between live TUI sessions",
+      "category": "TUI"
+    },
+    {
+      "name": "setup",
+      "aliases": [],
+      "description": "Run the full setup wizard",
+      "category": "TUI"
+    },
+    {
+      "name": "terminal-setup",
+      "aliases": [],
+      "description": "Configure IDE terminal keybindings",
+      "category": "TUI"
+    }
+  ]
+}

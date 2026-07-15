@@ -8210,15 +8210,75 @@ _TUI_HIDDEN: frozenset[str] = frozenset(
     }
 )
 
+_TUI_NATIVE_CONTRACT_PATH = Path(__file__).with_name(
+    "tui_native_slash_commands.json"
+)
+
+
+def _load_tui_native_commands(
+    contract_path: Path = _TUI_NATIVE_CONTRACT_PATH,
+) -> list[dict[str, Any]]:
+    """Load the cross-runtime contract for commands implemented by ui-tui.
+
+    The JSON contains only the ui-tui delta from ``COMMAND_REGISTRY``.  Keeping
+    it beside this package makes the same fact consumable by Python at runtime
+    and by the TypeScript parity test without duplicating the command list.
+    """
+    try:
+        payload = json.loads(contract_path.read_text(encoding="utf-8"))
+        commands = payload.get("commands", [])
+        if not isinstance(commands, list):
+            raise ValueError("commands must be a list")
+        normalized: list[dict[str, Any]] = []
+        seen_roots: set[str] = set()
+        for item in commands:
+            if (
+                not isinstance(item, dict)
+                or not isinstance(item.get("name"), str)
+                or not item["name"].strip().lstrip("/")
+            ):
+                raise ValueError("each command requires a name")
+            name = str(item["name"]).strip().lstrip("/").lower()
+            raw_aliases = item.get("aliases", [])
+            if not isinstance(raw_aliases, list) or any(
+                not isinstance(alias, str) or not alias.strip().lstrip("/")
+                for alias in raw_aliases
+            ):
+                raise ValueError("aliases must be a list of non-empty strings")
+            aliases = [
+                alias.strip().lstrip("/").lower()
+                for alias in raw_aliases
+            ]
+            roots = [name, *aliases]
+            if any(root in seen_roots for root in roots) or len(set(roots)) != len(roots):
+                raise ValueError("command roots must be unique")
+            seen_roots.update(roots)
+            normalized.append(
+                {
+                    "name": name,
+                    "aliases": aliases,
+                    "description": str(item.get("description") or "TUI command"),
+                    "category": str(item.get("category") or "TUI"),
+                }
+            )
+        return normalized
+    except Exception:
+        # This contract defines reserved roots.  Continuing with an empty list
+        # would let a dynamic command shadow ui-tui-native /setup, /fortune,
+        # and similar commands.  Fail closed with a stable, non-sensitive
+        # startup error; never reflect a local path or parser detail.
+        raise RuntimeError("TUI native slash command contract unavailable") from None
+
+
+_TUI_NATIVE_COMMANDS = _load_tui_native_commands()
+_TUI_NATIVE_ROOTS: dict[str, str] = {
+    f"/{root}": f"/{command['name']}"
+    for command in _TUI_NATIVE_COMMANDS
+    for root in (command["name"], *command["aliases"])
+}
 _TUI_EXTRA: list[tuple[str, str, str]] = [
-    ("/compact", "Toggle compact display mode", "TUI"),
-    ("/logs", "Show recent gateway log lines", "TUI"),
-    (
-        "/mouse",
-        "Set mouse tracking preset [on|off|toggle|wheel|buttons|all]",
-        "TUI",
-    ),
-    ("/sessions", "Switch between live TUI sessions", "TUI"),
+    (f"/{command['name']}", command["description"], command["category"])
+    for command in _TUI_NATIVE_COMMANDS
 ]
 
 # Commands that queue messages onto _pending_input in the CLI.
@@ -8230,13 +8290,175 @@ _PENDING_INPUT_COMMANDS: frozenset[str] = frozenset(
         "queue",
         "q",
         "steer",
-        "plan",
         "goal",
         "undo",
     }
 )
 
 _WORKER_BLOCKED_COMMANDS: frozenset[str] = frozenset({"snapshot", "snap"})
+
+
+def _quick_commands_by_name() -> dict[str, dict]:
+    """Return configured quick commands under case-insensitive root keys."""
+    from hermes_cli.commands import normalize_quick_commands
+
+    return normalize_quick_commands(_load_cfg().get("quick_commands", {}))
+
+
+def _slash_ownership_directory() -> tuple[dict[str, dict[str, dict]], list[str]]:
+    """Collect callable dynamic command metadata without executing handlers."""
+    candidates: dict[str, dict[str, dict]] = {}
+    warnings: list[str] = []
+
+    def register(
+        owner: str,
+        key: str,
+        description: str,
+        completion_meta: str,
+        payload=None,
+    ) -> None:
+        normalized = f"/{str(key).strip().lstrip('/')}".lower()
+        display_key = normalized
+        if display_key == "/" or owner in candidates.get(normalized, {}):
+            return
+        candidates.setdefault(normalized, {})[owner] = {
+            "key": display_key,
+            "owner": owner,
+            "description": description,
+            "completion_meta": completion_meta,
+            "payload": payload,
+        }
+
+    try:
+        for qname, qc in _quick_commands_by_name().items():
+            qtype = qc.get("type", "")
+            if qtype == "exec":
+                default_desc = f"exec: {qc.get('command', '')}"
+            elif qtype == "alias":
+                default_desc = f"alias → {qc.get('target', '')}"
+            else:
+                # Classic CLI may render a helpful unsupported-type error for
+                # an explicitly typed invalid quick command, but Gateway
+                # ownership only admits executable quick types. An invalid
+                # entry must not shadow a callable plugin, Bundle, or Skill.
+                continue
+            description = str(qc.get("description") or default_desc)
+            register("quick", qname, description, description, qc)
+    except Exception as exc:
+        warnings.append(f"quick_commands discovery unavailable: {exc}")
+
+    try:
+        from hermes_cli.plugins import get_plugin_commands
+
+        plugin_commands = get_plugin_commands() or {}
+        for name, info in sorted(plugin_commands.items()):
+            if not isinstance(info, dict) or not callable(info.get("handler")):
+                continue
+            description = str(info.get("description") or "Plugin command")
+            register("plugin", name, description, f"🔌 {description}", info)
+    except Exception as exc:
+        warnings.append(f"plugin command discovery unavailable: {exc}")
+
+    try:
+        from agent.skill_bundles import get_skill_bundles
+
+        for key, info in sorted(get_skill_bundles().items()):
+            if not isinstance(info, dict):
+                continue
+            description = str(info.get("description") or "Skill bundle")
+            skill_count = len(info.get("skills") or [])
+            register(
+                "bundle",
+                key,
+                description,
+                f"▣ {description} ({skill_count} skills)",
+                info,
+            )
+    except Exception as exc:
+        warnings.append(f"bundle discovery unavailable: {exc}")
+
+    try:
+        from agent.skill_commands import get_skill_commands
+
+        for key, info in sorted(get_skill_commands().items()):
+            if not isinstance(info, dict):
+                continue
+            description = str(info.get("description") or "Skill command")
+            register("skill", key, description, f"⚡ {description}", info)
+    except Exception as exc:
+        warnings.append(f"skill discovery unavailable: {exc}")
+
+    return candidates, warnings
+
+
+def _resolve_slash_ownership(
+    name: str,
+    directory: dict[str, dict[str, dict]] | None = None,
+) -> dict:
+    """Resolve one case-insensitive root under the reserved-first contract."""
+    normalized = f"/{str(name).strip().lstrip('/')}".lower()
+    variants = [normalized]
+    for candidate in (
+        normalized.replace("_", "-"),
+        normalized.replace("-", "_"),
+    ):
+        if candidate not in variants:
+            variants.append(candidate)
+
+    try:
+        from hermes_cli.commands import resolve_command
+
+        resolved = next(
+            (resolved for candidate in variants if (resolved := resolve_command(candidate))),
+            None,
+        )
+    except Exception:
+        resolved = None
+    if resolved is not None:
+        return {
+            "key": normalized,
+            "canonical": f"/{resolved.name}",
+            "owner": "reserved",
+        }
+
+    for candidate in variants:
+        canonical = _TUI_NATIVE_ROOTS.get(candidate)
+        if canonical is not None:
+            return {
+                "key": normalized,
+                "canonical": canonical,
+                "owner": "reserved",
+            }
+
+    if directory is None:
+        directory, _warnings = _slash_ownership_directory()
+    exact = directory.get(normalized, {})
+    equivalent_keys = variants[1:]
+    for owner in ("quick", "plugin", "bundle", "skill"):
+        info = exact.get(owner)
+        if info is None and owner in {"bundle", "skill"}:
+            info = next(
+                (
+                    directory.get(candidate, {}).get(owner)
+                    for candidate in equivalent_keys
+                    if directory.get(candidate, {}).get(owner) is not None
+                ),
+                None,
+            )
+        if info is not None:
+            return info
+    return {"key": normalized, "canonical": normalized, "owner": "unknown"}
+
+
+def _dynamic_slash_commands() -> tuple[dict[str, dict], list[str]]:
+    """Return non-reserved dynamic winners for catalog and completion."""
+    directory, warnings = _slash_ownership_directory()
+    commands: dict[str, dict] = {}
+    for normalized in sorted(directory):
+        winner = _resolve_slash_ownership(normalized, directory)
+        if winner["owner"] not in {"reserved", "unknown"}:
+            commands[normalized] = winner
+    return commands, warnings
 
 
 @method("commands.catalog")
@@ -8273,51 +8495,59 @@ def _(rid, params: dict) -> dict:
                 cat_order.append(cat)
             cat_map[cat].append([c, desc])
 
-        for name, desc, cat in _TUI_EXTRA:
+        catalog_roots = {pair[0].lower() for pair in all_pairs}
+        for command in _TUI_NATIVE_COMMANDS:
+            name = f"/{command['name']}"
+            desc = command["description"]
+            cat = command["category"]
+            canon[name.lower()] = name
+            for alias in command["aliases"]:
+                canon[f"/{alias}"] = name
+            if name.lower() in catalog_roots:
+                continue
             all_pairs.append([name, desc])
+            catalog_roots.add(name.lower())
             if cat not in cat_map:
                 cat_map[cat] = []
                 cat_order.append(cat)
             cat_map[cat].append([name, desc])
 
-        warning = ""
-        try:
-            qcmds = _load_cfg().get("quick_commands", {}) or {}
-            if isinstance(qcmds, dict) and qcmds:
-                bucket = "User commands"
-                if bucket not in cat_map:
-                    cat_map[bucket] = []
-                    cat_order.append(bucket)
-                for qname, qc in sorted(qcmds.items()):
-                    if not isinstance(qc, dict):
-                        continue
-                    key = f"/{qname}"
-                    canon[key.lower()] = key
-                    qtype = qc.get("type", "")
-                    if qtype == "exec":
-                        default_desc = f"exec: {qc.get('command', '')}"
-                    elif qtype == "alias":
-                        default_desc = f"alias → {qc.get('target', '')}"
-                    else:
-                        default_desc = qtype or "quick command"
-                    qdesc = str(qc.get("description") or default_desc)
-                    qdesc = qdesc[:120] + ("…" if len(qdesc) > 120 else "")
-                    all_pairs.append([key, qdesc])
-                    cat_map[bucket].append([key, qdesc])
-        except Exception as e:
-            if not warning:
-                warning = f"quick_commands discovery unavailable: {e}"
-
+        dynamic_commands, discovery_warnings = _dynamic_slash_commands()
+        dynamic_buckets = {
+            "quick": "User commands",
+            "plugin": "Tools & Skills",
+            "bundle": "Tools & Skills",
+            "skill": "Tools & Skills",
+        }
+        bundle_count = 0
         skill_count = 0
-        try:
-            from agent.skill_commands import scan_skill_commands
+        plugin_count = 0
+        for normalized_key, info in dynamic_commands.items():
+            # A dynamic winner may intentionally replace a built-in (for
+            # example quick_commands.retry after slash.exec's pending-input
+            # rejection). Remove the stale static row from every projection.
+            all_pairs = [pair for pair in all_pairs if pair[0].lower() != normalized_key]
+            for pairs in cat_map.values():
+                pairs[:] = [pair for pair in pairs if pair[0].lower() != normalized_key]
+            key = info["key"]
+            description = str(info["description"])
+            description = description[:120] + ("…" if len(description) > 120 else "")
+            pair = [key, description]
+            all_pairs.append(pair)
+            canon[normalized_key] = key
 
-            for k, info in sorted(scan_skill_commands().items()):
-                d = str(info.get("description", "Skill"))
-                all_pairs.append([k, d[:120] + ("…" if len(d) > 120 else "")])
+            bucket = dynamic_buckets[info["owner"]]
+            if bucket not in cat_map:
+                cat_map[bucket] = []
+                cat_order.append(bucket)
+            cat_map[bucket].append(pair)
+
+            if info["owner"] == "bundle":
+                bundle_count += 1
+            elif info["owner"] == "skill":
                 skill_count += 1
-        except Exception as e:
-            warning = f"skill discovery unavailable: {e}"
+            elif info["owner"] == "plugin":
+                plugin_count += 1
 
         for cat in cat_order:
             categories.append({"name": cat, "pairs": cat_map[cat]})
@@ -8331,7 +8561,9 @@ def _(rid, params: dict) -> dict:
                 "canon": canon,
                 "categories": categories,
                 "skill_count": skill_count,
-                "warning": warning,
+                "bundle_count": bundle_count,
+                "plugin_count": plugin_count,
+                "warning": "; ".join(discovery_warnings),
             },
         )
     except Exception as e:
@@ -8404,27 +8636,23 @@ def _(rid, params: dict) -> dict:
         return _err(rid, 5012, str(e))
 
 
-def _resolve_name(name: str) -> str:
-    try:
-        from hermes_cli.commands import resolve_command
-
-        r = resolve_command(name)
-        return r.name if r else name
-    except Exception:
-        return name
-
-
 @method("command.dispatch")
 def _(rid, params: dict) -> dict:
-    name, arg = params.get("name", "").lstrip("/"), params.get("arg", "")
-    resolved = _resolve_name(name)
-    if resolved != name:
-        name = resolved
+    from hermes_cli.enterprise_policy import EnterpriseSkillPolicyDenied
+
+    # Command roots are case-insensitive across discovery and slash.exec.
+    # Keep the argument byte-for-byte as supplied: paths, prompts, and shell
+    # fragments may be case-sensitive even though /REVIEW-PACK is not.
+    name = str(params.get("name", "")).lstrip("/").lower()
+    arg = params.get("arg", "")
+    directory, _warnings = _slash_ownership_directory()
+    ownership = _resolve_slash_ownership(name, directory)
+    owner = ownership["owner"]
+    name = str(ownership.get("canonical") or ownership.get("key") or name).lstrip("/")
     session = _sessions.get(params.get("session_id", ""))
 
-    qcmds = _load_cfg().get("quick_commands", {})
-    if name in qcmds:
-        qc = qcmds[name]
+    if owner == "quick":
+        qc = ownership.get("payload") or {}
         if qc.get("type") == "exec":
             r = subprocess.run(
                 qc.get("command", ""),
@@ -8448,29 +8676,69 @@ def _(rid, params: dict) -> dict:
             return _ok(rid, {"type": "exec", "output": output})
         if qc.get("type") == "alias":
             return _ok(rid, {"type": "alias", "target": qc.get("target", "")})
+        return _err(rid, 4018, "unsupported quick command type")
 
-    try:
-        from hermes_cli.plugins import (
-            get_plugin_command_handler,
-            resolve_plugin_command_result,
-        )
+    if owner == "plugin":
+        handler = (ownership.get("payload") or {}).get("handler")
+        if not callable(handler):
+            return _err(rid, 4011, f"unknown command: {name}")
+        try:
+            from hermes_cli.plugins import resolve_plugin_command_result
 
-        handler = get_plugin_command_handler(name)
-        if handler:
             result = resolve_plugin_command_result(handler(arg))
             return _ok(rid, {"type": "plugin", "output": str(result or "")})
-    except Exception:
-        pass
+        except Exception:
+            return _err(rid, 5019, "plugin_command_failed")
 
-    try:
-        from agent.skill_commands import (
-            scan_skill_commands,
-            build_skill_invocation_message,
-        )
+    bundle_key = ownership["key"] if owner == "bundle" else None
+    if bundle_key:
+        try:
+            from agent.skill_bundles import (
+                build_bundle_invocation_message,
+                get_skill_bundles,
+            )
 
-        cmds = scan_skill_commands()
-        key = f"/{name}"
-        if key in cmds:
+            bundle_result = build_bundle_invocation_message(
+                bundle_key,
+                arg,
+                task_id=session.get("session_key", "") if session else "",
+            )
+            if bundle_result:
+                msg, loaded_names, missing = bundle_result
+                bundle_info = get_skill_bundles().get(bundle_key, {})
+                return _ok(
+                    rid,
+                    {
+                        "type": "bundle",
+                        "message": msg,
+                        "name": bundle_info.get("name", name),
+                        "skills": loaded_names,
+                        "missing": missing,
+                    },
+                )
+            # The slug still belongs to the bundle.  Do not fall through to a
+            # colliding individual skill merely because every bundle member
+            # was missing or otherwise produced no loadable message.
+            return _err(rid, 5018, "bundle_load_failed")
+        except EnterpriseSkillPolicyDenied:
+            # Never serialize the exception: its source decision can contain
+            # managed-policy details, local paths, or credential-shaped values.
+            return _err(rid, 403, "enterprise_skill_policy_denied")
+        except Exception:
+            # Once discovery confirms ownership, every failure remains a
+            # bundle failure.  Never execute a colliding individual skill and
+            # never reflect exception text into the JSON-RPC response.
+            return _err(rid, 5018, "bundle_load_failed")
+
+    if owner == "skill":
+        key = ownership["key"]
+        try:
+            from agent.skill_commands import (
+                build_skill_invocation_message,
+                get_skill_commands,
+            )
+
+            cmds = get_skill_commands()
             msg = build_skill_invocation_message(
                 key, arg, task_id=session.get("session_key", "") if session else ""
             )
@@ -8480,11 +8748,14 @@ def _(rid, params: dict) -> dict:
                     {
                         "type": "skill",
                         "message": msg,
-                        "name": cmds[key].get("name", name),
+                        "name": cmds.get(key, {}).get("name", name),
                     },
                 )
-    except Exception:
-        pass
+            return _err(rid, 5017, "skill_load_failed")
+        except EnterpriseSkillPolicyDenied:
+            return _err(rid, 403, "enterprise_skill_policy_denied")
+        except Exception:
+            return _err(rid, 5017, "skill_load_failed")
 
     # ── Commands that queue messages onto _pending_input in the CLI ───
     # In the TUI the slash worker subprocess has no reader for that queue,
@@ -9177,13 +9448,11 @@ def _(rid, params: dict) -> dict:
         from prompt_toolkit.document import Document
         from prompt_toolkit.formatted_text import to_plain_text
 
-        from agent.skill_commands import get_skill_commands
-        from agent.skill_bundles import get_skill_bundles
-
-        completer = SlashCommandCompleter(
-            skill_commands_provider=lambda: get_skill_commands(),
-            skill_bundles_provider=lambda: get_skill_bundles(),
-        )
+        # SlashCommandCompleter supplies the stable built-in/subcommand
+        # behavior.  It also discovers plugins internally, so normalize its
+        # root-command rows against the same dynamic ownership directory used
+        # by commands.catalog before adding the winners below.
+        completer = SlashCommandCompleter()
         doc = Document(text, len(text))
         items = [
             {
@@ -9197,35 +9466,56 @@ def _(rid, params: dict) -> dict:
                 "meta": to_plain_text(c.display_meta) if c.display_meta else "",
             }
             for c in completer.get_completions(doc, None)
-        ][:30]
+        ]
         text_lower = text.lower()
         extras = [
             {
-                "text": "/compact",
-                "display": "/compact",
-                "meta": "Toggle compact display mode",
-            },
-            {
-                "text": "/details",
-                "display": "/details",
-                "meta": "Control agent detail visibility",
-            },
-            {
-                "text": "/logs",
-                "display": "/logs",
-                "meta": "Show recent gateway log lines",
-            },
-            {
-                "text": "/mouse",
-                "display": "/mouse",
-                "meta": "Set mouse tracking preset [on|off|toggle|wheel|buttons|all]",
-            },
+                "text": name,
+                "display": name,
+                "meta": description,
+            }
+            for name, description, _category in _TUI_EXTRA
         ]
         for extra in extras:
             if extra["text"].startswith(text_lower) and not any(
                 item["text"] == extra["text"] for item in items
             ):
                 items.append(extra)
+
+        if " " not in text:
+            dynamic_commands, _discovery_warnings = _dynamic_slash_commands()
+
+            def item_key(item: dict) -> str:
+                display = str(item.get("display") or "").strip().split(maxsplit=1)[0]
+                if display.startswith("/"):
+                    return display.lower()
+                replacement = str(item.get("text") or "").strip().split(maxsplit=1)[0]
+                return f"/{replacement.lstrip('/')}".lower() if replacement else ""
+
+            # Drop every completer copy owned by the production dynamic route;
+            # the authoritative winner is appended once below.
+            items = [
+                item
+                for item in items
+                if item_key(item) not in dynamic_commands
+            ]
+            seen = {item_key(item) for item in items}
+            word = text[1:]
+            word_lower = word.lower()
+            for normalized_key, info in dynamic_commands.items():
+                if normalized_key in seen:
+                    continue
+                cmd_name = str(info["key"])[1:]
+                if not cmd_name.lower().startswith(word_lower):
+                    continue
+                items.append(
+                    {
+                        "text": SlashCommandCompleter._completion_text(cmd_name, word),
+                        "display": info["key"],
+                        "meta": str(info["completion_meta"]),
+                    }
+                )
+                seen.add(normalized_key)
 
         details_items = _details_completions(text)
         if details_items is not None:
@@ -9239,7 +9529,7 @@ def _(rid, params: dict) -> dict:
 
         return _ok(
             rid,
-            {"items": items, "replace_from": text.rfind(" ") + 1 if " " in text else 1},
+            {"items": items[:30], "replace_from": text.rfind(" ") + 1 if " " in text else 1},
         )
     except Exception as e:
         return _err(rid, 5020, str(e))
@@ -9480,7 +9770,7 @@ def _(rid, params: dict) -> dict:
     if not cmd:
         return _err(rid, 4004, "empty command")
 
-    # Skill slash commands and _pending_input commands must NOT go through the
+    # Skill and bundle slash commands and _pending_input commands must NOT go through the
     # slash worker — see _PENDING_INPUT_COMMANDS definition above. Plugin
     # commands must also avoid the worker, but unlike skills/pending-input they
     # still return normal slash.exec output so the TUI keeps the pager path.
@@ -9489,12 +9779,16 @@ def _(rid, params: dict) -> dict:
     _cmd_base = (_cmd_parts[0] if _cmd_parts else "").lower()
     _cmd_arg = _cmd_parts[1] if len(_cmd_parts) > 1 else ""
 
-    if _cmd_base in _PENDING_INPUT_COMMANDS:
+    directory, _warnings = _slash_ownership_directory()
+    ownership = _resolve_slash_ownership(_cmd_base, directory)
+    owner = ownership["owner"]
+
+    if owner == "reserved" and _cmd_base in _PENDING_INPUT_COMMANDS:
         return _err(
             rid, 4018, f"pending-input command: use command.dispatch for /{_cmd_base}"
         )
 
-    if _cmd_base in _WORKER_BLOCKED_COMMANDS:
+    if owner == "reserved" and _cmd_base in _WORKER_BLOCKED_COMMANDS:
         subcommand = _cmd_arg.split(maxsplit=1)[0].lower() if _cmd_arg else ""
         if subcommand in {"restore", "rewind"}:
             return _err(
@@ -9503,33 +9797,18 @@ def _(rid, params: dict) -> dict:
                 "snapshot restore mutates live config/state; use command.dispatch for /snapshot restore",
             )
 
-    try:
-        from agent.skill_commands import get_skill_commands
+    if owner in {"quick", "bundle", "skill"}:
+        return _err(
+            rid,
+            4018,
+            f"{owner} command: use command.dispatch for {ownership['key']}",
+        )
 
-        _cmd_key = f"/{_cmd_base}"
-        if _cmd_key in get_skill_commands():
-            return _err(
-                rid, 4018, f"skill command: use command.dispatch for {_cmd_key}"
-            )
-    except Exception:
-        pass
-
-    plugin_handler = None
-    resolve_plugin_command_result = None
-    if _cmd_base:
+    plugin_handler = (ownership.get("payload") or {}).get("handler")
+    if owner == "plugin" and callable(plugin_handler):
         try:
-            from hermes_cli.plugins import (
-                get_plugin_command_handler,
-                resolve_plugin_command_result,
-            )
+            from hermes_cli.plugins import resolve_plugin_command_result
 
-            plugin_handler = get_plugin_command_handler(_cmd_base)
-        except Exception:
-            plugin_handler = None
-            resolve_plugin_command_result = None
-
-    if plugin_handler and resolve_plugin_command_result:
-        try:
             result = resolve_plugin_command_result(plugin_handler(_cmd_arg))
             return _ok(rid, {"output": str(result or "(no output)")})
         except Exception as e:

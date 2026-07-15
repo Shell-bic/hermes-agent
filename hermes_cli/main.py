@@ -2299,6 +2299,10 @@ def cmd_chat(args):
 
     # Import and run the CLI
     from cli import main as cli_main
+    from hermes_cli.enterprise_policy import (
+        EnterpriseSkillPolicyDenied,
+        skill_policy_error_payload,
+    )
 
     # Build kwargs from args
     kwargs = {
@@ -2324,6 +2328,10 @@ def cmd_chat(args):
 
     try:
         cli_main(**kwargs)
+    except EnterpriseSkillPolicyDenied as exc:
+        payload = skill_policy_error_payload(exc.decision)
+        print(f"Error [{payload['errorCode']}]: {payload['error']}")
+        sys.exit(1)
     except ValueError as e:
         print(f"Error: {e}")
         sys.exit(1)

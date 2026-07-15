@@ -1,4 +1,5 @@
 import { execFileSync } from 'node:child_process'
+import { readFileSync } from 'node:fs'
 import { dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -11,6 +12,10 @@ type CommandRoute = 'fallback' | 'local' | 'native'
 interface CommandRegistryLoad {
   error?: string
   names: string[]
+}
+
+interface TuiNativeCommandContract {
+  commands: Array<{ aliases?: string[]; name: string }>
 }
 
 const NATIVE_MUTATING_COMMANDS = new Set(['browser', 'busy', 'fast', 'reload-mcp', 'rollback', 'stop'])
@@ -50,7 +55,7 @@ const loadCommandRegistryNames = (): CommandRegistryLoad => {
         process.env.PYTHON ?? 'python3',
         [
           '-c',
-          'import json; from hermes_cli.commands import COMMAND_REGISTRY; print(json.dumps([c.name for c in COMMAND_REGISTRY]))'
+          'import json; from hermes_cli.commands import COMMAND_REGISTRY; print(json.dumps([root for c in COMMAND_REGISTRY for root in (c.name, *c.aliases)]))'
         ],
         { cwd: resolve(here, '../../..'), encoding: 'utf8' }
       )
@@ -72,6 +77,11 @@ const skipReason = commandRegistry.error ? commandRegistry.error.split('\n')[0] 
 const LOCAL_COMMAND_NAMES = new Set(
   SLASH_COMMANDS.flatMap(command => [command.name, ...(command.aliases ?? [])].map(name => name.toLowerCase()))
 )
+
+const here = dirname(fileURLToPath(import.meta.url))
+const tuiNativeContract = JSON.parse(
+  readFileSync(resolve(here, '../../../tui_gateway/tui_native_slash_commands.json'), 'utf8')
+) as TuiNativeCommandContract
 
 const classifyRoute = (name: string): CommandRoute => {
   const normalized = name.toLowerCase()
@@ -109,6 +119,26 @@ describe('slash parity matrix', () => {
       expect(routes[name], `missing command in registry: ${name}`).toBeDefined()
       expect(routes[name], `mutating command must not fallback: ${name}`).not.toBe('fallback')
     }
+  })
+
+  it('keeps the shared TUI-native delta in sync with the local registry', () => {
+    expect(
+      commandRegistry.error,
+      `Python command registry is required for the shared contract gate: ${skipReason}`
+    ).toBeUndefined()
+
+    const centralRoots = new Set(commandRegistry.names.map(name => name.toLowerCase()))
+    const actualDelta = [...LOCAL_COMMAND_NAMES].filter(name => !centralRoots.has(name)).sort()
+    const contractDelta = [
+      ...new Set(
+        tuiNativeContract.commands
+          .flatMap(command => [command.name, ...(command.aliases ?? [])])
+          .map(name => name.toLowerCase())
+          .filter(name => !centralRoots.has(name))
+      )
+    ].sort()
+
+    expect(contractDelta).toEqual(actualDelta)
   })
 
   it('/q alias resolves to queue, not quit (#31983)', () => {

@@ -115,7 +115,7 @@ COMMAND_REGISTRY: list[CommandDef] = [
     CommandDef("sethome", "Set this chat as the home channel", "Session",
                gateway_only=True, aliases=("set-home",)),
     CommandDef("resume", "Resume a previously-named session", "Session",
-               args_hint="[name]"),
+               aliases=("switch",), args_hint="[name]"),
 
     # Configuration
     CommandDef("sessions", "Browse and resume previous sessions", "Session"),
@@ -260,6 +260,24 @@ def resolve_command(name: str) -> CommandDef | None:
     Accepts names with or without the leading slash.
     """
     return _COMMAND_LOOKUP.get(name.lower().lstrip("/"))
+
+
+def normalize_quick_commands(raw: Any) -> dict[str, dict]:
+    """Normalize quick-command roots for case-insensitive slash dispatch.
+
+    Config is user-authored and older files may contain leading slashes or
+    mixed-case keys. Slash roots are case-insensitive everywhere else, so all
+    execution/discovery consumers share this normalization. If two configured
+    keys collapse to the same root, deterministic lexical first wins.
+    """
+    if not isinstance(raw, Mapping):
+        return {}
+    normalized: dict[str, dict] = {}
+    for key, value in sorted(raw.items(), key=lambda item: str(item[0])):
+        root = str(key).strip().lstrip("/").lower()
+        if root and isinstance(value, dict):
+            normalized.setdefault(root, value)
+    return normalized
 
 
 def _build_description(cmd: CommandDef) -> str:
@@ -483,7 +501,11 @@ def _iter_plugin_command_entries() -> list[tuple[str, str, str]]:
         return []
     entries: list[tuple[str, str, str]] = []
     for name, meta in commands.items():
-        if not isinstance(name, str) or not isinstance(meta, dict):
+        if (
+            not isinstance(name, str)
+            or not isinstance(meta, dict)
+            or not callable(meta.get("handler"))
+        ):
             continue
         description = str(meta.get("description") or f"Run /{name}")
         args_hint = str(meta.get("args_hint") or "").strip()
@@ -1213,10 +1235,12 @@ class SlashCommandCompleter(Completer):
         skill_commands_provider: Callable[[], Mapping[str, dict[str, Any]]] | None = None,
         command_filter: Callable[[str], bool] | None = None,
         skill_bundles_provider: Callable[[], Mapping[str, dict[str, Any]]] | None = None,
+        quick_commands_provider: Callable[[], Mapping[str, dict[str, Any]]] | None = None,
     ) -> None:
         self._skill_commands_provider = skill_commands_provider
         self._command_filter = command_filter
         self._skill_bundles_provider = skill_bundles_provider
+        self._quick_commands_provider = quick_commands_provider
         # Cached project file list for fuzzy @ completions
         self._file_cache: list[str] = []
         self._file_cache_time: float = 0.0
@@ -1243,6 +1267,14 @@ class SlashCommandCompleter(Completer):
             return {}
         try:
             return self._skill_bundles_provider() or {}
+        except Exception:
+            return {}
+
+    def _iter_quick_commands(self) -> Mapping[str, dict[str, Any]]:
+        if self._quick_commands_provider is None:
+            return {}
+        try:
+            return normalize_quick_commands(self._quick_commands_provider() or {})
         except Exception:
             return {}
 
@@ -1825,46 +1857,85 @@ class SlashCommandCompleter(Completer):
                     display_meta=desc,
                 )
 
-        for cmd, info in self._iter_skill_bundles().items():
-            cmd_name = cmd[1:]
-            if cmd_name.startswith(word):
-                description = str(info.get("description", "Skill bundle"))
-                short_desc = description[:50] + ("..." if len(description) > 50 else "")
-                skill_count = len(info.get("skills", []))
-                yield Completion(
-                    self._completion_text(cmd_name, word),
-                    start_position=-len(word),
-                    display=cmd,
-                    display_meta=f"▣ {short_desc} ({skill_count} skills)",
-                )
+        # Dynamic roots follow the same ownership contract as execution:
+        # reserved command/alias > quick > plugin > Bundle > Skill. Build one row per
+        # exact root so a plugin and a Bundle named /review do not produce
+        # contradictory completion choices.  Reserved underscore/hyphen
+        # variants are filtered too (for example /set_home vs /set-home).
+        dynamic_rows: dict[str, tuple[str, str]] = {}
+
+        def is_reserved_dynamic_root(cmd_name: str) -> bool:
+            normalized = cmd_name.strip().lstrip("/").lower()
+            variants = {
+                normalized,
+                normalized.replace("_", "-"),
+                normalized.replace("-", "_"),
+            }
+            return any(resolve_command(candidate) is not None for candidate in variants)
 
         for cmd, info in self._iter_skill_commands().items():
-            cmd_name = cmd[1:]
-            if cmd_name.startswith(word):
-                description = str(info.get("description", "Skill command"))
-                short_desc = description[:50] + ("..." if len(description) > 50 else "")
-                yield Completion(
-                    self._completion_text(cmd_name, word),
-                    start_position=-len(word),
-                    display=cmd,
-                    display_meta=f"⚡ {short_desc}",
-                )
+            cmd_name = str(cmd).strip().lstrip("/")
+            if not cmd_name or is_reserved_dynamic_root(cmd_name):
+                continue
+            description = str(info.get("description", "Skill command"))
+            short_desc = description[:50] + ("..." if len(description) > 50 else "")
+            dynamic_rows.setdefault(cmd_name.lower(), (cmd_name, f"⚡ {short_desc}"))
 
-        # Plugin-registered slash commands
+        for cmd, info in self._iter_skill_bundles().items():
+            cmd_name = str(cmd).strip().lstrip("/")
+            if not cmd_name or is_reserved_dynamic_root(cmd_name):
+                continue
+            description = str(info.get("description", "Skill bundle"))
+            short_desc = description[:50] + ("..." if len(description) > 50 else "")
+            skill_count = len(info.get("skills", []))
+            dynamic_rows[cmd_name.lower()] = (
+                cmd_name,
+                f"▣ {short_desc} ({skill_count} skills)",
+            )
+
+        # Plugin-registered slash commands override same-root Bundle/Skill
+        # entries, but cannot override a reserved root.
         try:
             from hermes_cli.plugins import get_plugin_commands
             for cmd_name, cmd_info in get_plugin_commands().items():
-                if cmd_name.startswith(word):
-                    desc = str(cmd_info.get("description", "Plugin command"))
-                    short_desc = desc[:50] + ("..." if len(desc) > 50 else "")
-                    yield Completion(
-                        self._completion_text(cmd_name, word),
-                        start_position=-len(word),
-                        display=f"/{cmd_name}",
-                        display_meta=f"🔌 {short_desc}",
-                    )
+                if not isinstance(cmd_info, dict) or not callable(
+                    cmd_info.get("handler")
+                ):
+                    continue
+                cmd_name = str(cmd_name).strip().lstrip("/")
+                if not cmd_name or is_reserved_dynamic_root(cmd_name):
+                    continue
+                desc = str(cmd_info.get("description", "Plugin command"))
+                short_desc = desc[:50] + ("..." if len(desc) > 50 else "")
+                dynamic_rows[cmd_name.lower()] = (cmd_name, f"🔌 {short_desc}")
         except Exception:
             pass
+
+        # User-defined quick commands are the highest-priority dynamic owner.
+        # Invalid types do not own the root and therefore cannot hide a valid
+        # plugin, Bundle, or Skill completion.
+        for cmd_name, info in self._iter_quick_commands().items():
+            if is_reserved_dynamic_root(cmd_name):
+                continue
+            qtype = info.get("type")
+            if qtype == "exec":
+                default_desc = f"exec: {info.get('command', '')}"
+            elif qtype == "alias":
+                default_desc = f"alias → {info.get('target', '')}"
+            else:
+                continue
+            description = str(info.get("description") or default_desc)
+            short_desc = description[:50] + ("..." if len(description) > 50 else "")
+            dynamic_rows[cmd_name.lower()] = (cmd_name, f"⚡ {short_desc}")
+
+        for cmd_name, meta in dynamic_rows.values():
+            if cmd_name.lower().startswith(word.lower()):
+                yield Completion(
+                    self._completion_text(cmd_name, word),
+                    start_position=-len(word),
+                    display=f"/{cmd_name}",
+                    display_meta=meta,
+                )
 
 
 # ---------------------------------------------------------------------------

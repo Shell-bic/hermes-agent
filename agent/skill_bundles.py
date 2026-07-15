@@ -43,6 +43,7 @@ Public API
 from __future__ import annotations
 
 import logging
+import json
 import os
 import re
 from pathlib import Path
@@ -250,10 +251,58 @@ def list_bundles() -> List[Dict[str, Any]]:
     return sorted(bundles.values(), key=lambda b: b["slug"])
 
 
+def preflight_bundle_skills(cmd_key: str) -> Optional[Tuple[List[str], List[str]]]:
+    """Authorize every installed bundle member without loading Skill bodies."""
+    info = get_skill_bundles().get(cmd_key)
+    if not info:
+        return None
+
+    from hermes_cli.enterprise_policy import EnterpriseSkillPolicyDenied
+    from tools.skills_tool import skill_runtime_preflight
+
+    allowed: List[str] = []
+    missing: List[str] = []
+    seen: set[str] = set()
+    for skill_id in info["skills"]:
+        identifier = (skill_id or "").strip()
+        if not identifier or identifier in seen:
+            continue
+        seen.add(identifier)
+        result = json.loads(skill_runtime_preflight(identifier))
+        if result.get("success"):
+            allowed.append(identifier)
+            continue
+        if result.get("errorCode") == "enterprise_skill_policy_denied":
+            raise EnterpriseSkillPolicyDenied(result)
+        missing.append(identifier)
+    return allowed, missing
+
+
 def build_bundle_invocation_message(
     cmd_key: str,
     user_instruction: str = "",
     task_id: str | None = None,
+    *,
+    bump_usage: bool = True,
+) -> Optional[Tuple[str, List[str], List[str]]]:
+    """Build one bundle under a single frozen enterprise policy mapping."""
+    from hermes_cli.enterprise_policy import skill_policy_operation
+
+    with skill_policy_operation():
+        return _build_bundle_invocation_message(
+            cmd_key,
+            user_instruction=user_instruction,
+            task_id=task_id,
+            bump_usage=bump_usage,
+        )
+
+
+def _build_bundle_invocation_message(
+    cmd_key: str,
+    user_instruction: str = "",
+    task_id: str | None = None,
+    *,
+    bump_usage: bool = True,
 ) -> Optional[Tuple[str, List[str], List[str]]]:
     """Build the user message content for a bundle slash command invocation.
 
@@ -270,36 +319,42 @@ def build_bundle_invocation_message(
     if not info:
         return None
 
+    preflight = preflight_bundle_skills(cmd_key)
+    if preflight is None:
+        return None
+    allowed_identifiers, missing = preflight
+
     # Late import to avoid pulling tools/* at module import time and to
     # keep skill_bundles cheap to import in test environments.
     from agent.skill_commands import _load_skill_payload, _build_skill_message
 
     loaded_names: List[str] = []
-    missing: List[str] = []
     skill_blocks: List[str] = []
-    seen: set[str] = set()
+    resolved_skills: List[Tuple[dict[str, Any], Path | None, str]] = []
 
     bundle_name = info["name"]
-    skills = info["skills"]
     extra_instruction = info.get("instruction") or ""
 
-    for skill_id in skills:
-        identifier = (skill_id or "").strip()
-        if not identifier or identifier in seen:
-            continue
-        seen.add(identifier)
-
+    for identifier in allowed_identifiers:
         loaded = _load_skill_payload(identifier, task_id=task_id)
         if not loaded:
             missing.append(identifier)
             continue
         loaded_skill, skill_dir, skill_name = loaded
 
-        try:
-            from tools.skill_usage import bump_use
-            bump_use(skill_name)
-        except Exception:
-            pass
+        # Do not create message blocks or usage side effects until every
+        # referenced Skill has passed its runtime policy guard. A structured
+        # enterprise denial raised by _load_skill_payload aborts the bundle.
+        resolved_skills.append((loaded_skill, skill_dir, skill_name))
+
+    for loaded_skill, skill_dir, skill_name in resolved_skills:
+
+        if bump_usage:
+            try:
+                from tools.skill_usage import bump_use
+                bump_use(skill_name)
+            except Exception:
+                pass
 
         activation_note = (
             f'[Loaded as part of the "{bundle_name}" skill bundle.]'

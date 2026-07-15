@@ -155,7 +155,21 @@ def blueprint_spec_for_installed(skill_name: str) -> Optional[BlueprintSpec]:
     base = Path(SKILLS_DIR)
     # Skills live at skills/<category>/<name>/SKILL.md or skills/<name>/SKILL.md.
     candidates = list(base.glob(f"**/{skill_name}/SKILL.md"))
+    from agent.skill_utils import read_skill_frontmatter
+    from hermes_cli.enterprise_policy import (
+        EnterpriseSkillPolicyDenied,
+        skill_runtime_decision,
+        skill_runtime_identity,
+    )
+
     for path in candidates:
+        frontmatter = read_skill_frontmatter(path)
+        canonical_name = str(frontmatter.get("name") or path.parent.name)
+        decision = skill_runtime_decision(
+            skill_runtime_identity(canonical_name, skill_path=path)
+        )
+        if not decision["allowed"]:
+            raise EnterpriseSkillPolicyDenied(decision)
         try:
             text = path.read_text(encoding="utf-8")
         except OSError:

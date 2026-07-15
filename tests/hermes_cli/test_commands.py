@@ -614,6 +614,146 @@ class TestSlashCommandCompleter:
         assert len(completions) == 1
         assert "Skill command" in completions[0].display_meta_text
 
+    def test_reserved_root_deduplicates_quick_bundle_skill_and_plugin(self, monkeypatch):
+        from hermes_cli import plugins as plugins_mod
+
+        monkeypatch.setattr(
+            plugins_mod,
+            "get_plugin_commands",
+            lambda: {
+                "status": {
+                    "description": "Plugin status loser",
+                    "handler": lambda _arg: "plugin",
+                }
+            },
+        )
+        completer = SlashCommandCompleter(
+            skill_bundles_provider=lambda: {
+                "/status": {"description": "Bundle status loser", "skills": []}
+            },
+            skill_commands_provider=lambda: {
+                "/status": {"description": "Skill status loser"}
+            },
+            quick_commands_provider=lambda: {
+                "status": {
+                    "type": "exec",
+                    "command": "status-loser",
+                    "description": "Quick status loser",
+                }
+            },
+        )
+
+        completions = [
+            item for item in _completions(completer, "/stat")
+            if item.display_text == "/status"
+        ]
+
+        assert len(completions) == 1
+        assert completions[0].display_meta_text == "Show session, model, token, and context info"
+
+    def test_dynamic_root_deduplicates_with_plugin_precedence(self, monkeypatch):
+        from hermes_cli import plugins as plugins_mod
+
+        monkeypatch.setattr(
+            plugins_mod,
+            "get_plugin_commands",
+            lambda: {
+                "review": {
+                    "description": "Plugin review winner",
+                    "handler": lambda _arg: "plugin",
+                }
+            },
+        )
+        completer = SlashCommandCompleter(
+            skill_bundles_provider=lambda: {
+                "/review": {"description": "Bundle review loser", "skills": []}
+            },
+            skill_commands_provider=lambda: {
+                "/review": {"description": "Skill review loser"}
+            },
+        )
+
+        completions = [
+            item for item in _completions(completer, "/rev")
+            if item.display_text == "/review"
+        ]
+
+        assert len(completions) == 1
+        assert completions[0].display_meta_text == "🔌 Plugin review winner"
+
+    def test_dynamic_root_deduplicates_with_quick_precedence(self, monkeypatch):
+        from hermes_cli import plugins as plugins_mod
+
+        monkeypatch.setattr(
+            plugins_mod,
+            "get_plugin_commands",
+            lambda: {
+                "review": {
+                    "description": "Plugin review loser",
+                    "handler": lambda _arg: "plugin",
+                }
+            },
+        )
+        completer = SlashCommandCompleter(
+            skill_bundles_provider=lambda: {
+                "/review": {"description": "Bundle review loser", "skills": []}
+            },
+            skill_commands_provider=lambda: {
+                "/review": {"description": "Skill review loser"}
+            },
+            quick_commands_provider=lambda: {
+                "ReView": {
+                    "type": "exec",
+                    "command": "review-now",
+                    "description": "Quick review winner",
+                }
+            },
+        )
+
+        completions = [
+            item for item in _completions(completer, "/rev")
+            if item.display_text == "/review"
+        ]
+
+        assert len(completions) == 1
+        assert completions[0].display_meta_text == "⚡ Quick review winner"
+
+    def test_invalid_quick_completion_yields_to_plugin(self, monkeypatch):
+        from hermes_cli import plugins as plugins_mod
+
+        monkeypatch.setattr(
+            plugins_mod,
+            "get_plugin_commands",
+            lambda: {
+                "review": {
+                    "description": "Plugin review winner",
+                    "handler": lambda _arg: "plugin",
+                }
+            },
+        )
+        completer = SlashCommandCompleter(
+            skill_bundles_provider=lambda: {
+                "/review": {"description": "Bundle review loser", "skills": []}
+            },
+            skill_commands_provider=lambda: {
+                "/review": {"description": "Skill review loser"}
+            },
+            quick_commands_provider=lambda: {
+                "review": {
+                    "type": "prompt",
+                    "description": "Invalid quick must not own the root",
+                }
+            },
+        )
+
+        completions = [
+            item for item in _completions(completer, "/rev")
+            if item.display_text == "/review"
+        ]
+
+        assert len(completions) == 1
+        assert completions[0].display_meta_text == "🔌 Plugin review winner"
+
 
 # ── SUBCOMMANDS extraction ──────────────────────────────────────────────
 

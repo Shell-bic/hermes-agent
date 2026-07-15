@@ -157,6 +157,70 @@ def parse_frontmatter(content: str) -> Tuple[Dict[str, Any], str]:
     return frontmatter, body
 
 
+def read_skill_frontmatter(
+    skill_md: Path,
+    *,
+    max_bytes: int = 16 * 1024,
+    max_lines: int = 256,
+) -> Dict[str, Any]:
+    """Return strictly parsed frontmatter, or ``{}`` when its proof is invalid."""
+    evidence = read_skill_frontmatter_evidence(
+        skill_md,
+        max_bytes=max_bytes,
+        max_lines=max_lines,
+    )
+    frontmatter = evidence.get("frontmatter")
+    return frontmatter if isinstance(frontmatter, dict) else {}
+
+
+def read_skill_frontmatter_evidence(
+    skill_md: Path,
+    *,
+    max_bytes: int = 16 * 1024,
+    max_lines: int = 256,
+) -> Dict[str, Any]:
+    """Read a bounded frontmatter block and report whether it is trustworthy.
+
+    This reader deliberately does not use ``parse_frontmatter``'s permissive
+    line-oriented fallback. Runtime enterprise provenance treats missing,
+    oversized, unterminated, undecodable, and invalid YAML metadata as a
+    tamper signal. Ordinary local Skills remain backward compatible because
+    their callers can still fall back to the directory name.
+    """
+    chunks: List[bytes] = []
+    consumed = 0
+    try:
+        with skill_md.open("rb") as handle:
+            first = handle.readline(max_bytes + 1)
+            consumed += len(first)
+            if consumed > max_bytes or first.lstrip(b"\xef\xbb\xbf").strip() != b"---":
+                return {"valid": False, "reason": "missing-opening-delimiter", "frontmatter": {}}
+            chunks.append(first)
+            for _ in range(max_lines - 1):
+                remaining = max_bytes - consumed
+                if remaining <= 0:
+                    return {"valid": False, "reason": "frontmatter-too-large", "frontmatter": {}}
+                line = handle.readline(remaining + 1)
+                if not line:
+                    return {"valid": False, "reason": "unterminated-frontmatter", "frontmatter": {}}
+                consumed += len(line)
+                if consumed > max_bytes:
+                    return {"valid": False, "reason": "frontmatter-too-large", "frontmatter": {}}
+                chunks.append(line)
+                if line.strip() == b"---":
+                    try:
+                        raw = b"".join(chunks[1:-1]).decode("utf-8-sig")
+                        parsed = yaml_load(raw)
+                    except Exception:
+                        return {"valid": False, "reason": "invalid-yaml", "frontmatter": {}}
+                    if not isinstance(parsed, dict):
+                        return {"valid": False, "reason": "invalid-yaml", "frontmatter": {}}
+                    return {"valid": True, "reason": "", "frontmatter": parsed}
+    except (OSError, UnicodeError):
+        return {"valid": False, "reason": "frontmatter-unreadable", "frontmatter": {}}
+    return {"valid": False, "reason": "frontmatter-too-many-lines", "frontmatter": {}}
+
+
 # ── Platform matching ─────────────────────────────────────────────────────
 
 

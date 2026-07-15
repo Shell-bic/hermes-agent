@@ -22,6 +22,7 @@ logger = logging.getLogger(__name__)
 
 _skill_commands: Dict[str, Dict[str, Any]] = {}
 _skill_commands_platform: Optional[str] = None
+_skill_commands_policy_fingerprint: tuple[Any, ...] | None = None
 # Patterns for sanitizing skill names into clean hyphen-separated slugs.
 _SKILL_INVALID_CHARS = re.compile(r"[^a-z0-9-]")
 _SKILL_MULTI_HYPHEN = re.compile(r"-{2,}")
@@ -182,6 +183,10 @@ def _load_skill_payload(skill_identifier: str, task_id: str | None = None) -> tu
         return None
 
     if not loaded_skill.get("success"):
+        if loaded_skill.get("errorCode") == "enterprise_skill_policy_denied":
+            from hermes_cli.enterprise_policy import EnterpriseSkillPolicyDenied
+
+            raise EnterpriseSkillPolicyDenied(loaded_skill)
         return None
 
     skill_name = str(loaded_skill.get("name") or normalized)
@@ -315,7 +320,7 @@ def _build_skill_message(
             if subdir_path.exists():
                 for f in sorted(subdir_path.rglob("*")):
                     if f.is_file() and not f.is_symlink():
-                        rel = str(f.relative_to(skill_dir))
+                        rel = f.relative_to(skill_dir).as_posix()
                         supporting.append(rel)
 
     if supporting and skill_dir:
@@ -351,12 +356,16 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
     Returns:
         Dict mapping "/skill-name" to {name, description, skill_md_path, skill_dir}.
     """
-    global _skill_commands, _skill_commands_platform
+    global _skill_commands, _skill_commands_platform, _skill_commands_policy_fingerprint
     _skill_commands_platform = _resolve_skill_commands_platform()
+    from hermes_cli.enterprise_policy import enterprise_policy_fingerprint
+
+    _skill_commands_policy_fingerprint = enterprise_policy_fingerprint()
     _skill_commands = {}
     try:
         from tools.skills_tool import SKILLS_DIR, _parse_frontmatter, skill_matches_platform, skill_matches_environment, _get_disabled_skill_names
-        from agent.skill_utils import get_external_skills_dirs, iter_skill_index_files
+        from agent.skill_utils import get_external_skills_dirs, iter_skill_index_files, read_skill_frontmatter
+        from hermes_cli.enterprise_policy import skill_runtime_decision, skill_runtime_identity
         disabled = _get_disabled_skill_names()
         seen_names: set = set()
 
@@ -371,8 +380,7 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
                 if any(part in {'.git', '.github', '.hub', '.archive'} for part in skill_md.parts):
                     continue
                 try:
-                    content = skill_md.read_text(encoding='utf-8')
-                    frontmatter, body = _parse_frontmatter(content)
+                    frontmatter = read_skill_frontmatter(skill_md)
                     # Skip skills incompatible with the current OS platform
                     if not skill_matches_platform(frontmatter):
                         continue
@@ -386,8 +394,14 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
                     # Respect user's disabled skills config
                     if name in disabled:
                         continue
+                    if not skill_runtime_decision(
+                        skill_runtime_identity(name, skill_path=skill_md)
+                    )["allowed"]:
+                        continue
                     description = frontmatter.get('description', '')
                     if not description:
+                        content = skill_md.read_text(encoding='utf-8')
+                        _, body = _parse_frontmatter(content)
                         for line in body.strip().split('\n'):
                             line = line.strip()
                             if line and not line.startswith('#'):
@@ -425,9 +439,16 @@ def get_skill_commands() -> Dict[str, Dict[str, Any]]:
     if (
         not _skill_commands
         or _skill_commands_platform != _resolve_skill_commands_platform()
+        or _skill_commands_policy_fingerprint != _current_skill_policy_fingerprint()
     ):
         scan_skill_commands()
     return _skill_commands
+
+
+def _current_skill_policy_fingerprint() -> tuple[Any, ...]:
+    from hermes_cli.enterprise_policy import enterprise_policy_fingerprint
+
+    return enterprise_policy_fingerprint()
 
 
 def reload_skills() -> Dict[str, Any]:

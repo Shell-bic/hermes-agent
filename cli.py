@@ -826,7 +826,11 @@ def get_toolset_for_tool(*args, **kwargs):
 
 # Extracted CLI modules (Phase 3)
 from hermes_cli.banner import build_welcome_banner
-from hermes_cli.commands import SlashCommandCompleter, SlashCommandAutoSuggest
+from hermes_cli.commands import (
+    SlashCommandAutoSuggest,
+    SlashCommandCompleter,
+    normalize_quick_commands,
+)
 
 
 def get_all_toolsets(*args, **kwargs):
@@ -3113,7 +3117,11 @@ def _get_plugin_cmd_handler_names() -> set:
     """Return plugin command names (without slash prefix) for dispatch matching."""
     try:
         from hermes_cli.plugins import get_plugin_commands
-        return set(get_plugin_commands().keys())
+        return {
+            name
+            for name, entry in get_plugin_commands().items()
+            if isinstance(entry, dict) and callable(entry.get("handler"))
+        }
     except Exception:
         return set()
 
@@ -7659,14 +7667,23 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             self._handle_voice_command(cmd_original)
         elif canonical == "busy":
             self._handle_busy_command(cmd_original)
+        elif _cmd_def is not None:
+            # Registry roots are reserved even when this particular surface
+            # has no local handler (for example gateway-only /approve). Never
+            # let a quick/plugin/bundle/skill shadow a built-in root.
+            _cprint(f"  /{canonical} is not available in this interface.")
         else:
             # Check for user-defined quick commands (bypass agent loop, no LLM call)
             base_cmd = cmd_lower.split()[0]
             skill_commands = _ensure_skill_commands()
             skill_bundles = get_skill_bundles()
-            quick_commands = self.config.get("quick_commands", {})
-            if base_cmd.lstrip("/") in quick_commands:
-                qcmd = quick_commands[base_cmd.lstrip("/")]
+            from hermes_cli.commands import normalize_quick_commands
+
+            quick_commands = normalize_quick_commands(
+                self.config.get("quick_commands", {})
+            )
+            qcmd = quick_commands.get(base_cmd.lstrip("/"))
+            if qcmd and qcmd.get("type") in {"exec", "alias"}:
                 if qcmd.get("type") == "exec":
                     import subprocess
                     exec_cmd = qcmd.get("command", "")
@@ -7698,8 +7715,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                         return self.process_command(aliased_command)
                     else:
                         self._console_print(f"[bold red]Quick command '{base_cmd}' has no target defined[/]")
-                else:
-                    self._console_print(f"[bold red]Quick command '{base_cmd}' has unsupported type (supported: 'exec', 'alias')[/]")
             # Check for plugin-registered slash commands
             elif base_cmd.lstrip("/") in _get_plugin_cmd_handler_names():
                 from hermes_cli.plugins import (
@@ -7707,7 +7722,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                     resolve_plugin_command_result,
                 )
                 plugin_handler = get_plugin_command_handler(base_cmd.lstrip("/"))
-                if plugin_handler:
+                if callable(plugin_handler):
                     user_args = cmd_original[len(base_cmd):].strip()
                     try:
                         result = resolve_plugin_command_result(
@@ -7754,6 +7769,14 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                         self._pending_input.put(msg)
                 else:
                     ChatConsole().print(f"[bold red]Failed to load skill for {base_cmd}[/]")
+            elif qcmd:
+                # Invalid quick types do not own the root, so valid dynamic
+                # successors above still get a chance to run. If no successor
+                # exists, keep the classic CLI's actionable config error.
+                self._console_print(
+                    f"[bold red]Quick command '{base_cmd}' has unsupported type "
+                    "(supported: 'exec', 'alias')[/]"
+                )
             else:
                 # Prefix matching: if input uniquely identifies one command, execute it.
                 # Matches against both built-in COMMANDS and installed skill commands so
@@ -12031,6 +12054,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             skill_commands_provider=lambda: get_skill_commands(),
             command_filter=cli_ref._command_available,
             skill_bundles_provider=lambda: get_skill_bundles(),
+            quick_commands_provider=lambda: normalize_quick_commands(
+                cli_ref.config.get("quick_commands", {})
+            ),
         )
         input_area = TextArea(
             height=Dimension(min=1, max=8, preferred=1),
@@ -13649,10 +13675,13 @@ def main(
     )
 
     if parsed_skills:
-        skills_prompt, loaded_skills, missing_skills = build_preloaded_skills_prompt(
-            parsed_skills,
-            task_id=cli.session_id,
-        )
+        from hermes_cli.enterprise_policy import skill_policy_operation
+
+        with skill_policy_operation():
+            skills_prompt, loaded_skills, missing_skills = build_preloaded_skills_prompt(
+                parsed_skills,
+                task_id=cli.session_id,
+            )
         if missing_skills:
             missing_display = ", ".join(missing_skills)
             raise ValueError(f"Unknown skill(s): {missing_display}")

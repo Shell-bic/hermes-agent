@@ -6,6 +6,18 @@ from rich.text import Text
 import pytest
 
 
+class _FalseyCallable:
+    def __init__(self):
+        self.calls = []
+
+    def __bool__(self):
+        return False
+
+    def __call__(self, arg):
+        self.calls.append(arg)
+        return "plugin-winner"
+
+
 # ── CLI tests ──────────────────────────────────────────────────────────────
 
 class TestCLIQuickCommands:
@@ -62,10 +74,14 @@ class TestCLIQuickCommands:
 
     def test_exec_command_no_output_shows_fallback(self):
         cli = self._make_cli({"empty": {"type": "exec", "command": "true"}})
-        cli.process_command("/empty")
+        with patch(
+            "subprocess.run",
+            return_value=subprocess.CompletedProcess("true", 0, stdout="", stderr=""),
+        ):
+            cli.process_command("/empty")
         cli.console.print.assert_called_once()
         args = cli.console.print.call_args[0][0]
-        assert "no output" in args.lower()
+        assert "no output" in self._printed_plain(args).lower()
 
     def test_alias_command_routes_to_target(self):
         """Alias quick commands rewrite to the target command."""
@@ -81,6 +97,27 @@ class TestCLIQuickCommands:
         with patch.object(cli, "process_command", wraps=cli.process_command) as spy:
             cli.process_command("/sc some args")
             spy.assert_any_call("/context some args")
+
+    def test_mixed_case_config_key_and_typed_root_preserve_args(self):
+        """Classic CLI uses the same case-insensitive quick root contract."""
+        cli = self._make_cli(
+            {"MyCmd": {"type": "alias", "target": "/context"}}
+        )
+        with patch.object(cli, "process_command", wraps=cli.process_command) as spy:
+            cli.process_command("/MYCMD KeepCase ARG")
+            spy.assert_any_call("/context KeepCase ARG")
+
+    def test_reserved_builtin_cannot_be_shadowed_by_quick_command(self):
+        """Registry roots remain built-in even with colliding quick config."""
+        cli = self._make_cli(
+            {"help": {"type": "exec", "command": "echo wrong owner"}}
+        )
+        cli.show_help = MagicMock()
+        with patch("subprocess.run") as run:
+            cli.process_command("/HELP")
+
+        cli.show_help.assert_called_once_with()
+        run.assert_not_called()
 
     def test_alias_no_target_shows_error(self):
         cli = self._make_cli({"broken": {"type": "alias", "target": ""}})
@@ -111,6 +148,98 @@ class TestCLIQuickCommands:
         cli.console.print.assert_called_once()
         printed = self._printed_plain(cli.console.print.call_args[0][0])
         assert printed == "overridden"
+
+    def test_quick_command_takes_priority_over_all_dynamic_sources(self):
+        cli = self._make_cli(
+            {"review": {"type": "exec", "command": "echo quick-winner"}}
+        )
+        plugin_handler = MagicMock(return_value="plugin-loser")
+        with patch("cli._skill_commands", {"/review": {"name": "Skill loser"}}), patch(
+            "cli.get_skill_bundles",
+            return_value={"/review": {"name": "Bundle loser", "skills": []}},
+        ), patch(
+            "cli._get_plugin_cmd_handler_names", return_value={"review"}
+        ), patch(
+            "hermes_cli.plugins.get_plugin_command_handler",
+            return_value=plugin_handler,
+        ):
+            cli.process_command("/review")
+
+        printed = self._printed_plain(cli.console.print.call_args[0][0])
+        assert printed == "quick-winner"
+        plugin_handler.assert_not_called()
+
+    def test_invalid_quick_command_yields_to_plugin_execution(self):
+        cli = self._make_cli(
+            {"review": {"type": "prompt", "description": "invalid quick"}}
+        )
+        plugin_handler = MagicMock(return_value="plugin-winner")
+        with patch("cli._skill_commands", {"/review": {"name": "Skill loser"}}), patch(
+            "cli.get_skill_bundles",
+            return_value={"/review": {"name": "Bundle loser", "skills": []}},
+        ), patch(
+            "cli._get_plugin_cmd_handler_names", return_value={"review"}
+        ), patch(
+            "hermes_cli.plugins.get_plugin_command_handler",
+            return_value=plugin_handler,
+        ), patch(
+            "hermes_cli.plugins.resolve_plugin_command_result",
+            side_effect=lambda result: result,
+        ), patch("cli._cprint") as printed:
+            cli.process_command("/review KeepCase ARG")
+
+        plugin_handler.assert_called_once_with("KeepCase ARG")
+        printed.assert_any_call("plugin-winner")
+
+    @pytest.mark.parametrize("falsey", [False, True])
+    def test_callable_plugin_handler_executes_once_with_original_args(self, falsey):
+        cli = self._make_cli({})
+        handler = _FalseyCallable() if falsey else MagicMock(return_value="plugin-winner")
+        with patch("cli._skill_commands", {}), patch(
+            "cli.get_skill_bundles", return_value={}
+        ), patch(
+            "hermes_cli.plugins.get_plugin_commands",
+            return_value={"review": {"handler": handler}},
+        ), patch(
+            "hermes_cli.plugins.get_plugin_command_handler", return_value=handler
+        ), patch(
+            "hermes_cli.plugins.resolve_plugin_command_result",
+            side_effect=lambda result: result,
+        ), patch("cli._cprint") as printed:
+            cli.process_command("/review KeepCase --Flag=VaL")
+
+        if falsey:
+            assert handler.calls == ["KeepCase --Flag=VaL"]
+        else:
+            handler.assert_called_once_with("KeepCase --Flag=VaL")
+        printed.assert_called_once_with("plugin-winner")
+
+    @pytest.mark.parametrize("handler", [None, 0, "not-callable", object()])
+    def test_non_callable_plugin_handler_yields_to_bundle(self, handler):
+        cli = self._make_cli({})
+        bundle_builder = MagicMock(
+            return_value=("bundle-message", ["bundle-skill"], [])
+        )
+        plugin_lookup = MagicMock(return_value=handler)
+        with patch("cli._skill_commands", {}), patch(
+            "cli.get_skill_bundles",
+            return_value={
+                "/review": {"name": "Review Bundle", "skills": ["bundle-skill"]}
+            },
+        ), patch(
+            "cli.build_bundle_invocation_message", bundle_builder
+        ), patch(
+            "hermes_cli.plugins.get_plugin_commands",
+            return_value={"review": {"handler": handler}},
+        ), patch(
+            "hermes_cli.plugins.get_plugin_command_handler", plugin_lookup
+        ), patch("builtins.print"):
+            cli.process_command("/review KeepCase --Flag=VaL")
+
+        plugin_lookup.assert_not_called()
+        bundle_builder.assert_called_once_with(
+            "/review", "KeepCase --Flag=VaL", task_id="test-session"
+        )
 
     def test_unknown_command_still_shows_error(self):
         cli = self._make_cli({})

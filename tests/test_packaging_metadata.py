@@ -116,6 +116,22 @@ def test_manifest_includes_bundled_skills():
     assert "graft optional-skills" in manifest
 
 
+def test_tui_native_slash_contract_ships_in_both_wheel_and_sdist():
+    contract = REPO_ROOT / "tui_gateway" / "tui_native_slash_commands.json"
+    assert contract.is_file(), "expected the TUI native slash contract on disk"
+
+    data = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    package_data = data["tool"]["setuptools"]["package-data"]
+    assert "tui_native_slash_commands.json" in package_data.get("tui_gateway", []), (
+        "pyproject package-data must ship the TUI native slash contract in wheels"
+    )
+
+    manifest = (REPO_ROOT / "MANIFEST.in").read_text(encoding="utf-8")
+    assert "include tui_gateway/tui_native_slash_commands.json" in manifest, (
+        "MANIFEST.in must ship the TUI native slash contract in sdists"
+    )
+
+
 def test_bundled_plugin_manifests_ship_in_both_wheel_and_sdist():
     """Regression test for #34034 / #28149.
 

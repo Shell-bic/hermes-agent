@@ -1002,6 +1002,916 @@ def test_cli_exec_allowed(server, argv):
     assert server._cli_exec_blocked(argv) is None
 
 
+def test_commands_catalog_discovers_bundles_with_bundle_over_skill_precedence(server):
+    """Initial slash discovery and /help expose each Bundle slug exactly once."""
+    fake_bundles = {
+        "/bundle-only": {"name": "Bundle Only", "description": "Bundle workflow"},
+        "/collision": {"name": "Collision Bundle", "description": "Bundle wins"},
+    }
+    fake_skills = {
+        "/collision": {"name": "collision", "description": "Skill loses"},
+        "/skill-only": {"name": "skill-only", "description": "Skill workflow"},
+    }
+
+    with patch(
+        "agent.skill_bundles.get_skill_bundles", return_value=fake_bundles
+    ), patch(
+        "agent.skill_commands.get_skill_commands", return_value=fake_skills
+    ):
+        resp = server.handle_request({
+            "id": "catalog-bundles",
+            "method": "commands.catalog",
+            "params": {},
+        })
+
+    assert "error" not in resp
+    result = resp["result"]
+    pairs = result["pairs"]
+    assert sum(1 for command, _ in pairs if command == "/collision") == 1
+    pair_map = dict(pairs)
+    assert pair_map["/collision"] == "Bundle wins"
+    assert pair_map["/bundle-only"] == "Bundle workflow"
+    assert pair_map["/skill-only"] == "Skill workflow"
+    assert result["bundle_count"] == 2
+    assert result["skill_count"] == 1
+
+    tools_and_skills = next(
+        section
+        for section in result["categories"]
+        if section["name"] == "Tools & Skills"
+    )
+    category_pairs = dict(tools_and_skills["pairs"])
+    assert category_pairs["/collision"] == "Bundle wins"
+    assert category_pairs["/bundle-only"] == "Bundle workflow"
+
+
+def test_dynamic_slash_catalog_and_completion_share_ownership_and_precedence(server):
+    """Quick/plugin/bundle/skill discovery is complete, stable, and deduplicated."""
+    plugin_handler = MagicMock(return_value="plugin result")
+    quick_commands = {
+        "dyn-all": {
+            "type": "alias",
+            "target": "/status",
+            "description": "Quick wins all",
+        },
+        "dyn-quick": {"type": "exec", "command": "echo quick"},
+    }
+    plugin_commands = {
+        "dyn-all": {"handler": plugin_handler, "description": "Plugin loses all"},
+        "dyn-plugin": {"handler": plugin_handler, "description": "Plugin workflow"},
+    }
+    bundle_commands = {
+        "/dyn-all": {"name": "All Bundle", "description": "Bundle loses all", "skills": ["a"]},
+        "/dyn-bundle": {"name": "Bundle", "description": "Bundle workflow", "skills": ["a", "b"]},
+    }
+    skill_commands = {
+        "/dyn-all": {"name": "dyn-all", "description": "Skill loses all"},
+        "/dyn-skill": {"name": "dyn-skill", "description": "Skill workflow"},
+    }
+
+    with patch.object(
+        server,
+        "_load_cfg",
+        return_value={"quick_commands": quick_commands},
+    ), patch(
+        "hermes_cli.plugins.get_plugin_commands", return_value=plugin_commands
+    ), patch(
+        "agent.skill_bundles.get_skill_bundles", return_value=bundle_commands
+    ), patch(
+        "agent.skill_commands.get_skill_commands", return_value=skill_commands
+    ):
+        catalog = server.handle_request({
+            "id": "dynamic-catalog",
+            "method": "commands.catalog",
+            "params": {},
+        })["result"]
+        completion = server.handle_request({
+            "id": "dynamic-complete",
+            "method": "complete.slash",
+            "params": {"text": "/dyn-"},
+        })["result"]
+
+    # Discovery reads plugin registry metadata only; it must never execute a
+    # handler merely to render catalog/completion rows.
+    plugin_handler.assert_not_called()
+
+    catalog_rows = [pair for pair in catalog["pairs"] if pair[0].startswith("/dyn-")]
+    completion_rows = [
+        item for item in completion["items"] if item["display"].startswith("/dyn-")
+    ]
+    expected = {"/dyn-all", "/dyn-quick", "/dyn-plugin", "/dyn-bundle", "/dyn-skill"}
+    assert {pair[0] for pair in catalog_rows} == expected
+    assert {item["display"] for item in completion_rows} == expected
+    assert len([pair for pair in catalog_rows if pair[0] == "/dyn-all"]) == 1
+    assert len([item for item in completion_rows if item["display"] == "/dyn-all"]) == 1
+    assert dict(catalog_rows)["/dyn-all"] == "Quick wins all"
+    assert next(
+        item["meta"] for item in completion_rows if item["display"] == "/dyn-all"
+    ) == "Quick wins all"
+
+
+def test_dynamic_slash_collision_winner_matches_command_dispatch(server):
+    """The quick winner shown for a four-source collision is the executed owner."""
+    sid = "four-source-collision-session"
+    worker = MagicMock()
+    server._sessions[sid] = {
+        "session_key": sid,
+        "agent": None,
+        "slash_worker": worker,
+    }
+    plugin_handler = MagicMock(return_value="wrong plugin")
+    skill_builder = MagicMock(return_value="wrong skill")
+    quick = {
+        "collision": {
+            "type": "alias",
+            "target": "/status",
+            "description": "Quick collision winner",
+        }
+    }
+
+    with patch.object(
+        server,
+        "_load_cfg",
+        return_value={"quick_commands": quick},
+    ), patch(
+        "hermes_cli.plugins.get_plugin_commands",
+        return_value={
+            "collision": {"handler": plugin_handler, "description": "Plugin loser"}
+        },
+    ), patch(
+        "agent.skill_bundles.get_skill_bundles",
+        return_value={
+            "/collision": {"name": "Bundle loser", "description": "Bundle loser", "skills": ["a"]}
+        },
+    ), patch(
+        "agent.skill_commands.get_skill_commands",
+        return_value={
+            "/collision": {"name": "Skill loser", "description": "Skill loser"}
+        },
+    ), patch(
+        "agent.skill_commands.build_skill_invocation_message",
+        skill_builder,
+    ):
+        catalog = server.handle_request({
+            "id": "collision-catalog",
+            "method": "commands.catalog",
+            "params": {},
+        })["result"]
+        completion = server.handle_request({
+            "id": "collision-complete",
+            "method": "complete.slash",
+            "params": {"text": "/coll"},
+        })["result"]
+        first_hop = server.handle_request({
+            "id": "collision-exec",
+            "method": "slash.exec",
+            "params": {"command": "COLLISION KeepCase", "session_id": sid},
+        })
+        dispatch = server.handle_request({
+            "id": "collision-dispatch",
+            "method": "command.dispatch",
+            "params": {"name": "COLLISION", "arg": "KeepCase", "session_id": sid},
+        })
+
+    assert [pair for pair in catalog["pairs"] if pair[0] == "/collision"] == [
+        ["/collision", "Quick collision winner"]
+    ]
+    assert [item["display"] for item in completion["items"]].count("/collision") == 1
+    assert first_hop["error"]["code"] == 4018
+    assert dispatch["result"] == {"type": "alias", "target": "/status"}
+    plugin_handler.assert_not_called()
+    skill_builder.assert_not_called()
+    worker.run.assert_not_called()
+
+
+def test_pending_builtin_remains_reserved_through_desktop_fallback(server):
+    """Pending built-ins fall back for execution without yielding ownership."""
+    sid = "pending-discovery-session"
+
+    class Worker:
+        def __init__(self):
+            self.calls = []
+
+        def command(self, command):
+            self.calls.append(command)
+            return f"worker:{command}"
+
+    worker = Worker()
+    server._sessions[sid] = {
+        "session_key": sid,
+        "agent": None,
+        "slash_worker": worker,
+        "history": [{"role": "user", "content": "Retry ThisCase"}],
+        "history_lock": threading.Lock(),
+    }
+    quick = {
+        "retry": {
+            "type": "alias",
+            "target": "/status",
+            "description": "Quick retry owner",
+        }
+    }
+
+    with patch.object(
+        server,
+        "_load_cfg",
+        return_value={"quick_commands": quick},
+    ), patch(
+        "hermes_cli.plugins.get_plugin_commands", return_value={}
+    ), patch(
+        "agent.skill_bundles.get_skill_bundles", return_value={}
+    ), patch(
+        "agent.skill_commands.get_skill_commands", return_value={}
+    ):
+        catalog = server.handle_request({
+            "id": "pending-catalog",
+            "method": "commands.catalog",
+            "params": {},
+        })["result"]
+        completion = server.handle_request({
+            "id": "pending-complete",
+            "method": "complete.slash",
+            "params": {"text": "/retr"},
+        })["result"]
+        first_hop = server.handle_request({
+            "id": "pending-exec",
+            "method": "slash.exec",
+            "params": {"command": "retry", "session_id": sid},
+        })
+        fallback = server.handle_request({
+            "id": "pending-dispatch",
+            "method": "command.dispatch",
+            "params": {"name": "retry", "session_id": sid},
+        })
+
+    retry_pairs = [pair for pair in catalog["pairs"] if pair[0] == "/retry"]
+    assert len(retry_pairs) == 1
+    assert retry_pairs[0][1] != "Quick retry owner"
+    retry_items = [
+        item for item in completion["items"] if item["display"] == "/retry"
+    ]
+    assert len(retry_items) == 1
+    assert retry_items[0]["meta"] != "Quick retry owner"
+    assert first_hop["error"]["code"] == 4018
+    assert fallback["result"] == {"type": "send", "message": "Retry ThisCase"}
+    assert worker.calls == []
+
+
+@pytest.mark.parametrize("command", ["status", "snapshot", "compact"])
+def test_quick_collision_keeps_non_fallback_static_root(server, command):
+    """Ordinary, bare worker-blocked, and TUI-only roots stay static."""
+    quick_description = f"Quick {command} must lose"
+    with patch.object(
+        server,
+        "_load_cfg",
+        return_value={
+            "quick_commands": {
+                command: {
+                    "type": "alias",
+                    "target": "/help",
+                    "description": quick_description,
+                }
+            }
+        },
+    ), patch(
+        "hermes_cli.plugins.get_plugin_commands", return_value={}
+    ), patch(
+        "agent.skill_bundles.get_skill_bundles", return_value={}
+    ), patch(
+        "agent.skill_commands.get_skill_commands", return_value={}
+    ):
+        catalog = server.handle_request({
+            "id": f"static-{command}-catalog",
+            "method": "commands.catalog",
+            "params": {},
+        })["result"]
+        completion = server.handle_request({
+            "id": f"static-{command}-complete",
+            "method": "complete.slash",
+            "params": {"text": f"/{command}"},
+        })["result"]
+
+    assert quick_description not in [description for _, description in catalog["pairs"]]
+    assert quick_description not in [item["meta"] for item in completion["items"]]
+
+
+def test_every_registry_alias_and_tui_extra_root_is_reserved(server):
+    """The reserved set derives from registries, not a drifting copied list."""
+    from hermes_cli.commands import COMMAND_REGISTRY
+
+    roots = {
+        root
+        for command in COMMAND_REGISTRY
+        for root in (command.name, *command.aliases)
+    }
+    roots.update(
+        root
+        for command in server._TUI_NATIVE_COMMANDS
+        for root in (command["name"], *command["aliases"])
+    )
+
+    assert "switch" in roots
+    assert "details" in roots
+    assert "detail" in roots
+    assert "fortune" in roots
+    assert "terminal-setup" in roots
+    assert "heapdump" in roots
+    assert "mem" in roots
+    assert "replay" in roots
+    assert "replay-diff" in roots
+    assert "setup" in roots
+    assert all(
+        server._resolve_slash_ownership(root)["owner"] == "reserved"
+        for root in roots
+    )
+
+
+@pytest.mark.parametrize(
+    ("filename", "contents"),
+    [
+        ("missing.json", None),
+        ("malformed.json", "{not-json"),
+        ("wrong-shape.json", '{"commands": {}}'),
+        ("invalid-name.json", '{"commands": [{"name": null}]}'),
+        (
+            "invalid-aliases.json",
+            '{"commands": [{"name": "setup", "aliases": "alias"}]}',
+        ),
+        (
+            "duplicate-root.json",
+            '{"commands": [{"name": "setup"}, {"name": "setup"}]}',
+        ),
+    ],
+)
+def test_tui_native_contract_load_failure_is_fail_closed(
+    server, tmp_path, filename, contents
+):
+    contract_path = tmp_path / filename
+    if contents is not None:
+        contract_path.write_text(contents, encoding="utf-8")
+
+    with pytest.raises(
+        RuntimeError, match="^TUI native slash command contract unavailable$"
+    ) as raised:
+        server._load_tui_native_commands(contract_path)
+
+    assert str(contract_path) not in str(raised.value)
+
+
+def test_hidden_builtin_remains_reserved_and_suppresses_quick_owner(server):
+    """A hidden gateway-only registry row still reserves its exact root."""
+    sid = "reserved-approve-session"
+    worker = MagicMock()
+    worker.run.return_value = "reserved approve"
+    server._sessions[sid] = {
+        "session_key": sid,
+        "agent": None,
+        "slash_worker": worker,
+    }
+    quick = {
+        "approve": {
+            "type": "alias",
+            "target": "/status",
+            "description": "Quick approve owner",
+        }
+    }
+    with patch.object(
+        server,
+        "_load_cfg",
+        return_value={"quick_commands": quick},
+    ), patch(
+        "hermes_cli.plugins.get_plugin_commands", return_value={}
+    ), patch(
+        "agent.skill_bundles.get_skill_bundles", return_value={}
+    ), patch(
+        "agent.skill_commands.get_skill_commands", return_value={}
+    ):
+        catalog = server.handle_request({
+            "id": "hidden-quick-catalog",
+            "method": "commands.catalog",
+            "params": {},
+        })["result"]
+        completion = server.handle_request({
+            "id": "hidden-quick-complete",
+            "method": "complete.slash",
+            "params": {"text": "/appr"},
+        })["result"]
+        direct = server.handle_request({
+            "id": "hidden-quick-exec",
+            "method": "slash.exec",
+            "params": {"command": "APPROVE", "session_id": sid},
+        })
+        dispatch = server.handle_request({
+            "id": "hidden-quick-dispatch",
+            "method": "command.dispatch",
+            "params": {"name": "APPROVE", "session_id": sid},
+        })
+
+    assert all(pair[0] != "/approve" for pair in catalog["pairs"])
+    assert all(item["display"] != "/approve" for item in completion["items"])
+    assert server._resolve_slash_ownership("APPROVE")["owner"] == "reserved"
+    assert direct["result"] == {"output": "reserved approve"}
+    assert dispatch["error"]["code"] == 4018
+    worker.run.assert_called_once_with("APPROVE")
+
+
+def test_uppercase_bundle_collision_cannot_replace_reserved_builtin(server):
+    """Reserved built-ins beat colliding Bundle/Skill roots case-insensitively."""
+    sid = "uppercase-bundle-session"
+    worker = MagicMock()
+    worker.run.return_value = "built-in status"
+    server._sessions[sid] = {
+        "session_key": sid,
+        "agent": None,
+        "slash_worker": worker,
+    }
+    bundles = {
+        "/status": {
+            "name": "Status Bundle",
+            "description": "Bundle owns status",
+            "skills": ["one"],
+        }
+    }
+    skills = {
+        "/status": {"name": "status-skill", "description": "Skill loses status"}
+    }
+    bundle_builder = MagicMock(return_value=("bundle-message", ["one"], []))
+
+    with patch.object(
+        server,
+        "_load_cfg",
+        return_value={"quick_commands": {}},
+    ), patch(
+        "hermes_cli.plugins.get_plugin_commands", return_value={}
+    ), patch(
+        "agent.skill_bundles.get_skill_bundles", return_value=bundles
+    ), patch(
+        "agent.skill_bundles.build_bundle_invocation_message", bundle_builder
+    ), patch(
+        "agent.skill_commands.get_skill_commands", return_value=skills
+    ):
+        catalog = server.handle_request({
+            "id": "uppercase-bundle-catalog",
+            "method": "commands.catalog",
+            "params": {},
+        })["result"]
+        completion = server.handle_request({
+            "id": "uppercase-bundle-complete",
+            "method": "complete.slash",
+            "params": {"text": "/stat"},
+        })["result"]
+        first_hop = server.handle_request({
+            "id": "uppercase-bundle-exec",
+            "method": "slash.exec",
+            "params": {"command": "STATUS KeepCase ARG", "session_id": sid},
+        })
+
+    status_pairs = [pair for pair in catalog["pairs"] if pair[0] == "/status"]
+    assert len(status_pairs) == 1
+    assert status_pairs[0][1] != "Bundle owns status"
+    status_items = [
+        item for item in completion["items"] if item["display"] == "/status"
+    ]
+    assert len(status_items) == 1
+    assert not status_items[0]["meta"].startswith("▣ Bundle owns status")
+    assert "error" not in first_hop
+    assert first_hop["result"] == {"output": "built-in status"}
+    worker.run.assert_called_once_with("STATUS KeepCase ARG")
+    bundle_builder.assert_not_called()
+
+
+def test_reserved_alias_equivalence_beats_bundle_and_skill(server):
+    """A dynamic /set_home cannot bypass the reserved /set-home alias."""
+    sid = "reserved-set-home-equivalence"
+    worker = MagicMock()
+    worker.run.return_value = "reserved sethome"
+    server._sessions[sid] = {
+        "session_key": sid,
+        "agent": None,
+        "slash_worker": worker,
+    }
+    bundles = {
+        "/set_home": {
+            "name": "Set Home Bundle",
+            "description": "Bundle loser",
+            "skills": ["one"],
+        }
+    }
+    skills = {
+        "/set_home": {"name": "set-home-skill", "description": "Skill loser"}
+    }
+
+    with patch.object(
+        server, "_load_cfg", return_value={"quick_commands": {}}
+    ), patch(
+        "hermes_cli.plugins.get_plugin_commands", return_value={}
+    ), patch(
+        "agent.skill_bundles.get_skill_bundles", return_value=bundles
+    ), patch(
+        "agent.skill_commands.get_skill_commands", return_value=skills
+    ):
+        catalog = server.handle_request({
+            "id": "set-home-equivalence-catalog",
+            "method": "commands.catalog",
+            "params": {},
+        })["result"]
+        completion = server.handle_request({
+            "id": "set-home-equivalence-completion",
+            "method": "complete.slash",
+            "params": {"text": "/set_"},
+        })["result"]
+        direct = server.handle_request({
+            "id": "set-home-equivalence-exec",
+            "method": "slash.exec",
+            "params": {"command": "SET_HOME KeepCase ARG", "session_id": sid},
+        })
+
+    assert server._resolve_slash_ownership("set_home")["owner"] == "reserved"
+    assert server._resolve_slash_ownership("set_home")["canonical"] == "/sethome"
+    assert all(pair[0] != "/set_home" for pair in catalog["pairs"])
+    assert all(item["display"] != "/set_home" for item in completion["items"])
+    assert direct["result"] == {"output": "reserved sethome"}
+    worker.run.assert_called_once_with("SET_HOME KeepCase ARG")
+
+
+def test_uppercase_skill_execution_preserves_case_sensitive_arg(server):
+    """Uppercase typed skill roots canonicalize without lowercasing the argument."""
+    sid = "uppercase-skill-session"
+    server._sessions[sid] = {"session_key": sid, "agent": None}
+    skills = {
+        "/case-skill": {"name": "case-skill", "description": "Case skill"}
+    }
+    skill_builder = MagicMock(return_value="skill-message")
+
+    with patch(
+        "agent.skill_bundles.get_skill_bundles", return_value={}
+    ), patch(
+        "agent.skill_commands.get_skill_commands", return_value=skills
+    ), patch(
+        "agent.skill_commands.scan_skill_commands", return_value=skills
+    ), patch(
+        "agent.skill_commands.build_skill_invocation_message", skill_builder
+    ):
+        first_hop = server.handle_request({
+            "id": "uppercase-skill-exec",
+            "method": "slash.exec",
+            "params": {"command": "CASE-SKILL KeepCase ARG", "session_id": sid},
+        })
+        fallback = server.handle_request({
+            "id": "uppercase-skill-dispatch",
+            "method": "command.dispatch",
+            "params": {
+                "name": "CASE-SKILL",
+                "arg": "KeepCase ARG",
+                "session_id": sid,
+            },
+        })
+
+    assert first_hop["error"]["code"] == 4018
+    assert fallback["result"] == {
+        "type": "skill",
+        "message": "skill-message",
+        "name": "case-skill",
+    }
+    skill_builder.assert_called_once_with(
+        "/case-skill", "KeepCase ARG", task_id=sid
+    )
+
+
+def test_uppercase_bundle_two_hop_preserves_arg_and_beats_skill(server):
+    """Non-reserved Bundle roots keep underscore equivalence and beat Skill."""
+    sid = "uppercase-bundle-dynamic-session"
+    worker = MagicMock()
+    server._sessions[sid] = {
+        "session_key": sid,
+        "agent": None,
+        "slash_worker": worker,
+    }
+    bundles = {
+        "/review-pack": {
+            "name": "Review Pack",
+            "description": "Review bundle",
+            "skills": ["one"],
+        }
+    }
+    skills = {
+        "/review-pack": {"name": "review-pack", "description": "Skill loser"}
+    }
+    bundle_builder = MagicMock(return_value=("bundle-message", ["one"], []))
+    skill_builder = MagicMock(return_value="skill-message")
+
+    with patch.object(
+        server, "_load_cfg", return_value={"quick_commands": {}}
+    ), patch(
+        "hermes_cli.plugins.get_plugin_commands", return_value={}
+    ), patch(
+        "agent.skill_bundles.get_skill_bundles", return_value=bundles
+    ), patch(
+        "agent.skill_bundles.build_bundle_invocation_message", bundle_builder
+    ), patch(
+        "agent.skill_commands.get_skill_commands", return_value=skills
+    ), patch(
+        "agent.skill_commands.build_skill_invocation_message", skill_builder
+    ):
+        first_hop = server.handle_request({
+            "id": "uppercase-dynamic-bundle-exec",
+            "method": "slash.exec",
+            "params": {"command": "REVIEW_PACK KeepCase ARG", "session_id": sid},
+        })
+        fallback = server.handle_request({
+            "id": "uppercase-dynamic-bundle-dispatch",
+            "method": "command.dispatch",
+            "params": {
+                "name": "REVIEW_PACK",
+                "arg": "KeepCase ARG",
+                "session_id": sid,
+            },
+        })
+
+    assert first_hop["error"]["code"] == 4018
+    assert fallback["result"]["type"] == "bundle"
+    bundle_builder.assert_called_once_with(
+        "/review-pack", "KeepCase ARG", task_id=sid
+    )
+    skill_builder.assert_not_called()
+    worker.run.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("owner", "stored_root", "typed_root"),
+    [
+        ("bundle", "/review-pack", "REVIEW_PACK"),
+        ("bundle", "/review_pack", "REVIEW-PACK"),
+        ("skill", "/review-pack", "REVIEW_PACK"),
+        ("skill", "/review_pack", "REVIEW-PACK"),
+    ],
+)
+def test_bundle_and_skill_underscore_hyphen_equivalence_is_symmetric(
+    server, owner, stored_root, typed_root
+):
+    sid = f"symmetric-{owner}-{stored_root}"
+    server._sessions[sid] = {"session_key": sid, "agent": None}
+    bundles = (
+        {
+            stored_root: {
+                "name": "Review Bundle",
+                "description": "Review bundle",
+                "skills": ["one"],
+            }
+        }
+        if owner == "bundle"
+        else {}
+    )
+    skills = (
+        {stored_root: {"name": "review-skill", "description": "Review skill"}}
+        if owner == "skill"
+        else {}
+    )
+    bundle_builder = MagicMock(return_value=("bundle-message", ["one"], []))
+    skill_builder = MagicMock(return_value="skill-message")
+
+    with patch.object(
+        server, "_load_cfg", return_value={"quick_commands": {}}
+    ), patch(
+        "hermes_cli.plugins.get_plugin_commands", return_value={}
+    ), patch(
+        "agent.skill_bundles.get_skill_bundles", return_value=bundles
+    ), patch(
+        "agent.skill_bundles.build_bundle_invocation_message", bundle_builder
+    ), patch(
+        "agent.skill_commands.get_skill_commands", return_value=skills
+    ), patch(
+        "agent.skill_commands.build_skill_invocation_message", skill_builder
+    ):
+        first_hop = server.handle_request({
+            "id": f"symmetric-{owner}-exec",
+            "method": "slash.exec",
+            "params": {"command": f"{typed_root} KeepCase ARG", "session_id": sid},
+        })
+        fallback = server.handle_request({
+            "id": f"symmetric-{owner}-dispatch",
+            "method": "command.dispatch",
+            "params": {
+                "name": typed_root,
+                "arg": "KeepCase ARG",
+                "session_id": sid,
+            },
+        })
+
+    assert first_hop["error"]["code"] == 4018
+    assert fallback["result"]["type"] == owner
+    if owner == "bundle":
+        bundle_builder.assert_called_once_with(
+            stored_root, "KeepCase ARG", task_id=sid
+        )
+        skill_builder.assert_not_called()
+    else:
+        skill_builder.assert_called_once_with(
+            stored_root, "KeepCase ARG", task_id=sid
+        )
+        bundle_builder.assert_not_called()
+
+
+def test_quick_and_plugin_roots_do_not_use_underscore_hyphen_equivalence(server):
+    quick = {
+        "quick-root": {
+            "type": "alias",
+            "target": "/help",
+            "description": "Quick root",
+        }
+    }
+    plugins = {
+        "plugin-root": {
+            "handler": lambda _arg: "plugin",
+            "description": "Plugin root",
+        }
+    }
+
+    with patch.object(
+        server, "_load_cfg", return_value={"quick_commands": quick}
+    ), patch(
+        "hermes_cli.plugins.get_plugin_commands", return_value=plugins
+    ), patch(
+        "agent.skill_bundles.get_skill_bundles", return_value={}
+    ), patch(
+        "agent.skill_commands.get_skill_commands", return_value={}
+    ):
+        directory, _warnings = server._slash_ownership_directory()
+
+    assert server._resolve_slash_ownership("quick-root", directory)["owner"] == "quick"
+    assert server._resolve_slash_ownership("plugin-root", directory)["owner"] == "plugin"
+    assert server._resolve_slash_ownership("quick_root", directory)["owner"] == "unknown"
+    assert server._resolve_slash_ownership("plugin_root", directory)["owner"] == "unknown"
+
+
+def test_mixed_case_quick_command_has_one_case_insensitive_owner(server):
+    """Mixed-case config keys discover and dispatch under the same lower root."""
+    sid = "mixed-case-quick-session"
+    worker = MagicMock()
+    server._sessions[sid] = {
+        "session_key": sid,
+        "agent": None,
+        "slash_worker": worker,
+    }
+    quick = {
+        "MyCmd": {
+            "type": "alias",
+            "target": "/Status KeepCASE",
+            "description": "Mixed case quick",
+        }
+    }
+    with patch.object(
+        server,
+        "_load_cfg",
+        return_value={"quick_commands": quick},
+    ), patch(
+        "hermes_cli.plugins.get_plugin_commands", return_value={}
+    ), patch(
+        "agent.skill_bundles.get_skill_bundles", return_value={}
+    ), patch(
+        "agent.skill_commands.get_skill_commands", return_value={}
+    ):
+        catalog = server.handle_request({
+            "id": "mixed-quick-catalog",
+            "method": "commands.catalog",
+            "params": {},
+        })["result"]
+        completion = server.handle_request({
+            "id": "mixed-quick-complete",
+            "method": "complete.slash",
+            "params": {"text": "/MY"},
+        })["result"]
+        first_hop = server.handle_request({
+            "id": "mixed-quick-exec",
+            "method": "slash.exec",
+            "params": {"command": "MYCMD KeepCase ARG", "session_id": sid},
+        })
+        dispatch = server.handle_request({
+            "id": "mixed-quick-dispatch",
+            "method": "command.dispatch",
+            "params": {"name": "MYCMD", "arg": "KeepCase ARG", "session_id": sid},
+        })
+
+    assert [pair for pair in catalog["pairs"] if pair[0] == "/mycmd"] == [
+        ["/mycmd", "Mixed case quick"]
+    ]
+    assert [
+        item["display"] for item in completion["items"] if item["display"] == "/mycmd"
+    ] == ["/mycmd"]
+    assert first_hop["error"]["code"] == 4018
+    worker.run.assert_not_called()
+    assert dispatch["result"] == {
+        "type": "alias",
+        "target": "/Status KeepCASE",
+    }
+
+
+@pytest.mark.parametrize(
+    ("successor", "description", "expected_type"),
+    [
+        ("plugin", "Callable plugin owner", "plugin"),
+        ("bundle", "Bundle owner", "bundle"),
+        ("skill", "Skill owner", "skill"),
+        (None, None, None),
+    ],
+)
+def test_invalid_quick_never_owns_gateway_discovery_or_dispatch(
+    server, successor, description, expected_type
+):
+    """Unsupported quick types yield to the next valid owner or disappear."""
+    root = "invalid-quick-collision"
+    plugin_handler = MagicMock(return_value="plugin-output")
+    bundle_builder = MagicMock(return_value=("bundle-message", ["one"], []))
+    skill_builder = MagicMock(return_value="skill-message")
+    plugins = (
+        {root: {"handler": plugin_handler, "description": description}}
+        if successor == "plugin"
+        else {}
+    )
+    bundles = (
+        {
+            f"/{root}": {
+                "name": "Bundle owner",
+                "description": description,
+                "skills": ["one"],
+            }
+        }
+        if successor == "bundle"
+        else {}
+    )
+    skills = (
+        {f"/{root}": {"name": "Skill owner", "description": description}}
+        if successor == "skill"
+        else {}
+    )
+
+    with patch.object(
+        server,
+        "_load_cfg",
+        return_value={
+            "quick_commands": {
+                root: {
+                    "type": "prompt",
+                    "command": "must-not-own",
+                    "description": "Invalid quick must lose",
+                }
+            }
+        },
+    ), patch(
+        "hermes_cli.plugins.get_plugin_commands", return_value=plugins
+    ), patch(
+        "agent.skill_bundles.get_skill_bundles", return_value=bundles
+    ), patch(
+        "agent.skill_bundles.build_bundle_invocation_message", bundle_builder
+    ), patch(
+        "agent.skill_commands.get_skill_commands", return_value=skills
+    ), patch(
+        "agent.skill_commands.build_skill_invocation_message", skill_builder
+    ):
+        catalog = server.handle_request({
+            "id": f"invalid-quick-{successor}-catalog",
+            "method": "commands.catalog",
+            "params": {},
+        })["result"]
+        completion = server.handle_request({
+            "id": f"invalid-quick-{successor}-complete",
+            "method": "complete.slash",
+            "params": {"text": "/INVALID-QUICK"},
+        })["result"]
+        dispatch = server.handle_request({
+            "id": f"invalid-quick-{successor}-dispatch",
+            "method": "command.dispatch",
+            "params": {"name": root, "arg": "KeepCase ARG"},
+        })
+
+    rows = [pair for pair in catalog["pairs"] if pair[0] == f"/{root}"]
+    completion_rows = [
+        item for item in completion["items"] if item["display"] == f"/{root}"
+    ]
+    if successor is None:
+        assert rows == []
+        assert completion_rows == []
+        assert dispatch["error"]["code"] == 4018
+    else:
+        assert rows == [[f"/{root}", description]]
+        assert len(completion_rows) == 1
+        assert description in completion_rows[0]["meta"]
+        assert dispatch["result"]["type"] == expected_type
+
+    if successor == "plugin":
+        plugin_handler.assert_called_once_with("KeepCase ARG")
+    else:
+        plugin_handler.assert_not_called()
+    if successor == "bundle":
+        bundle_builder.assert_called_once()
+    else:
+        bundle_builder.assert_not_called()
+    if successor == "skill":
+        skill_builder.assert_called_once()
+    else:
+        skill_builder.assert_not_called()
+
+
 # ── slash.exec skill command interception ────────────────────────────
 
 
@@ -1027,6 +1937,27 @@ def test_slash_exec_rejects_skill_commands(server):
     assert "skill command" in resp["error"]["message"]
 
 
+def test_slash_exec_rejects_bundle_commands(server):
+    """Bundle commands must fall through to command.dispatch, never the worker."""
+    sid = "test-session"
+    server._sessions[sid] = {"session_key": sid, "agent": None}
+
+    with patch(
+        "agent.skill_bundles.get_skill_bundles",
+        return_value={"/review-pack": {"name": "Review Pack", "skills": []}},
+    ), patch("agent.skill_commands.get_skill_commands", return_value={}):
+        resp = server.handle_request({
+            "id": "r-bundle-slash",
+            "method": "slash.exec",
+            "params": {"command": "review-pack inspect this", "session_id": sid},
+        })
+
+    assert resp["error"] == {
+        "code": 4018,
+        "message": "bundle command: use command.dispatch for /review-pack",
+    }
+
+
 def test_slash_exec_handles_plugin_commands_in_live_gateway(server):
     """Plugin slash commands return normal slash.exec output without using the worker."""
     sid = "test-session"
@@ -1042,9 +1973,12 @@ def test_slash_exec_handles_plugin_commands_in_live_gateway(server):
     worker = Worker()
     server._sessions[sid] = {"session_key": sid, "agent": None, "slash_worker": worker}
 
+    handler = lambda arg: f"plugin:{arg}"
     with patch(
-        "hermes_cli.plugins.get_plugin_command_handler",
-        lambda name: (lambda arg: f"plugin:{arg}") if name == "plugin-cmd" else None,
+        "hermes_cli.plugins.get_plugin_commands",
+        return_value={"plugin-cmd": {"handler": handler, "description": "Plugin"}},
+    ), patch("agent.skill_bundles.get_skill_bundles", return_value={}), patch(
+        "agent.skill_commands.get_skill_commands", return_value={}
     ):
         resp = server.handle_request({
             "id": "r-plugin-slash",
@@ -1106,8 +2040,10 @@ def test_slash_exec_plugin_handler_error_returns_output(server):
     server._sessions[sid] = {"session_key": sid, "agent": None, "slash_worker": worker}
 
     with patch(
-        "hermes_cli.plugins.get_plugin_command_handler",
-        lambda name: handler if name == "plugin-cmd" else None,
+        "hermes_cli.plugins.get_plugin_commands",
+        return_value={"plugin-cmd": {"handler": handler, "description": "Plugin"}},
+    ), patch("agent.skill_bundles.get_skill_bundles", return_value={}), patch(
+        "agent.skill_commands.get_skill_commands", return_value={}
     ):
         resp = server.handle_request({
             "id": "r-plugin-handler-error",
@@ -1120,7 +2056,125 @@ def test_slash_exec_plugin_handler_error_returns_output(server):
     assert worker.calls == []
 
 
-@pytest.mark.parametrize("cmd", ["retry", "queue hello", "q hello", "steer fix the test", "plan"])
+class _FalseyCallablePlugin:
+    def __init__(self):
+        self.calls = []
+
+    def __bool__(self):
+        return False
+
+    def __call__(self, arg):
+        self.calls.append(arg)
+        return f"falsey-callable:{arg}"
+
+
+def test_falsey_callable_plugin_is_discovered_and_executed(server):
+    """Callable validation must not accidentally use handler truthiness."""
+    sid = "falsey-callable-plugin-session"
+    worker = MagicMock()
+    handler = _FalseyCallablePlugin()
+    server._sessions[sid] = {
+        "session_key": sid,
+        "agent": None,
+        "slash_worker": worker,
+    }
+    plugins = {
+        "falsey-plugin": {"handler": handler, "description": "Falsey callable"}
+    }
+    with patch.object(
+        server, "_load_cfg", return_value={"quick_commands": {}}
+    ), patch(
+        "hermes_cli.plugins.get_plugin_commands", return_value=plugins
+    ), patch(
+        "agent.skill_bundles.get_skill_bundles", return_value={}
+    ), patch(
+        "agent.skill_commands.get_skill_commands", return_value={}
+    ):
+        catalog = server.handle_request({
+            "id": "falsey-plugin-catalog",
+            "method": "commands.catalog",
+            "params": {},
+        })["result"]
+        completion = server.handle_request({
+            "id": "falsey-plugin-complete",
+            "method": "complete.slash",
+            "params": {"text": "/FALSEY"},
+        })["result"]
+        direct = server.handle_request({
+            "id": "falsey-plugin-exec",
+            "method": "slash.exec",
+            "params": {
+                "command": "FALSEY-PLUGIN KeepCase ARG",
+                "session_id": sid,
+            },
+        })
+
+    assert [pair for pair in catalog["pairs"] if pair[0] == "/falsey-plugin"] == [
+        ["/falsey-plugin", "Falsey callable"]
+    ]
+    assert [
+        item["display"]
+        for item in completion["items"]
+        if item["display"] == "/falsey-plugin"
+    ] == ["/falsey-plugin"]
+    assert direct["result"] == {"output": "falsey-callable:KeepCase ARG"}
+    assert handler.calls == ["KeepCase ARG"]
+    worker.run.assert_not_called()
+
+
+@pytest.mark.parametrize("invalid_handler", [None, 0, "not-callable", object()])
+def test_invalid_plugin_handlers_are_not_discovered_or_dispatched(
+    server, invalid_handler
+):
+    """Defensive discovery ignores corrupt plugin registry handler entries."""
+    sid = "invalid-plugin-session"
+    worker = MagicMock()
+    worker.run.return_value = "worker unknown"
+    server._sessions[sid] = {
+        "session_key": sid,
+        "agent": None,
+        "slash_worker": worker,
+    }
+    plugins = {
+        "broken-plugin": {
+            "handler": invalid_handler,
+            "description": "Must stay hidden",
+        }
+    }
+    with patch.object(
+        server, "_load_cfg", return_value={"quick_commands": {}}
+    ), patch(
+        "hermes_cli.plugins.get_plugin_commands", return_value=plugins
+    ), patch(
+        "agent.skill_bundles.get_skill_bundles", return_value={}
+    ), patch(
+        "agent.skill_commands.get_skill_commands", return_value={}
+    ):
+        catalog = server.handle_request({
+            "id": "invalid-plugin-catalog",
+            "method": "commands.catalog",
+            "params": {},
+        })["result"]
+        completion = server.handle_request({
+            "id": "invalid-plugin-complete",
+            "method": "complete.slash",
+            "params": {"text": "/broken"},
+        })["result"]
+        direct = server.handle_request({
+            "id": "invalid-plugin-exec",
+            "method": "slash.exec",
+            "params": {"command": "broken-plugin ARG", "session_id": sid},
+        })
+
+    assert all(pair[0] != "/broken-plugin" for pair in catalog["pairs"])
+    assert all(
+        item["display"] != "/broken-plugin" for item in completion["items"]
+    )
+    assert direct["result"] == {"output": "worker unknown"}
+    worker.run.assert_called_once_with("broken-plugin ARG")
+
+
+@pytest.mark.parametrize("cmd", ["retry", "queue hello", "q hello", "steer fix the test"])
 def test_slash_exec_rejects_pending_input_commands(server, cmd):
     """slash.exec must reject commands that use _pending_input in the CLI."""
     sid = "test-session"
@@ -1308,7 +2362,7 @@ def test_command_dispatch_returns_skill_payload(server):
     fake_skills = {"/hermes-agent-dev": {"name": "hermes-agent-dev", "description": "Dev workflow"}}
     fake_msg = "Loaded skill content here"
 
-    with patch("agent.skill_commands.scan_skill_commands", return_value=fake_skills), \
+    with patch("agent.skill_commands.get_skill_commands", return_value=fake_skills), \
          patch("agent.skill_commands.build_skill_invocation_message", return_value=fake_msg):
         resp = server.handle_request({
             "id": "r2",
@@ -1323,13 +2377,179 @@ def test_command_dispatch_returns_skill_payload(server):
     assert result["name"] == "hermes-agent-dev"
 
 
+def test_command_dispatch_returns_bundle_payload(server):
+    """A bundle stays a bundle while its expanded message is sent to the session."""
+    sid = "test-session"
+    server._sessions[sid] = {"session_key": sid}
+    fake_bundles = {
+        "/review-pack": {"name": "Review Pack", "skills": ["review", "tests"]}
+    }
+
+    with patch(
+        "agent.skill_bundles.resolve_bundle_command_key",
+        return_value="/review-pack",
+    ), patch(
+        "agent.skill_bundles.get_skill_bundles",
+        return_value=fake_bundles,
+    ), patch(
+        "agent.skill_bundles.build_bundle_invocation_message",
+        return_value=("expanded bundle message", ["review", "tests"], ["optional"]),
+    ) as builder:
+        resp = server.handle_request({
+            "id": "r-bundle",
+            "method": "command.dispatch",
+            "params": {
+                "name": "review-pack",
+                "arg": "inspect this change",
+                "session_id": sid,
+            },
+        })
+
+    assert "error" not in resp
+    assert resp["result"] == {
+        "type": "bundle",
+        "message": "expanded bundle message",
+        "name": "Review Pack",
+        "skills": ["review", "tests"],
+        "missing": ["optional"],
+    }
+    builder.assert_called_once_with(
+        "/review-pack", "inspect this change", task_id=sid
+    )
+
+
+def test_command_dispatch_bundle_precedes_individual_skill(server):
+    """A colliding bundle slug wins before individual skill resolution."""
+    sid = "test-session"
+    server._sessions[sid] = {"session_key": sid}
+
+    with patch(
+        "agent.skill_bundles.get_skill_bundles",
+        return_value={"/collision": {"name": "Collision Bundle"}},
+    ), patch(
+        "agent.skill_bundles.build_bundle_invocation_message",
+        return_value=("bundle wins", ["first", "second"], []),
+    ), patch(
+        "agent.skill_commands.get_skill_commands",
+        return_value={"/collision": {"name": "collision"}},
+    ), patch(
+        "agent.skill_commands.build_skill_invocation_message",
+        return_value="individual skill",
+    ) as skill_builder:
+        resp = server.handle_request({
+            "id": "r-collision",
+            "method": "command.dispatch",
+            "params": {"name": "collision", "arg": "do work", "session_id": sid},
+        })
+
+    assert resp["result"]["type"] == "bundle"
+    assert resp["result"]["message"] == "bundle wins"
+    skill_builder.assert_not_called()
+
+
+def test_command_dispatch_failed_bundle_does_not_fall_through_to_skill(server):
+    """Bundle ownership of a colliding slug remains authoritative on failure."""
+    with patch(
+        "agent.skill_bundles.get_skill_bundles",
+        return_value={"/collision": {"name": "Collision Bundle"}},
+    ), patch(
+        "agent.skill_bundles.build_bundle_invocation_message",
+        return_value=None,
+    ), patch(
+        "agent.skill_commands.get_skill_commands",
+        return_value={"/collision": {"name": "collision"}},
+    ), patch(
+        "agent.skill_commands.build_skill_invocation_message"
+    ) as skill_builder:
+        resp = server.handle_request({
+            "id": "r-collision-failed",
+            "method": "command.dispatch",
+            "params": {"name": "collision", "arg": "do work"},
+        })
+
+    assert resp["error"] == {"code": 5018, "message": "bundle_load_failed"}
+    skill_builder.assert_not_called()
+
+
+def test_command_dispatch_bundle_runtime_failure_is_redacted_and_never_falls_through(server):
+    """A confirmed Bundle remains authoritative after an unexpected builder error."""
+    secret = "BUNDLE_RUNTIME_FAILURE_SENTINEL"
+    skill_builder = MagicMock(return_value="wrong individual skill")
+
+    with patch(
+        "agent.skill_bundles.get_skill_bundles",
+        return_value={"/collision": {"name": "Collision Bundle"}},
+    ), patch(
+        "agent.skill_bundles.build_bundle_invocation_message",
+        side_effect=RuntimeError(
+            f"{secret} C:/private/company/skill.md dsk_do_not_serialize"
+        ),
+    ), patch(
+        "agent.skill_commands.get_skill_commands",
+        return_value={"/collision": {"name": "collision"}},
+    ), patch(
+        "agent.skill_commands.build_skill_invocation_message",
+        skill_builder,
+    ):
+        resp = server.handle_request({
+            "id": "r-bundle-runtime-failure",
+            "method": "command.dispatch",
+            "params": {"name": "collision", "arg": secret},
+        })
+
+    assert resp["error"] == {"code": 5018, "message": "bundle_load_failed"}
+    serialized = json.dumps(resp)
+    assert secret not in serialized
+    assert "C:/private" not in serialized
+    assert "dsk_do_not_serialize" not in serialized
+    skill_builder.assert_not_called()
+
+
+def test_command_dispatch_bundle_policy_denial_is_stable_and_redacted(server):
+    """A mixed bundle denial is a stable 403 without decision-data leakage."""
+    from hermes_cli.enterprise_policy import EnterpriseSkillPolicyDenied
+
+    sid = "test-session"
+    server._sessions[sid] = {"session_key": sid}
+    secret = "SENSITIVE_BUNDLE_SENTINEL"
+    denied = EnterpriseSkillPolicyDenied({
+        "policyKey": "blocked-skill-at-C:/private/company/skill.md",
+        "reason": secret,
+        "credential": "dsk_do_not_serialize",
+    })
+
+    with patch(
+        "agent.skill_bundles.get_skill_bundles",
+        return_value={"/mixed": {"name": "Mixed Bundle"}},
+    ), patch(
+        "agent.skill_bundles.build_bundle_invocation_message",
+        side_effect=denied,
+    ):
+        resp = server.handle_request({
+            "id": "r-bundle-denied",
+            "method": "command.dispatch",
+            "params": {"name": "mixed", "arg": secret, "session_id": sid},
+        })
+
+    assert resp["error"] == {
+        "code": 403,
+        "message": "enterprise_skill_policy_denied",
+    }
+    serialized = json.dumps(resp)
+    assert secret not in serialized
+    assert "C:/private" not in serialized
+    assert "dsk_do_not_serialize" not in serialized
+
+
 def test_command_dispatch_awaits_async_plugin_handler(server):
     async def _handler(arg):
         return f"async:{arg}"
 
     with patch(
-        "hermes_cli.plugins.get_plugin_command_handler",
-        lambda name: _handler if name == "async-cmd" else None,
+        "hermes_cli.plugins.get_plugin_commands",
+        return_value={"async-cmd": {"handler": _handler, "description": "Async"}},
+    ), patch("agent.skill_bundles.get_skill_bundles", return_value={}), patch(
+        "agent.skill_commands.get_skill_commands", return_value={}
     ):
         resp = server.handle_request({
             "id": "r-plugin",

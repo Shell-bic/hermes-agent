@@ -760,6 +760,7 @@ class TestInlineShellExpansion:
 
     def test_inline_shell_runs_in_skill_directory(self, tmp_path):
         """Inline snippets get the skill dir as CWD so relative paths work."""
+        marker = "INLINE_SHELL_SKILL_CWD"
         with (
             patch("tools.skills_tool.SKILLS_DIR", tmp_path),
             patch(
@@ -771,13 +772,14 @@ class TestInlineShellExpansion:
             skill_dir = _make_skill(
                 tmp_path,
                 "dyn-cwd",
-                body="Here: !`pwd`",
+                body="Here: !`cat .inline-cwd-marker`",
             )
+            (skill_dir / ".inline-cwd-marker").write_text(marker)
             scan_skill_commands()
             msg = build_skill_invocation_message("/dyn-cwd")
 
         assert msg is not None
-        assert f"Here: {skill_dir}" in msg
+        assert f"Here: {marker}" in msg.splitlines()
 
     def test_inline_shell_timeout_does_not_break_message(self, tmp_path):
         with (

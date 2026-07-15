@@ -10,6 +10,10 @@ from __future__ import annotations
 import json
 import hashlib
 import os
+import re
+import unicodedata
+from contextlib import contextmanager
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Any, Mapping, Optional
 
@@ -20,8 +24,22 @@ ENTERPRISE_POLICY_JSON_ENV = "HERMES_ENTERPRISE_TOOL_POLICY_JSON"
 ENTERPRISE_PROVIDER = "company-gateway"
 ENTERPRISE_GATEWAY_TOKEN_ENV = "COMPANY_GATEWAY_TOKEN"
 ENTERPRISE_PROFILE_PREFIX = "enterprise-profile:"
+ENTERPRISE_SKILL_POLICY_DENIED = "enterprise_skill_policy_denied"
 
 _TRUE_VALUES = {"1", "true", "yes", "on"}
+_SAFE_ERROR_TOKEN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+_WINDOWS_RESERVED_SKILL_NAMES = {
+    "con",
+    "prn",
+    "aux",
+    "nul",
+    *(f"com{number}" for number in range(1, 10)),
+    *(f"lpt{number}" for number in range(1, 10)),
+}
+_SKILL_OPERATION_POLICY: ContextVar[Optional[Mapping[str, Any]]] = ContextVar(
+    "skill_operation_policy",
+    default=None,
+)
 
 _MODEL_CONFIG_KEYS = {
     "model",
@@ -102,6 +120,20 @@ class EnterprisePolicyDenied(PermissionError):
     """Raised when enterprise managed policy refuses a local mutation."""
 
 
+class EnterpriseSkillPolicyDenied(EnterprisePolicyDenied):
+    """Raised when an ordinary Skill read is refused by enterprise policy."""
+
+    def __init__(self, decision: Mapping[str, Any]):
+        self.decision = dict(decision)
+        policy_key = _display_skill_policy_key(decision.get("policyKey"))
+        reason = _safe_error_token(decision.get("reason"), ENTERPRISE_SKILL_POLICY_DENIED)
+        super().__init__(denial_message(f"skill '{policy_key}' load", reason))
+
+    @property
+    def error_code(self) -> str:
+        return ENTERPRISE_SKILL_POLICY_DENIED
+
+
 def _truthy(value: Any) -> bool:
     return str(value or "").strip().lower() in _TRUE_VALUES
 
@@ -144,6 +176,63 @@ def _as_list(value: Any) -> list[Any]:
 
 def _text(value: Any) -> str:
     return str(value or "").strip()
+
+
+def _safe_error_token(value: Any, fallback: str = "") -> str:
+    text = _text(value)
+    return text if _SAFE_ERROR_TOKEN.fullmatch(text) else fallback
+
+
+def _is_valid_skill_name(value: str) -> bool:
+    """Mirror Gateway P1 ``SkillPackageRules.IsValidSkillName`` semantics."""
+    if (
+        not value
+        or value.isspace()
+        or len(value) > 64
+        or value in {".", ".."}
+        or value.endswith((" ", "."))
+    ):
+        return False
+    if value.split(".", 1)[0].casefold() in _WINDOWS_RESERVED_SKILL_NAMES:
+        return False
+    return all(
+        char in "._-"
+        or unicodedata.category(char).startswith("L")
+        or unicodedata.category(char) == "Nd"
+        for char in value
+    )
+
+
+def _canonical_skill_policy_key(value: Any) -> str:
+    """Preserve a valid P1 Unicode lookup key without making it display text."""
+    text = _text(value)
+    if _is_valid_skill_name(text):
+        return text
+    if text.count(":") == 1:
+        namespace, skill_name = text.split(":", 1)
+        if _is_valid_skill_name(namespace) and _is_valid_skill_name(skill_name):
+            return text
+    return ""
+
+
+def _display_skill_policy_key(value: Any, fallback: str = "unknown") -> str:
+    """Return only a path-free, bounded canonical key for user-facing errors."""
+    return _canonical_skill_policy_key(value) or fallback
+
+
+@contextmanager
+def skill_policy_operation(policy: Optional[Mapping[str, Any]] = None):
+    """Freeze one enterprise policy mapping for a multi-Skill operation."""
+    active = _SKILL_OPERATION_POLICY.get()
+    if active is not None:
+        yield active
+        return
+    snapshot = dict(load_enterprise_policy() if policy is None else policy)
+    token = _SKILL_OPERATION_POLICY.set(snapshot)
+    try:
+        yield snapshot
+    finally:
+        _SKILL_OPERATION_POLICY.reset(token)
 
 
 def _policy_value(policy: Mapping[str, Any], key: str) -> Any:
@@ -733,6 +822,239 @@ def is_skill_allowed(name: str, policy: Optional[Mapping[str, Any]] = None) -> b
     if not is_enterprise_managed():
         return True
     return not _tool_policy_denies("skills", name, policy)
+
+
+def _path_is_within(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+        return True
+    except ValueError:
+        return False
+
+
+def _read_skill_hub_lock(skills_root: Path) -> tuple[bool, Mapping[str, Any]]:
+    """Read the standard Hub lock without turning unrelated lock damage into a deny."""
+    lock_path = skills_root / ".hub" / "lock.json"
+    if not lock_path.is_file():
+        return False, {}
+    try:
+        raw = json.loads(lock_path.read_text(encoding="utf-8"))
+    except Exception:
+        return False, {}
+    installed = raw.get("installed") if isinstance(raw, dict) else None
+    return (True, installed) if isinstance(installed, dict) else (False, {})
+
+
+def _enterprise_lock_entry_matches(
+    entry: Mapping[str, Any],
+    *,
+    policy_key: str,
+    install_path: str,
+) -> bool:
+    if _text(entry.get("source")).lower() != "enterprise":
+        return False
+    entry_key = _text(entry.get("key") or entry.get("identifier"))
+    if entry_key and entry_key != policy_key:
+        return False
+    recorded_path = _text(entry.get("install_path") or entry.get("path")).replace("\\", "/")
+    if recorded_path != install_path:
+        return False
+    metadata = entry.get("metadata")
+    if isinstance(metadata, dict):
+        metadata_key = _text(metadata.get("enterprise_key"))
+        if metadata_key and metadata_key != policy_key:
+            return False
+    return True
+
+
+def skill_runtime_identity(
+    name: str,
+    *,
+    skill_path: Optional[str | Path] = None,
+    provenance: str = "",
+    frontmatter_evidence: Optional[Mapping[str, Any]] = None,
+) -> dict[str, Any]:
+    """Build the canonical identity consumed by :func:`skill_runtime_decision`.
+
+    Enterprise provenance is proven jointly by the standard
+    ``skills/enterprise/<name>/SKILL.md`` location and its ``.hub/lock.json``
+    entry. A damaged or contradictory proof is kept distinct so managed mode
+    can fail closed without penalising ordinary local/external/plugin Skills.
+    """
+    policy_key = _canonical_skill_policy_key(name)
+    declared_provenance = _text(provenance).lower()
+    if declared_provenance == "plugin":
+        return {"policyKey": policy_key, "provenance": "plugin"}
+
+    if skill_path is None:
+        return {
+            "policyKey": policy_key,
+            "provenance": declared_provenance or "local",
+        }
+
+    from hermes_constants import get_skills_dir
+
+    path = Path(skill_path).absolute()
+    skills_root = get_skills_dir().absolute()
+    resolved_root = skills_root.resolve(strict=False)
+    resolved_path = path.resolve(strict=False)
+    lexical_local = _path_is_within(path, skills_root)
+    resolved_local = _path_is_within(resolved_path, resolved_root)
+    lock_valid, installed = _read_skill_hub_lock(skills_root)
+    matching_entry = installed.get(policy_key) if lock_valid else None
+
+    if lexical_local:
+        rel = path.relative_to(skills_root)
+        rel_parts = rel.parts
+        is_enterprise_location = bool(rel_parts and rel_parts[0].lower() == "enterprise")
+        if is_enterprise_location:
+            directory_key = rel_parts[1] if len(rel_parts) > 1 else ""
+            trusted_policy_key = _canonical_skill_policy_key(directory_key)
+            enterprise_entry = (
+                installed.get(directory_key)
+                if lock_valid and trusted_policy_key
+                else None
+            )
+            if frontmatter_evidence is None:
+                from agent.skill_utils import read_skill_frontmatter_evidence
+
+                frontmatter_evidence = read_skill_frontmatter_evidence(path)
+            evidence_valid = bool(frontmatter_evidence.get("valid"))
+            evidence_frontmatter = frontmatter_evidence.get("frontmatter")
+            canonical_name = (
+                _text(evidence_frontmatter.get("name"))
+                if isinstance(evidence_frontmatter, Mapping)
+                else ""
+            )
+            install_path = f"enterprise/{trusted_policy_key}"
+            location_matches = (
+                len(rel_parts) == 3
+                and trusted_policy_key == policy_key
+                and rel_parts[2] == "SKILL.md"
+                and resolved_local
+                and evidence_valid
+                and canonical_name == trusted_policy_key
+            )
+            if (
+                location_matches
+                and isinstance(enterprise_entry, dict)
+                and _enterprise_lock_entry_matches(
+                    enterprise_entry,
+                    policy_key=trusted_policy_key,
+                    install_path=install_path,
+                )
+            ):
+                return {"policyKey": trusted_policy_key, "provenance": "enterprise"}
+            return {
+                "policyKey": trusted_policy_key,
+                "provenance": "enterprise-invalid",
+            }
+
+        if isinstance(matching_entry, dict) and _text(matching_entry.get("source")).lower() == "enterprise":
+            return {"policyKey": policy_key, "provenance": "enterprise-invalid"}
+
+        if isinstance(matching_entry, dict):
+            recorded = _text(matching_entry.get("install_path") or matching_entry.get("path")).replace("\\", "/")
+            if recorded:
+                expected = str(path.parent.relative_to(skills_root)).replace("\\", "/")
+                if recorded == expected:
+                    return {"policyKey": policy_key, "provenance": "hub"}
+        return {"policyKey": policy_key, "provenance": declared_provenance or "local"}
+
+    if isinstance(matching_entry, dict) and _text(matching_entry.get("source")).lower() == "enterprise":
+        return {"policyKey": policy_key, "provenance": "enterprise-invalid"}
+    return {"policyKey": policy_key, "provenance": declared_provenance or "external"}
+
+
+def skill_runtime_decision(
+    identity: str | Mapping[str, Any],
+    policy: Optional[Mapping[str, Any]] = None,
+) -> dict[str, Any]:
+    """Return the one runtime authorization decision for a resolved Skill."""
+    if isinstance(identity, str):
+        identity = skill_runtime_identity(identity)
+    policy_key = _canonical_skill_policy_key(
+        identity.get("policyKey") or identity.get("name")
+    )
+    provenance = _safe_error_token(identity.get("provenance"), "local")
+
+    base = {
+        "allowed": True,
+        "policyKey": policy_key,
+        "status": "available",
+        "reason": "not_enterprise_managed",
+        "policyHash": "",
+        "provenance": provenance,
+        "errorCode": "",
+    }
+    if not is_enterprise_managed():
+        return base
+
+    if policy is None:
+        policy = _SKILL_OPERATION_POLICY.get()
+    if policy is None:
+        policy = load_enterprise_policy()
+    snapshot = tool_policy_snapshot(policy)
+    base["policyHash"] = _policy_hash(snapshot)
+
+    if provenance == "enterprise-invalid":
+        base.update(
+            allowed=False,
+            status="invalid-provenance",
+            reason="enterprise_skill_provenance_invalid",
+            errorCode=ENTERPRISE_SKILL_POLICY_DENIED,
+        )
+        return base
+
+    entry_decision = _policy_entry_decision("skills", policy_key, policy)
+    if entry_decision is not None:
+        base["allowed"] = bool(entry_decision["allowed"])
+        base["status"] = _text(entry_decision.get("status")) or (
+            "available" if base["allowed"] else "blocked"
+        )
+        base["reason"] = (
+            "enterprise_skill_policy_allowed"
+            if base["allowed"]
+            else "enterprise_skill_policy_denied"
+        )
+        if not base["allowed"]:
+            base["errorCode"] = ENTERPRISE_SKILL_POLICY_DENIED
+        return base
+
+    if provenance == "enterprise":
+        base.update(
+            allowed=False,
+            status="unlisted",
+            reason="enterprise_skill_policy_missing",
+            errorCode=ENTERPRISE_SKILL_POLICY_DENIED,
+        )
+        return base
+
+    base.update(status="unlisted", reason="ordinary_skill_not_listed")
+    return base
+
+
+def skill_policy_error_payload(decision: Mapping[str, Any]) -> dict[str, Any]:
+    """Build a stable, path-free tool error for a denied Skill read."""
+    policy_key = _display_skill_policy_key(decision.get("policyKey"))
+    status = _safe_error_token(decision.get("status"), "blocked")
+    return {
+        "success": False,
+        "error": f"Enterprise managed policy denied skill '{policy_key}' ({status}).",
+        "errorCode": ENTERPRISE_SKILL_POLICY_DENIED,
+        "policyKey": policy_key,
+        "status": status,
+        "policyHash": _safe_error_token(decision.get("policyHash")),
+        "provenance": _safe_error_token(decision.get("provenance"), "unknown"),
+    }
+
+
+def require_skill_runtime_allowed(identity: str | Mapping[str, Any]) -> dict[str, Any]:
+    """Raise a structured runtime denial without requiring ``skills.manage``."""
+    decision = skill_runtime_decision(identity)
+    if not decision["allowed"]:
+        raise EnterpriseSkillPolicyDenied(decision)
+    return decision
 
 
 def is_toolset_allowed(name: str, policy: Optional[Mapping[str, Any]] = None) -> bool:

@@ -1429,6 +1429,21 @@ class TestPluginCommands:
         assert len(mgr._plugin_commands) == 0
         assert "empty name" in caplog.text
 
+    @pytest.mark.parametrize("handler", [None, 0, "not-callable", object()])
+    def test_register_command_non_callable_handler_rejected(
+        self, handler, caplog
+    ):
+        """Corrupt command handlers never enter the shared plugin registry."""
+        mgr = PluginManager()
+        manifest = PluginManifest(name="test-plugin", source="user")
+        ctx = PluginContext(manifest, mgr)
+
+        with caplog.at_level(logging.WARNING, logger="hermes_cli.plugins"):
+            ctx.register_command("broken", handler)
+
+        assert "broken" not in mgr._plugin_commands
+        assert "non-callable" in caplog.text
+
     def test_register_command_builtin_conflict_rejected(self, caplog):
         """Commands that conflict with built-in names are rejected."""
         mgr = PluginManager()

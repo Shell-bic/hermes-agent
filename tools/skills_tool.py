@@ -492,6 +492,28 @@ def _parse_frontmatter(content: str) -> Tuple[Dict[str, Any], str]:
     return parse_frontmatter(content)
 
 
+def _read_frontmatter_only(
+    skill_md: Path,
+    *,
+    max_bytes: int = 16 * 1024,
+    max_lines: int = 256,
+) -> Dict[str, Any]:
+    """Read only a bounded YAML frontmatter block from ``SKILL.md``.
+
+    Runtime policy needs the canonical ``name`` before it may authorize a body
+    read. This reader stops at the closing delimiter and refuses oversized or
+    unterminated metadata, so a denied Skill body is never pulled into memory as
+    a side effect of identity resolution.
+    """
+    from agent.skill_utils import read_skill_frontmatter
+
+    return read_skill_frontmatter(
+        skill_md,
+        max_bytes=max_bytes,
+        max_lines=max_lines,
+    )
+
+
 def _get_category_from_path(skill_path: Path) -> Optional[str]:
     """
     Extract category from skill path based on directory structure.
@@ -632,8 +654,7 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
             skill_dir = skill_md.parent
 
             try:
-                content = skill_md.read_text(encoding="utf-8")[:4000]
-                frontmatter, body = _parse_frontmatter(content)
+                frontmatter = _read_frontmatter_only(skill_md)
 
                 if not skill_matches_platform(frontmatter):
                     continue
@@ -647,8 +668,21 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
                 if name in disabled:
                     continue
 
+                from hermes_cli.enterprise_policy import (
+                    skill_runtime_decision,
+                    skill_runtime_identity,
+                )
+
+                decision = skill_runtime_decision(
+                    skill_runtime_identity(name, skill_path=skill_md)
+                )
+                if not decision["allowed"]:
+                    continue
+
                 description = frontmatter.get("description", "")
                 if not description:
+                    content = skill_md.read_text(encoding="utf-8")[:4000]
+                    _, body = _parse_frontmatter(content)
                     for line in body.strip().split("\n"):
                         line = line.strip()
                         if line and not line.startswith("#"):
@@ -764,6 +798,18 @@ def _serve_plugin_skill(
     session_id: str | None = None,
 ) -> str:
     """Read a plugin-provided skill, apply guards, return JSON."""
+    from hermes_cli.enterprise_policy import (
+        skill_policy_error_payload,
+        skill_runtime_decision,
+        skill_runtime_identity,
+    )
+
+    decision = skill_runtime_decision(
+        skill_runtime_identity(f"{namespace}:{bare}", provenance="plugin")
+    )
+    if not decision["allowed"]:
+        return json.dumps(skill_policy_error_payload(decision), ensure_ascii=False)
+
     from hermes_cli.plugins import _get_disabled_plugins, get_plugin_manager
 
     if namespace in _get_disabled_plugins():
@@ -859,6 +905,147 @@ def _serve_plugin_skill(
     )
 
 
+def _find_local_skill_candidates(
+    name: str,
+    local_category_name: str | None = None,
+) -> tuple[list[Path], List[Tuple[Optional[Path], Path]]]:
+    """Resolve local/external candidates using metadata-only reads."""
+    from agent.skill_utils import get_external_skills_dirs, iter_skill_index_files
+
+    all_dirs: list[Path] = []
+    if SKILLS_DIR.exists():
+        all_dirs.append(SKILLS_DIR)
+    all_dirs.extend(get_external_skills_dirs())
+
+    candidates: List[Tuple[Optional[Path], Path]] = []
+    seen_md: set[Path] = set()
+
+    def _record(skill_dir: Optional[Path], skill_md: Path) -> None:
+        try:
+            key = skill_md.resolve()
+        except Exception:
+            key = skill_md
+        if key in seen_md:
+            return
+        seen_md.add(key)
+        candidates.append((skill_dir, skill_md))
+
+    for search_dir in all_dirs:
+        direct_path = search_dir / name
+        if (
+            not _is_skill_support_path(direct_path)
+            and direct_path.is_dir()
+            and (direct_path / "SKILL.md").exists()
+        ):
+            _record(direct_path, direct_path / "SKILL.md")
+        elif direct_path.with_suffix(".md").exists() and not _is_skill_support_path(
+            direct_path.with_suffix(".md")
+        ):
+            _record(None, direct_path.with_suffix(".md"))
+
+        if local_category_name:
+            categorized_path = search_dir / local_category_name
+            if (
+                not _is_skill_support_path(categorized_path)
+                and categorized_path.is_dir()
+                and (categorized_path / "SKILL.md").exists()
+            ):
+                _record(categorized_path, categorized_path / "SKILL.md")
+            elif categorized_path.with_suffix(".md").exists() and not _is_skill_support_path(
+                categorized_path.with_suffix(".md")
+            ):
+                _record(None, categorized_path.with_suffix(".md"))
+
+        for found_skill_md in iter_skill_index_files(search_dir, "SKILL.md"):
+            if found_skill_md.parent.name == name:
+                _record(found_skill_md.parent, found_skill_md)
+                continue
+            if _read_frontmatter_only(found_skill_md).get("name") == name:
+                _record(found_skill_md.parent, found_skill_md)
+
+        for found_md in search_dir.rglob(f"{name}.md"):
+            if found_md.name != "SKILL.md" and not _is_skill_support_path(found_md):
+                _record(None, found_md)
+
+    return all_dirs, candidates
+
+
+def skill_runtime_preflight(name: str) -> str:
+    """Authorize a Skill using metadata only, before any runtime side effect."""
+    lookup_error = _skill_lookup_path_error(name)
+    if lookup_error:
+        return json.dumps({"success": False, "error": lookup_error}, ensure_ascii=False)
+
+    local_category_name: str | None = None
+    if ":" in name:
+        from agent.skill_utils import is_valid_namespace, parse_qualified_name
+        from hermes_cli.plugins import discover_plugins, get_plugin_manager
+
+        namespace, bare = parse_qualified_name(name)
+        if not is_valid_namespace(namespace):
+            return json.dumps(
+                {"success": False, "error": f"Invalid namespace '{namespace}' in '{name}'."},
+                ensure_ascii=False,
+            )
+        discover_plugins()
+        plugin_skill_md = get_plugin_manager().find_plugin_skill(name)
+        if plugin_skill_md is not None:
+            from hermes_cli.enterprise_policy import (
+                skill_policy_error_payload,
+                skill_runtime_decision,
+                skill_runtime_identity,
+            )
+
+            decision = skill_runtime_decision(
+                skill_runtime_identity(f"{namespace}:{bare}", provenance="plugin")
+            )
+            if not decision["allowed"]:
+                return json.dumps(skill_policy_error_payload(decision), ensure_ascii=False)
+            if not plugin_skill_md.exists():
+                return json.dumps(
+                    {"success": False, "error": f"Skill '{name}' is unavailable."},
+                    ensure_ascii=False,
+                )
+            return json.dumps(
+                {"success": True, "name": f"{namespace}:{bare}", "decision": decision},
+                ensure_ascii=False,
+            )
+        if bare:
+            local_category_name = f"{namespace}/{bare}"
+
+    all_dirs, candidates = _find_local_skill_candidates(name, local_category_name)
+    if not all_dirs:
+        return json.dumps({"success": False, "error": "Skills directory does not exist."})
+    if len(candidates) != 1:
+        error = (
+            f"Skill '{name}' not found."
+            if not candidates
+            else f"Ambiguous skill name '{name}': {len(candidates)} skills match."
+        )
+        return json.dumps({"success": False, "error": error}, ensure_ascii=False)
+
+    skill_dir, skill_md = candidates[0]
+    frontmatter = _read_frontmatter_only(skill_md)
+    canonical_name = str(
+        frontmatter.get("name", skill_md.stem if not skill_dir else skill_dir.name)
+    )
+    from hermes_cli.enterprise_policy import (
+        skill_policy_error_payload,
+        skill_runtime_decision,
+        skill_runtime_identity,
+    )
+
+    decision = skill_runtime_decision(
+        skill_runtime_identity(canonical_name, skill_path=skill_md)
+    )
+    if not decision["allowed"]:
+        return json.dumps(skill_policy_error_payload(decision), ensure_ascii=False)
+    return json.dumps(
+        {"success": True, "name": canonical_name, "decision": decision},
+        ensure_ascii=False,
+    )
+
+
 def skill_view(
     name: str,
     file_path: str = None,
@@ -922,6 +1109,20 @@ def skill_view(
             plugin_skill_md = pm.find_plugin_skill(name)
 
             if plugin_skill_md is not None:
+                from hermes_cli.enterprise_policy import (
+                    skill_policy_error_payload,
+                    skill_runtime_decision,
+                    skill_runtime_identity,
+                )
+
+                decision = skill_runtime_decision(
+                    skill_runtime_identity(f"{namespace}:{bare}", provenance="plugin")
+                )
+                if not decision["allowed"]:
+                    return json.dumps(
+                        skill_policy_error_payload(decision),
+                        ensure_ascii=False,
+                    )
                 if not plugin_skill_md.exists():
                     # Stale registry entry — file deleted out of band
                     pm.remove_plugin_skill(name)
@@ -929,10 +1130,8 @@ def skill_view(
                         {
                             "success": False,
                             "error": (
-                                f"Skill '{name}' file no longer exists at "
-                                f"{plugin_skill_md}. The registry entry has "
-                                f"been cleaned up — try again after the "
-                                f"plugin is reloaded."
+                                f"Skill '{name}' is unavailable. Its stale registry "
+                                "entry was cleaned up; reload the plugin and try again."
                             ),
                         },
                         ensure_ascii=False,
@@ -964,8 +1163,6 @@ def skill_view(
             if bare:
                 local_category_name = f"{namespace}/{bare}"
 
-        from agent.skill_utils import get_external_skills_dirs
-
         # The categorized fall-through form (namespace/bare) joins onto each
         # search dir too; re-validate it since `bare` is not namespace-checked.
         if local_category_name:
@@ -980,11 +1177,8 @@ def skill_view(
                     ensure_ascii=False,
                 )
 
-        # Build list of all skill directories to search
-        all_dirs = []
-        if SKILLS_DIR.exists():
-            all_dirs.append(SKILLS_DIR)
-        all_dirs.extend(get_external_skills_dirs())
+        # Build list of all skill directories and metadata-only candidates.
+        all_dirs, candidates = _find_local_skill_candidates(name, local_category_name)
 
         if not all_dirs:
             return json.dumps(
@@ -998,89 +1192,8 @@ def skill_view(
         skill_dir = None
         skill_md = None
 
-        # Collision detection: collect ALL candidates across every dir using
-        # every lookup strategy (direct path, recursive by parent dir name,
-        # legacy flat <name>.md). If more than one matches, refuse and tell
-        # the caller — silent shadowing of a local skill by a same-named
-        # external skill is a real bug class (`/skills` shows one, agent
-        # loaded the other) so we surface it loudly instead of guessing.
-        from agent.skill_utils import iter_skill_index_files
-
-        candidates: List[Tuple[Optional[Path], Path]] = []  # (skill_dir, skill_md)
-        seen_md: set = set()
-
-        def _record(sd: Optional[Path], smd: Path) -> None:
-            try:
-                key = smd.resolve()
-            except Exception:
-                key = smd
-            if key in seen_md:
-                return
-            seen_md.add(key)
-            candidates.append((sd, smd))
-
-        for search_dir in all_dirs:
-            # Strategy 1: direct path (e.g., "mlops/axolotl" or bare "axolotl"
-            # at the top of the dir).
-            direct_path = search_dir / name
-            if (
-                not _is_skill_support_path(direct_path)
-                and direct_path.is_dir()
-                and (direct_path / "SKILL.md").exists()
-            ):
-                _record(direct_path, direct_path / "SKILL.md")
-            elif direct_path.with_suffix(".md").exists() and not _is_skill_support_path(
-                direct_path.with_suffix(".md")
-            ):
-                _record(None, direct_path.with_suffix(".md"))
-
-            # Strategy 1b: categorized form for plugin namespace fall-through
-            # (e.g., a "myplugin:explore" name with no plugin registered also
-            # tries the on-disk path "myplugin/explore").
-            if local_category_name:
-                categorized_path = search_dir / local_category_name
-                if (
-                    not _is_skill_support_path(categorized_path)
-                    and categorized_path.is_dir()
-                    and (categorized_path / "SKILL.md").exists()
-                ):
-                    _record(categorized_path, categorized_path / "SKILL.md")
-                elif categorized_path.with_suffix(
-                    ".md"
-                ).exists() and not _is_skill_support_path(
-                    categorized_path.with_suffix(".md")
-                ):
-                    _record(None, categorized_path.with_suffix(".md"))
-
-            # Strategy 2: recursive by directory name (catches nested skills
-            # like "foundations/runtime/explore-codebase" called by bare name),
-            # plus frontmatter `name:` lookup. `skills_list()` exposes the
-            # frontmatter name, so `skill_view(name)` must accept it too even
-            # when the on-disk directory is a shorter category/alias.
-            for found_skill_md in iter_skill_index_files(search_dir, "SKILL.md"):
-                if found_skill_md.parent.name == name:
-                    _record(found_skill_md.parent, found_skill_md)
-                    continue
-                try:
-                    fm_content = found_skill_md.read_text(encoding="utf-8")
-                    fm, _ = _parse_frontmatter(fm_content)
-                except Exception:
-                    fm = {}
-                if fm.get("name") == name:
-                    _record(found_skill_md.parent, found_skill_md)
-
-            # Strategy 3: legacy flat <name>.md files anywhere under the dir.
-            # Exclude skill support docs: references/templates/assets/scripts
-            # are loaded through skill_view(skill, file_path=...) and must not
-            # shadow or collide with real skills that share the same basename.
-            for found_md in search_dir.rglob(f"{name}.md"):
-                if found_md.name != "SKILL.md" and not _is_skill_support_path(
-                    found_md
-                ):
-                    _record(None, found_md)
-
         if len(candidates) > 1:
-            paths = [str(smd) for _, smd in candidates]
+            paths = [smd.as_posix() for _, smd in candidates]
             logging.getLogger(__name__).warning(
                 "Skill name collision for '%s': %d candidates — %s",
                 name, len(candidates), "; ".join(paths),
@@ -1117,6 +1230,28 @@ def skill_view(
                 },
                 ensure_ascii=False,
             )
+
+        # Resolve the canonical frontmatter name using only a bounded metadata
+        # prefix, then enforce enterprise policy before reading the Skill body,
+        # linked files, templates, environment requirements, or credentials.
+        policy_frontmatter = _read_frontmatter_only(skill_md)
+        resolved_policy_name = str(
+            policy_frontmatter.get(
+                "name",
+                skill_md.stem if not skill_dir else skill_dir.name,
+            )
+        )
+        from hermes_cli.enterprise_policy import (
+            skill_policy_error_payload,
+            skill_runtime_decision,
+            skill_runtime_identity,
+        )
+
+        decision = skill_runtime_decision(
+            skill_runtime_identity(resolved_policy_name, skill_path=skill_md)
+        )
+        if not decision["allowed"]:
+            return json.dumps(skill_policy_error_payload(decision), ensure_ascii=False)
 
         # Read the file once — reused for platform check and main content below
         try:
@@ -1303,7 +1438,8 @@ def skill_view(
             references_dir = skill_dir / "references"
             if references_dir.exists():
                 reference_files = [
-                    str(f.relative_to(skill_dir)) for f in references_dir.glob("*.md")
+                    f.relative_to(skill_dir).as_posix()
+                    for f in references_dir.glob("*.md")
                 ]
 
             templates_dir = skill_dir / "templates"
@@ -1319,7 +1455,7 @@ def skill_view(
                 ]:
                     template_files.extend(
                         [
-                            str(f.relative_to(skill_dir))
+                            f.relative_to(skill_dir).as_posix()
                             for f in templates_dir.rglob(ext)
                         ]
                     )
@@ -1329,13 +1465,13 @@ def skill_view(
             if assets_dir.exists():
                 for f in assets_dir.rglob("*"):
                     if f.is_file():
-                        asset_files.append(str(f.relative_to(skill_dir)))
+                        asset_files.append(f.relative_to(skill_dir).as_posix())
 
             scripts_dir = skill_dir / "scripts"
             if scripts_dir.exists():
                 for ext in ["*.py", "*.sh", "*.bash", "*.js", "*.ts", "*.rb"]:
                     script_files.extend(
-                        [str(f.relative_to(skill_dir)) for f in scripts_dir.glob(ext)]
+                        [f.relative_to(skill_dir).as_posix() for f in scripts_dir.glob(ext)]
                     )
 
         # Read tags/related_skills with backward compat:
@@ -1362,10 +1498,14 @@ def skill_view(
             linked_files["scripts"] = script_files
 
         try:
-            rel_path = str(skill_md.relative_to(SKILLS_DIR))
+            rel_path = skill_md.relative_to(SKILLS_DIR).as_posix()
         except ValueError:
             # External skill — use path relative to the skill's own parent dir
-            rel_path = str(skill_md.relative_to(skill_md.parent.parent)) if skill_md.parent.parent else skill_md.name
+            rel_path = (
+                skill_md.relative_to(skill_md.parent.parent).as_posix()
+                if skill_md.parent.parent
+                else skill_md.name
+            )
         skill_name = frontmatter.get(
             "name", skill_md.stem if not skill_dir else skill_dir.name
         )

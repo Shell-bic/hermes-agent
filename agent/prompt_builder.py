@@ -23,6 +23,7 @@ from agent.skill_utils import (
     get_disabled_skill_names,
     iter_skill_index_files,
     parse_frontmatter,
+    read_skill_frontmatter,
     skill_matches_environment,
     skill_matches_platform,
 )
@@ -1040,7 +1041,7 @@ def drain_truncation_warnings() -> list:
 _SKILLS_PROMPT_CACHE_MAX = 8
 _SKILLS_PROMPT_CACHE: OrderedDict[tuple, str] = OrderedDict()
 _SKILLS_PROMPT_CACHE_LOCK = threading.Lock()
-_SKILLS_SNAPSHOT_VERSION = 1
+_SKILLS_SNAPSHOT_VERSION = 2
 
 
 def _skills_prompt_snapshot_path() -> Path:
@@ -1129,6 +1130,7 @@ def _build_snapshot_entry(
         platforms = [platforms]
 
     return {
+        "relative_path": str(rel_path),
         "skill_name": skill_name,
         "category": category,
         "frontmatter_name": str(frontmatter.get("name", skill_name)),
@@ -1149,8 +1151,26 @@ def _parse_skill_file(skill_file: Path) -> tuple[bool, dict, str]:
     (True, {}, "") to err on the side of showing the skill.
     """
     try:
-        raw = skill_file.read_text(encoding="utf-8")
-        frontmatter, _ = parse_frontmatter(raw)
+        frontmatter = read_skill_frontmatter(skill_file)
+
+        from hermes_cli.enterprise_policy import (
+            skill_runtime_decision,
+            skill_runtime_identity,
+        )
+
+        canonical_name = str(frontmatter.get("name") or skill_file.parent.name)
+        if not skill_runtime_decision(
+            skill_runtime_identity(canonical_name, skill_path=skill_file)
+        )["allowed"]:
+            # The disk snapshot is policy-neutral metadata. Keep the bounded
+            # description even while current rendering filters this Skill out,
+            # so a later policy-only allow does not reuse an empty entry.
+            return False, frontmatter, extract_skill_description(frontmatter)
+
+        # Preserve the historical parse/read failure behavior for an allowed
+        # Skill, but only after the metadata-only runtime guard has passed.
+        content = skill_file.read_text(encoding="utf-8")
+        frontmatter, _ = parse_frontmatter(content)
 
         if not skill_matches_platform(frontmatter):
             return False, frontmatter, ""
@@ -1220,9 +1240,8 @@ def build_skills_system_prompt(
 
     ``compact_categories`` (e.g. from the coding posture — see
     agent/coding_context.py) demotes whole categories to a names-only line in
-    the rendered index. Nothing is ever hidden: every skill name stays
-    visible and loadable via ``skill_view`` / ``skills_list``; only the
-    descriptions are dropped, and a footer note explains the demotion.
+    the rendered index. Enterprise policy-denied Skills are omitted entirely;
+    posture demotion only drops descriptions and retains names.
     """
     skills_dir = get_skills_dir()
     external_dirs = get_all_skills_dirs()[1:]  # skip local (index 0)
@@ -1240,6 +1259,9 @@ def build_skills_system_prompt(
         or ""
     )
     disabled = get_disabled_skill_names(_platform_hint or None)
+    from hermes_cli.enterprise_policy import enterprise_policy_fingerprint
+
+    policy_fingerprint = enterprise_policy_fingerprint()
     cache_key = (
         str(skills_dir.resolve()),
         tuple(str(d) for d in external_dirs),
@@ -1248,6 +1270,7 @@ def build_skills_system_prompt(
         _platform_hint,
         tuple(sorted(disabled)),
         tuple(sorted(compact_categories or ())),
+        policy_fingerprint,
     )
     with _SKILLS_PROMPT_CACHE_LOCK:
         cached = _SKILLS_PROMPT_CACHE.get(cache_key)
@@ -1269,10 +1292,23 @@ def build_skills_system_prompt(
             skill_name = entry.get("skill_name") or ""
             category = entry.get("category") or "general"
             frontmatter_name = entry.get("frontmatter_name") or skill_name
+            relative_path = entry.get("relative_path") or ""
             platforms = entry.get("platforms") or []
             if not skill_matches_platform({"platforms": platforms}):
                 continue
             if frontmatter_name in disabled or skill_name in disabled:
+                continue
+            from hermes_cli.enterprise_policy import (
+                skill_runtime_decision,
+                skill_runtime_identity,
+            )
+
+            if not skill_runtime_decision(
+                skill_runtime_identity(
+                    frontmatter_name,
+                    skill_path=skills_dir / relative_path,
+                )
+            )["allowed"]:
                 continue
             if not _skill_should_show(
                 entry.get("conditions") or {},

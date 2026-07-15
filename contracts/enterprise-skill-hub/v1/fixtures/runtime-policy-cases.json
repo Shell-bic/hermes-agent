@@ -1,0 +1,48 @@
+{
+  "errorCode": "enterprise_skill_policy_denied",
+  "cases": [
+    {
+      "name": "listed enterprise available without manage capability",
+      "identity": {"policyKey": "expense-review", "provenance": "enterprise"},
+      "status": "available",
+      "expectedAllowed": true
+    },
+    {
+      "name": "listed enterprise blocked",
+      "identity": {"policyKey": "blocked-enterprise", "provenance": "enterprise"},
+      "status": "blocked",
+      "expectedAllowed": false
+    },
+    {
+      "name": "unlisted enterprise fails closed",
+      "identity": {"policyKey": "unlisted-enterprise", "provenance": "enterprise"},
+      "expectedAllowed": false
+    },
+    {
+      "name": "damaged enterprise provenance fails closed",
+      "identity": {"policyKey": "damaged-enterprise", "provenance": "enterprise-invalid"},
+      "expectedAllowed": false
+    },
+    {
+      "name": "unlisted ordinary local stays compatible",
+      "identity": {"policyKey": "local-helper", "provenance": "local"},
+      "expectedAllowed": true
+    },
+    {
+      "name": "unlisted external stays compatible",
+      "identity": {"policyKey": "external-helper", "provenance": "external"},
+      "expectedAllowed": true
+    },
+    {
+      "name": "unlisted qualified plugin stays compatible",
+      "identity": {"policyKey": "acme:helper", "provenance": "plugin"},
+      "expectedAllowed": true
+    },
+    {
+      "name": "listed qualified plugin blocked",
+      "identity": {"policyKey": "acme:blocked", "provenance": "plugin"},
+      "status": "restricted",
+      "expectedAllowed": false
+    }
+  ]
+}
