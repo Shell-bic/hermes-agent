@@ -5,6 +5,7 @@ import type {
   EnterpriseDesktopState,
   EnterpriseLoginMethod,
   EnterpriseLoginState,
+  EnterpriseMessagingChannelPolicyDecision,
   EnterpriseUiPolicy,
   EnterpriseWeComBounds
 } from '@/global'
@@ -30,6 +31,28 @@ import {
   setWorkingSessionIds
 } from '@/store/session'
 
+const MANAGED_MESSAGING_CHANNELS_FAIL_CLOSED: EnterpriseMessagingChannelPolicyDecision = {
+  allowedChannelIds: [],
+  hideUnlisted: true,
+  mode: 'managed',
+  policy: null,
+  reason: 'policy_missing',
+  status: 'fail-closed',
+  userManageableChannelIds: [],
+  visibleChannelIds: []
+}
+
+const UNMANAGED_MESSAGING_CHANNELS_FULL_CATALOG: EnterpriseMessagingChannelPolicyDecision = {
+  allowedChannelIds: null,
+  hideUnlisted: false,
+  mode: 'unmanaged',
+  policy: null,
+  reason: null,
+  status: 'full-catalog',
+  userManageableChannelIds: null,
+  visibleChannelIds: null
+}
+
 export const INITIAL_ENTERPRISE_STATE: EnterpriseDesktopState = {
   allowedModels: [],
   authenticated: false,
@@ -42,6 +65,7 @@ export const INITIAL_ENTERPRISE_STATE: EnterpriseDesktopState = {
   enabled: false,
   generatedAt: null,
   lockedSurfaces: [],
+  messagingChannelPolicy: UNMANAGED_MESSAGING_CHANNELS_FULL_CATALOG,
   modelRuntimeHash: null,
   modelProfiles: [],
   policyHash: null,
@@ -137,12 +161,21 @@ function applyEnterpriseState(state: EnterpriseDesktopState | null | undefined):
     status: 'disabled' as const
   }
 
-  const next = base.enabled && !base.uiPolicy
-    ? {
+  const withMessagingPolicy = base.messagingChannelPolicy
+    ? base
+    : {
         ...base,
+        messagingChannelPolicy: base.enabled
+          ? MANAGED_MESSAGING_CHANNELS_FAIL_CLOSED
+          : UNMANAGED_MESSAGING_CHANNELS_FULL_CATALOG
+      }
+
+  const next = withMessagingPolicy.enabled && !withMessagingPolicy.uiPolicy
+    ? {
+        ...withMessagingPolicy,
         uiPolicy: ENTERPRISE_UI_POLICY_DEFAULT
       }
-    : base
+    : withMessagingPolicy
 
   $enterprise.set(next)
 

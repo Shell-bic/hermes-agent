@@ -2,6 +2,8 @@ const test = require('node:test')
 const assert = require('node:assert/strict')
 
 const {
+  DESKTOP_CAPABILITIES_HEADER,
+  DESKTOP_CLIENT_CAPABILITIES,
   EnterpriseGatewayError,
   createEnterpriseGatewayClient,
   normalizeEnterpriseGatewayBaseUrl,
@@ -106,6 +108,28 @@ test('Gateway ProblemDetails preserves stable code detail and HTTP status', asyn
       return true
     }
   )
+})
+
+test('bootstrap and runtime manifest send the trusted main-process capability handshake', async () => {
+  const calls = []
+  const client = createEnterpriseGatewayClient({
+    baseUrl: 'https://gateway.example.com',
+    fetchImpl: async (url, options) => {
+      calls.push({ options, url })
+      return jsonResponse({ ok: true })
+    }
+  })
+
+  await client.bootstrap('dsk_fixture')
+  await client.runtimeManifest('dsk_fixture', { preferredModel: null })
+  await client.me('dsk_fixture')
+
+  assert.equal(DESKTOP_CAPABILITIES_HEADER, 'X-Hermes-Desktop-Capabilities')
+  assert.deepEqual(DESKTOP_CLIENT_CAPABILITIES, ['messaging-channel-policy.v1'])
+  assert.equal(calls[0].options.headers[DESKTOP_CAPABILITIES_HEADER], 'messaging-channel-policy.v1')
+  assert.equal(calls[1].options.headers[DESKTOP_CAPABILITIES_HEADER], 'messaging-channel-policy.v1')
+  assert.equal(calls[2].options.headers[DESKTOP_CAPABILITIES_HEADER], undefined)
+  assert.equal(calls[0].options.headers.Authorization, 'Bearer dsk_fixture')
 })
 
 test('Gateway request timeout aborts and returns a stable non-enumerating code', async () => {

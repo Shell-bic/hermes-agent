@@ -1,0 +1,4 @@
+{
+  "contractVersion": "wecom-bot-transaction.v1",
+  "clientCapabilities": ["some-other-capability.v1"]
+}

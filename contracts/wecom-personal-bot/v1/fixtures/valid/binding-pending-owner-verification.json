@@ -1,0 +1,13 @@
+{
+  "contractVersion": "wecom-bot-binding.v1",
+  "bindingId": "22222222-2222-4222-8222-222222222222",
+  "botId": "bot-fixture-pending",
+  "displayName": "Personal Bot Fixture",
+  "status": "pending-owner-verification",
+  "connectionStatus": "offline",
+  "ownerVerificationRequired": true,
+  "createdAt": "2026-07-15T09:00:00Z",
+  "updatedAt": "2026-07-15T09:00:00Z",
+  "lastConnectedAt": null,
+  "errorCode": null
+}

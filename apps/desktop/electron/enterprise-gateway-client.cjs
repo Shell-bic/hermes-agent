@@ -33,6 +33,9 @@ function normalizeEnterpriseGatewayBaseUrl(rawUrl) {
   return parsed.toString().replace(/\/+$/, '')
 }
 
+const DESKTOP_CAPABILITIES_HEADER = 'X-Hermes-Desktop-Capabilities'
+const DESKTOP_CLIENT_CAPABILITIES = Object.freeze(['messaging-channel-policy.v1'])
+
 function pickDesktopToken(payload) {
   if (!payload || typeof payload !== 'object') {
     return ''
@@ -97,7 +100,7 @@ class EnterpriseGatewayClient {
     this.timeoutMs = Math.max(100, Number(timeoutMs) || 10000)
   }
 
-  async requestJson(path, { method = 'GET', body, signal, token } = {}) {
+  async requestJson(path, { method = 'GET', body, includeDesktopCapabilities = false, signal, token } = {}) {
     if (typeof this.fetchImpl !== 'function') {
       throw new Error('Enterprise gateway client requires fetch.')
     }
@@ -111,6 +114,9 @@ class EnterpriseGatewayClient {
 
     if (token) {
       headers.Authorization = `Bearer ${token}`
+    }
+    if (includeDesktopCapabilities) {
+      headers[DESKTOP_CAPABILITIES_HEADER] = DESKTOP_CLIENT_CAPABILITIES.join(',')
     }
 
     const abortController = new AbortController()
@@ -270,7 +276,7 @@ class EnterpriseGatewayClient {
   }
 
   bootstrap(token) {
-    return this.requestJson('/api/desktop/bootstrap', { token })
+    return this.requestJson('/api/desktop/bootstrap', { includeDesktopCapabilities: true, token })
   }
 
   modelProfiles(token) {
@@ -281,6 +287,7 @@ class EnterpriseGatewayClient {
     return this.requestJson('/api/desktop/runtime/manifests', {
       method: 'POST',
       body,
+      includeDesktopCapabilities: true,
       token
     })
   }
@@ -317,6 +324,8 @@ function createEnterpriseGatewayClient(options) {
 }
 
 module.exports = {
+  DESKTOP_CAPABILITIES_HEADER,
+  DESKTOP_CLIENT_CAPABILITIES,
   ENTERPRISE_LOGIN_METHODS,
   EnterpriseGatewayError,
   EnterpriseGatewayClient,

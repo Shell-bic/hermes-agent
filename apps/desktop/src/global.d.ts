@@ -559,6 +559,69 @@ export interface EnterpriseToolPolicySnapshot {
   tools: EnterpriseToolPolicyItem[]
 }
 
+export interface EnterpriseMessagingChannelPolicy {
+  allowedChannelIds: string[]
+  contractVersion: 'messaging-channel-policy.v1'
+  hideUnlisted: boolean
+  policyHash: string
+  requiredClientCapabilities: string[]
+  userManageableChannelIds: string[]
+  visibleChannelIds: string[]
+}
+
+export type EnterpriseMessagingChannelPolicyStatus = 'applied' | 'fail-closed' | 'full-catalog'
+
+export interface EnterpriseMessagingChannelPolicyDecision {
+  allowedChannelIds: null | string[]
+  hideUnlisted: boolean
+  mode: 'managed' | 'unmanaged'
+  policy: EnterpriseMessagingChannelPolicy | null
+  reason: null | string
+  status: EnterpriseMessagingChannelPolicyStatus
+  userManageableChannelIds: null | string[]
+  visibleChannelIds: null | string[]
+}
+
+export type EnterpriseWeComBotBindingStatus =
+  | 'connected'
+  | 'connecting'
+  | 'disconnected'
+  | 'pending-owner-verification'
+  | 'revoked'
+  | 'suspended'
+
+export type EnterpriseWeComBotConnectionStatus = 'connecting' | 'error' | 'offline' | 'online'
+
+export interface EnterpriseWeComBotBinding {
+  bindingId: string
+  botId: string
+  connectionStatus: EnterpriseWeComBotConnectionStatus
+  contractVersion: 'wecom-bot-binding.v1'
+  createdAt: string
+  displayName: null | string
+  errorCode: null | string
+  lastConnectedAt: null | string
+  ownerVerificationRequired: boolean
+  status: EnterpriseWeComBotBindingStatus
+  updatedAt: string
+}
+
+export type EnterpriseWeComPersonalBotUiState =
+  | 'auth-pending'
+  | 'auth-preparing'
+  | 'binding-created'
+  | 'connected'
+  | 'connecting'
+  | 'disconnected'
+  | 'gateway-offline'
+  | 'not-bound'
+  | 'owner-mismatch'
+  | 'owner-verification'
+  | 'permission-denied'
+  | 'qr-expired'
+  | 'revoked'
+  | 'source-invalid'
+
 export interface EnterpriseDesktopState {
   allowedModels: string[]
   authenticated: boolean
@@ -572,6 +635,7 @@ export interface EnterpriseDesktopState {
   error?: string | null
   generatedAt: null | string
   lockedSurfaces: string[]
+  messagingChannelPolicy?: EnterpriseMessagingChannelPolicyDecision
   modelRuntimeHash?: null | string
   modelProfiles: EnterpriseModelProfileSummary[]
   policyHash: null | string

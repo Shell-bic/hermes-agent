@@ -1,0 +1,13 @@
+{
+  "contractVersion": "wecom-bot-binding.v1",
+  "bindingId": "33333333-3333-4333-8333-333333333333",
+  "botId": "bot-fixture-connected",
+  "displayName": "Connected Bot Fixture",
+  "status": "connected",
+  "connectionStatus": "online",
+  "ownerVerificationRequired": false,
+  "createdAt": "2026-07-15T09:00:00Z",
+  "updatedAt": "2026-07-15T09:02:00Z",
+  "lastConnectedAt": "2026-07-15T09:02:00Z",
+  "errorCode": null
+}

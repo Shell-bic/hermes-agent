@@ -1,0 +1,13 @@
+{
+  "contractVersion": "wecom-bot-binding.v1",
+  "bindingId": "00000000-0000-0000-0000-000000000000",
+  "botId": "bot-fixture-invalid",
+  "displayName": "Invalid Empty Guid",
+  "status": "pending-owner-verification",
+  "connectionStatus": "offline",
+  "ownerVerificationRequired": true,
+  "createdAt": "2026-07-15T09:00:00Z",
+  "updatedAt": "2026-07-15T09:00:00Z",
+  "lastConnectedAt": null,
+  "errorCode": null
+}

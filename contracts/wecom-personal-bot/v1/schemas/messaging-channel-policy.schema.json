@@ -1,0 +1,49 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://contracts.example.invalid/wecom-personal-bot/v1/messaging-channel-policy.schema.json",
+  "title": "Messaging channel policy v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "contractVersion",
+    "hideUnlisted",
+    "visibleChannelIds",
+    "userManageableChannelIds",
+    "allowedChannelIds",
+    "policyHash",
+    "requiredClientCapabilities"
+  ],
+  "properties": {
+    "contractVersion": { "const": "messaging-channel-policy.v1" },
+    "hideUnlisted": { "type": "boolean" },
+    "visibleChannelIds": { "$ref": "#/$defs/channelIds" },
+    "userManageableChannelIds": { "$ref": "#/$defs/channelIds" },
+    "allowedChannelIds": { "$ref": "#/$defs/channelIds" },
+    "policyHash": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "requiredClientCapabilities": {
+      "type": "array",
+      "maxItems": 32,
+      "uniqueItems": true,
+      "contains": { "const": "messaging-channel-policy.v1" },
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 128,
+        "pattern": "^[a-z0-9][a-z0-9._-]*$"
+      }
+    }
+  },
+  "$defs": {
+    "channelIds": {
+      "type": "array",
+      "maxItems": 64,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 64,
+        "pattern": "^[a-z0-9][a-z0-9._-]*$"
+      }
+    }
+  }
+}

@@ -3,6 +3,8 @@ const assert = require('node:assert/strict')
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
+const managedPolicy = require('../../../contracts/wecom-personal-bot/v1/fixtures/valid/managed-runtime-manifest.json').messagingChannelPolicy
+const { computeMessagingChannelPolicyHash } = require('./messaging-channel-policy.cjs')
 
 const {
   GATEWAY_TOKEN_ENV,
@@ -21,6 +23,7 @@ function manifest(overrides = {}) {
     gatewayApiBaseUrl: 'https://gateway.example.com',
     gatewayToken: 'gateway-secret',
     lockedSurfaces: ['providers', 'env'],
+    messagingChannelPolicy: managedPolicy,
     manifestId: 'mf-1',
     generatedAt: '2026-07-06T12:00:00Z',
     policyHash: 'policy-hash-1',
@@ -75,7 +78,7 @@ function manifest(overrides = {}) {
 test('managed runtime home writes company-gateway config and token env only in private outputs', () => {
   const hermesHome = fs.mkdtempSync(path.join(os.tmpdir(), 'hermes-enterprise-home-'))
   const result = writeManagedRuntimeHome({
-    bootstrap: { user: { displayName: 'Ada' } },
+    bootstrap: { mode: 'managed', messagingChannelPolicy: managedPolicy, user: { displayName: 'Ada' } },
     hermesHome,
     manifest: manifest({
       auxiliaryPolicy: { enabled: true, secretNote: 'drop-me' },
@@ -108,8 +111,8 @@ test('managed runtime home writes company-gateway config and token env only in p
 
   assert.match(config, /provider: "company-gateway"/)
   assert.match(config, /base_url: "https:\/\/gateway\.example\.com\/v1"/)
-  assert.match(config, /agent:\n  api_max_retries: 1/)
-  assert.match(config, /display:\n  language: "zh"/)
+  assert.match(config, /agent:\n {2}api_max_retries: 1/)
+  assert.match(config, /display:\n {2}language: "zh"/)
   assert.match(config, /api_mode: "chat_completions"/)
   assert.match(env, /COMPANY_GATEWAY_TOKEN="gateway-secret"/)
   assert.equal(result.env[GATEWAY_TOKEN_ENV], 'gateway-secret')
@@ -190,6 +193,8 @@ test('managed runtime home writes company-gateway config and token env only in p
     }
   ])
   assert.deepEqual(result.publicState.lockedSurfaces, ['providers', 'env'])
+  assert.equal(result.publicState.messagingChannelPolicy.status, 'applied')
+  assert.deepEqual(result.publicState.messagingChannelPolicy.visibleChannelIds, ['wecom-personal'])
   assert.deepEqual(result.publicState.uiPolicy, { defaultLocale: 'zh', allowLanguageChange: true, lockedLocale: false })
   assert.deepEqual(policy.uiPolicy, { defaultLocale: 'zh', allowLanguageChange: true, lockedLocale: false })
 })
@@ -210,7 +215,59 @@ test('public enterprise state degrades older manifests without tool policy snaps
   assert.equal(state.policyHash, null)
   assert.equal(state.generatedAt, null)
   assert.equal(state.providerRuntime, null)
+  assert.equal(state.messagingChannelPolicy.status, 'fail-closed')
+  assert.equal(state.messagingChannelPolicy.reason, 'policy_snapshot_incomplete')
+  assert.deepEqual(state.messagingChannelPolicy.allowedChannelIds, [])
   assert.deepEqual(state.allowedModels, ['m1'])
+})
+
+test('managed runtime state requires both HTTP documents and matching policy snapshots', () => {
+  const validBootstrap = { mode: 'managed', messagingChannelPolicy: managedPolicy }
+  const validManifest = manifest()
+
+  for (const [bootstrap, runtimeManifest] of [
+    [null, validManifest],
+    [validBootstrap, null],
+    [{ mode: 'managed', messagingChannelPolicy: null }, validManifest],
+    [validBootstrap, { ...validManifest, messagingChannelPolicy: null }]
+  ]) {
+    const decision = publicEnterpriseState({ bootstrap, manifest: runtimeManifest }).messagingChannelPolicy
+    assert.equal(decision.status, 'fail-closed')
+    assert.equal(decision.reason, 'policy_snapshot_incomplete')
+    assert.deepEqual(decision.allowedChannelIds, [])
+  }
+
+  const differentPolicy = {
+    ...managedPolicy,
+    allowedChannelIds: [],
+    userManageableChannelIds: [],
+    visibleChannelIds: []
+  }
+  differentPolicy.policyHash = computeMessagingChannelPolicyHash(differentPolicy)
+  const mismatch = publicEnterpriseState({
+    bootstrap: validBootstrap,
+    manifest: { ...validManifest, messagingChannelPolicy: differentPolicy }
+  }).messagingChannelPolicy
+
+  assert.equal(mismatch.status, 'fail-closed')
+  assert.equal(mismatch.reason, 'policy_snapshot_mismatch')
+})
+
+test('managed runtime cannot be downgraded by a single unmanaged HTTP document', () => {
+  const unmanaged = { mode: 'unmanaged', messagingChannelPolicy: null }
+
+  for (const [bootstrap, runtimeManifest] of [
+    [null, unmanaged],
+    [unmanaged, null]
+  ]) {
+    const decision = publicEnterpriseState({ bootstrap, manifest: runtimeManifest }).messagingChannelPolicy
+
+    assert.equal(decision.mode, 'managed')
+    assert.equal(decision.status, 'fail-closed')
+    assert.equal(decision.reason, 'policy_mode_mismatch')
+    assert.deepEqual(decision.visibleChannelIds, [])
+    assert.deepEqual(decision.allowedChannelIds, [])
+  }
 })
 
 test('public enterprise state allowlists provider runtime operational metadata', () => {
@@ -577,7 +634,7 @@ test('managed config preserves an existing supported explicit display language',
   })
 
   const config = fs.readFileSync(path.join(hermesHome, 'config.yaml'), 'utf8')
-  assert.match(config, /display:\n  language: "ja"/)
+  assert.match(config, /display:\n {2}language: "ja"/)
 })
 
 test('managed config falls back to zh when existing display language is unsupported', () => {
@@ -592,7 +649,7 @@ test('managed config falls back to zh when existing display language is unsuppor
   })
 
   const config = fs.readFileSync(path.join(hermesHome, 'config.yaml'), 'utf8')
-  assert.match(config, /display:\n  language: "zh"/)
+  assert.match(config, /display:\n {2}language: "zh"/)
 })
 
 test('managed runtime home is scoped by enterprise user identity', () => {

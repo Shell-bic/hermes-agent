@@ -1,0 +1,58 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://contracts.example.invalid/wecom-personal-bot/v1/wecom-bot-binding.schema.json",
+  "title": "WeCom personal bot binding response v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "contractVersion",
+    "bindingId",
+    "botId",
+    "displayName",
+    "status",
+    "connectionStatus",
+    "ownerVerificationRequired",
+    "createdAt",
+    "updatedAt",
+    "lastConnectedAt",
+    "errorCode"
+  ],
+  "properties": {
+    "contractVersion": { "const": "wecom-bot-binding.v1" },
+    "bindingId": {
+      "type": "string",
+      "format": "uuid",
+      "pattern": "^(?!00000000-0000-0000-0000-000000000000$)[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$"
+    },
+    "botId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9._-]+$" },
+    "displayName": { "type": ["string", "null"], "maxLength": 128 },
+    "status": {
+      "enum": ["pending-owner-verification", "connecting", "connected", "disconnected", "suspended", "revoked"]
+    },
+    "connectionStatus": { "enum": ["offline", "connecting", "online", "error"] },
+    "ownerVerificationRequired": { "type": "boolean" },
+    "createdAt": { "type": "string", "format": "date-time" },
+    "updatedAt": { "type": "string", "format": "date-time" },
+    "lastConnectedAt": { "type": ["string", "null"], "format": "date-time" },
+    "errorCode": {
+      "type": ["string", "null"],
+      "maxLength": 128,
+      "pattern": "^[a-z0-9][a-z0-9._-]*$"
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "status": { "const": "pending-owner-verification" } }, "required": ["status"] },
+      "then": { "properties": { "ownerVerificationRequired": { "const": true } } }
+    },
+    {
+      "if": { "properties": { "status": { "const": "connected" } }, "required": ["status"] },
+      "then": {
+        "properties": {
+          "connectionStatus": { "const": "online" },
+          "ownerVerificationRequired": { "const": false }
+        }
+      }
+    }
+  ]
+}
