@@ -143,7 +143,6 @@ function initialize(message) {
     app.setPath('logs', path.join(start.profileRoot, 'logs'))
     app.setPath('crashDumps', path.join(start.profileRoot, 'crash-dumps'))
     app.setPath('cache', path.join(start.profileRoot, 'cache'))
-    app.disableHardwareAcceleration()
     app.commandLine.appendSwitch('disable-breakpad')
     app.on('window-all-closed', () => {})
     host = createElectronHost({

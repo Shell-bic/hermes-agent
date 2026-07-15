@@ -13,7 +13,6 @@ if (!['success', 'nested', 'redirect'].includes(scenario) || !profileRoot || !pf
 for (const [name, directory] of Object.entries({
   userData: 'profile', sessionData: 'session-data', logs: 'logs', crashDumps: 'crash-dumps', cache: 'cache'
 })) app.setPath(name, path.join(profileRoot, directory))
-app.disableHardwareAcceleration()
 app.commandLine.appendSwitch('disable-breakpad')
 app.on('window-all-closed', () => {})
 

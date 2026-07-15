@@ -1,4 +1,5 @@
 const assert = require('node:assert/strict')
+const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
 const test = require('node:test')
@@ -69,4 +70,15 @@ test('renderer termination has a stable context-specific code across initial-loa
   assert.equal(rendererFailureCode(false, 'popup_load_failed', true), 'popup_load_failed')
   assert.equal(rendererFailureCode(true, 'gateway_load_failed'), 'renderer_crashed')
   assert.equal(rendererFailureCode(true, 'popup_load_failed', true), 'renderer_unresponsive')
+})
+
+test('visible live windows retain Chromium GPU compositing without weakening web isolation', () => {
+  for (const fileName of ['electron-live-main.cjs', 'electron-success-fixture-main.cjs']) {
+    const source = fs.readFileSync(path.join(__dirname, fileName), 'utf8')
+    assert.equal(source.includes('disableHardwareAcceleration'), false)
+  }
+  const hostSource = fs.readFileSync(path.join(__dirname, 'electron-host.cjs'), 'utf8')
+  for (const invariant of ['contextIsolation: true', 'sandbox: true', 'webSecurity: true']) {
+    assert.equal(hostSource.includes(invariant), true)
+  }
 })
