@@ -94,6 +94,9 @@ const { createEnterpriseBackendOwnership } = require('./enterprise-backend-owner
 const { resolveEnterpriseDesktopConfigPaths } = require('./enterprise-desktop-config.cjs')
 const { createEnterpriseGatewayClient } = require('./enterprise-gateway-client.cjs')
 const { createEnterpriseRuntime, resolveEnterpriseRuntimeOptions } = require('./enterprise-runtime.cjs')
+const {
+  createEnterpriseManagedProfileGuard
+} = require('./enterprise-managed-profile.cjs')
 const { createEnterpriseSkillHub, publicError: publicEnterpriseSkillHubError } = require('./enterprise-skill-hub.cjs')
 const { createEnterpriseManagedLifecycle } = require('./enterprise-managed-lifecycle.cjs')
 const { isTrustedRendererUrl } = require('./renderer-trust.cjs')
@@ -372,6 +375,12 @@ const enterpriseRuntime = createEnterpriseRuntime({
   gatewayUrl: ENTERPRISE_RUNTIME_OPTIONS.gatewayUrl,
   rememberLog,
   userDataPath: app.getPath('userData')
+})
+// Enterprise has one immutable managed runtime identity. The user/profile
+// selector and legacy connection files must never be able to turn it into a
+// pool child or a remote profile; secondary windows reuse this primary.
+const enterpriseManagedProfileGuard = createEnterpriseManagedProfileGuard({
+  enabled: () => enterpriseRuntime.isEnabled()
 })
 const enterpriseSkillHub = createEnterpriseSkillHub({
   authStore: enterpriseAuthStore,
@@ -4644,6 +4653,7 @@ async function buildRemoteConnection(rawUrl, authMode, token, source) {
 // A null/empty profile resolves the env/global remote, so legacy callers and
 // the connection test (which pass no profile) are unchanged.
 async function resolveRemoteBackend(profile) {
+  enterpriseManagedProfileGuard.assertRemoteAllowed('resolveRemoteBackend', profile)
   const config = readDesktopConnectionConfig()
 
   // 1. Per-profile override — "a profile with its own remote host". Wins even
@@ -4682,10 +4692,12 @@ async function resolveRemoteBackend(profile) {
 // not the local-disk fast path. These three helpers drive that (see
 // interceptSessionReadForRemote).
 function profileHasRemoteOverride(profile) {
+  if (enterpriseRuntime.isEnabled()) return false
   return Boolean(profileRemoteOverride(readDesktopConnectionConfig(), profile))
 }
 
 function configuredRemoteProfileNames() {
+  if (enterpriseRuntime.isEnabled()) return []
   const config = readDesktopConnectionConfig()
   return Object.keys(config.profiles || {}).filter(name => profileRemoteOverride(config, name))
 }
@@ -4694,6 +4706,7 @@ function configuredRemoteProfileNames() {
 // Remote, or the env override): a SINGLE remote backend serves every profile via
 // ?profile=. Distinct from per-profile overrides — here there's one host for all.
 function globalRemoteActive() {
+  if (enterpriseRuntime.isEnabled()) return false
   if (process.env.HERMES_DESKTOP_REMOTE_URL) {
     return true
   }
@@ -4779,6 +4792,7 @@ async function probeRemoteAuthMode(rawUrl) {
 }
 
 async function testDesktopConnectionConfig(input = {}) {
+  enterpriseManagedProfileGuard.assertRemoteAllowed('connection-config:test', input?.profile)
   const config = coerceDesktopConnectionConfig(input, readDesktopConnectionConfig(), { persistToken: false })
   const key = connectionScopeKey(input.profile)
   // The block under test: a per-profile entry or the global remote. Coerce has
@@ -4960,6 +4974,9 @@ async function waitForBackendExit(child, timeoutMs = 5000) {
 // returns the desktop's stored preference, or null when unset (legacy launch
 // that defers to active_profile / default).
 function primaryProfileKey() {
+  if (enterpriseRuntime.isEnabled()) {
+    return enterpriseManagedProfileGuard.managedKey()
+  }
   return readActiveDesktopProfile() || 'default'
 }
 
@@ -4972,7 +4989,9 @@ async function ensureBackend(profile) {
     throw enterpriseAuthRequiredError()
   }
 
-  const key = profile && String(profile).trim() ? String(profile).trim() : primaryProfileKey()
+  const key = enterpriseRuntime.isEnabled()
+    ? enterpriseManagedProfileGuard.resolve(profile)
+    : (profile && String(profile).trim() ? String(profile).trim() : primaryProfileKey())
 
   if (key === primaryProfileKey()) {
     return startHermes()
@@ -5062,6 +5081,7 @@ function startPoolIdleReaper() {
 // local-spawn portion of startHermes() but without the boot-progress UI,
 // bootstrap, or remote handling (those belong to the primary backend only).
 async function spawnPoolBackend(profile, entry, ticket) {
+  enterpriseManagedProfileGuard.assertRemoteAllowed('spawnPoolBackend', profile)
   // A profile may point at its OWN remote backend (connection.json
   // `profiles[name]`), or inherit the app-wide remote (env / global settings).
   // In either case there is no local child to spawn — we just verify the
@@ -5219,6 +5239,9 @@ function profileNameFromDeleteRequest(request) {
 
 async function prepareProfileDeleteRequest(request) {
   const profile = profileNameFromDeleteRequest(request)
+  if (enterpriseRuntime.isEnabled() && profile) {
+    enterpriseManagedProfileGuard.assertProfileMutation('profile:delete', request?.path)
+  }
   if (!profile || profile === 'default' || !PROFILE_NAME_RE.test(profile)) {
     return
   }
@@ -5930,8 +5953,12 @@ ipcMain.handle('hermes:connection-config:get', async (_event, profile) =>
   sanitizeDesktopConnectionConfig(readDesktopConnectionConfig(), profile)
 )
 ipcMain.handle('hermes:connection-config:test', async (_event, payload) => testDesktopConnectionConfig(payload))
-ipcMain.handle('hermes:connection-config:probe', async (_event, rawUrl) => probeRemoteAuthMode(rawUrl))
+ipcMain.handle('hermes:connection-config:probe', async (_event, rawUrl) => {
+  enterpriseManagedProfileGuard.assertRemoteAllowed('connection-config:probe')
+  return probeRemoteAuthMode(rawUrl)
+})
 ipcMain.handle('hermes:connection-config:oauth-login', async (_event, rawUrl) => {
+  enterpriseManagedProfileGuard.assertRemoteAllowed('connection-config:oauth-login')
   // Open the gateway's OAuth login window and wait for the session cookie to
   // land in the OAuth partition. The caller (settings UI) typically saves the
   // remote config with authMode='oauth' first, then calls this. We normalize
@@ -5941,6 +5968,7 @@ ipcMain.handle('hermes:connection-config:oauth-login', async (_event, rawUrl) =>
   return { ok: true, baseUrl, connected: await hasOauthSessionCookie(baseUrl) }
 })
 ipcMain.handle('hermes:connection-config:oauth-logout', async (_event, rawUrl) => {
+  enterpriseManagedProfileGuard.assertRemoteAllowed('connection-config:oauth-logout')
   const baseUrl = rawUrl ? normalizeRemoteBaseUrl(rawUrl) : ''
   await clearOauthSession(baseUrl || undefined)
   // Report against the SAME liveness notion the Settings indicator uses
@@ -5950,7 +5978,7 @@ ipcMain.handle('hermes:connection-config:oauth-logout', async (_event, rawUrl) =
 })
 ipcMain.handle('hermes:connection-config:save', async (_event, payload) => {
   if (enterpriseRuntime.isEnabled()) {
-    throw new Error('Gateway connection settings are locked by enterprise policy.')
+    enterpriseManagedProfileGuard.assertRemoteAllowed('connection-config:save', payload?.profile)
   }
 
   const config = coerceDesktopConnectionConfig(payload)
@@ -5960,7 +5988,7 @@ ipcMain.handle('hermes:connection-config:save', async (_event, payload) => {
 })
 ipcMain.handle('hermes:connection-config:apply', async (_event, payload) => {
   if (enterpriseRuntime.isEnabled()) {
-    throw new Error('Gateway connection settings are locked by enterprise policy.')
+    enterpriseManagedProfileGuard.assertRemoteAllowed('connection-config:apply', payload?.profile)
   }
 
   const config = coerceDesktopConnectionConfig(payload)
@@ -5983,8 +6011,11 @@ ipcMain.handle('hermes:connection-config:apply', async (_event, payload) => {
   return sanitizeDesktopConnectionConfig(config, payload?.profile)
 })
 
-ipcMain.handle('hermes:profile:get', async () => ({ profile: readActiveDesktopProfile() }))
+ipcMain.handle('hermes:profile:get', async () => ({
+  profile: enterpriseRuntime.isEnabled() ? enterpriseManagedProfileGuard.managedKey() : readActiveDesktopProfile()
+}))
 ipcMain.handle('hermes:profile:set', async (_event, name) => {
+  enterpriseManagedProfileGuard.assertProfileMutation('profile:set', name)
   const next = writeActiveDesktopProfile(name)
 
   // Switching profiles is a backend re-home: relaunch the dashboard under the
@@ -6140,6 +6171,15 @@ async function mergeRemoteProfileSessions(searchParams, remoteProfiles) {
 }
 
 ipcMain.handle('hermes:api', async (_event, request) => {
+  if (enterpriseRuntime.isEnabled()) {
+    const method = String(request?.method || 'GET').toUpperCase()
+    const requestPath = String(request?.path || '')
+    if (method === 'DELETE' && /^\/api\/profiles(?:[/?#]|$)/.test(requestPath)) {
+      enterpriseManagedProfileGuard.assertProfileMutation('profile:delete', requestPath)
+    } else {
+      enterpriseManagedProfileGuard.resolve(request?.profile)
+    }
+  }
   const pendingEnterpriseResponse = enterprisePendingApiResponse(request)
   if (pendingEnterpriseResponse !== undefined) {
     return pendingEnterpriseResponse
