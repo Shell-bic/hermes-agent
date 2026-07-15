@@ -1,0 +1,217 @@
+const BACKEND_OWNERSHIP_ERROR_CODES = Object.freeze({
+  START_ABORTED: 'enterprise_backend_start_aborted',
+  STOP_FAILED: 'enterprise_backend_stop_failed'
+})
+
+class EnterpriseBackendOwnershipError extends Error {
+  constructor(code, message) {
+    super(message || code)
+    this.name = 'EnterpriseBackendOwnershipError'
+    this.code = code
+  }
+}
+
+function createEnterpriseBackendOwnership(options = {}) {
+  const getLifecycle = options.getLifecycle
+  const isManaged = typeof options.isManaged === 'function' ? options.isManaged : () => true
+  const listOwnedProcesses = options.listOwnedProcesses || (() => [])
+  const clearOwnedProcess = options.clearOwnedProcess || (() => {})
+  const gracefulStop = options.gracefulStop || (async () => {})
+  const forceStopTree = options.forceStopTree || (async () => {})
+  const waitForExit = options.waitForExit || (async () => {})
+  const probeProcessTree = options.probeProcessTree || (async process => {
+    return process?.exitCode === null && process?.signalCode === null && process?.killed !== true
+  })
+
+  const pendingStarts = new Map()
+  let nextStartId = 1
+  let lastStopOwners = []
+
+  function lifecycle() {
+    const value = getLifecycle?.()
+    if (!value) throw new Error('Enterprise lifecycle is not initialized.')
+    return value
+  }
+
+  function beginStart(owner = {}) {
+    const managed = isManaged() === true
+    const controller = new AbortController()
+    const ticket = {
+      controller,
+      id: nextStartId++,
+      key: String(owner.key || 'backend'),
+      lease: managed ? lifecycle().acquireLease() : null,
+      managed,
+      recovery: owner.recovery === true,
+      settlePromise: Promise.resolve(),
+      signal: controller.signal
+    }
+    if (managed) {
+      lifecycle().guardEffect('spawn', ticket.lease, { recovery: ticket.recovery })
+    }
+    pendingStarts.set(ticket.id, ticket)
+    return ticket
+  }
+
+  function checkpoint(ticket) {
+    if (!ticket || ticket.signal?.aborted) {
+      throw new EnterpriseBackendOwnershipError(
+        BACKEND_OWNERSHIP_ERROR_CODES.START_ABORTED,
+        'Enterprise backend start was canceled.'
+      )
+    }
+    if (ticket.managed) {
+      lifecycle().guardEffect('spawn', ticket.lease, { recovery: ticket.recovery })
+    }
+    return true
+  }
+
+  function finishStart(ticket) {
+    if (ticket && pendingStarts.get(ticket.id) === ticket) {
+      pendingStarts.delete(ticket.id)
+    }
+  }
+
+  function trackStart(ticket, promise) {
+    ticket.settlePromise = Promise.resolve(promise)
+      .catch(() => undefined)
+      .finally(() => finishStart(ticket))
+    return promise
+  }
+
+  async function cancelPendingStarts() {
+    const starts = [...pendingStarts.values()]
+    for (const ticket of starts) ticket.controller.abort()
+    await Promise.allSettled(starts.map(ticket => ticket.settlePromise))
+  }
+
+  async function cancelStart(ticket) {
+    if (!ticket) return
+    ticket.controller.abort()
+    await Promise.allSettled([ticket.settlePromise])
+  }
+
+  function childIsCurrent(ticket, child, getCurrent) {
+    if (!ticket || ticket.signal.aborted || getCurrent() !== child) return false
+    return !ticket.managed || lifecycle().isLeaseCurrent(ticket.lease)
+  }
+
+  function bindChild(ticket, child, handlers = {}) {
+    const getCurrent = handlers.getCurrent || (() => child)
+    const clearCurrent = handlers.clearCurrent || (() => {})
+
+    child.once('error', error => {
+      if (!childIsCurrent(ticket, child, getCurrent)) return
+      clearCurrent(child)
+      handlers.onError?.(error)
+    })
+    child.once('exit', (code, signal) => {
+      if (!childIsCurrent(ticket, child, getCurrent)) return
+      clearCurrent(child)
+      handlers.onExit?.(code, signal)
+    })
+  }
+
+  function uniqueOwners(owners) {
+    const seen = new Set()
+    return owners.filter(owner => {
+      const process = owner?.process
+      if (!process) return false
+      const identity = Number.isInteger(process.pid) ? `pid:${process.pid}` : process
+      if (seen.has(identity)) return false
+      seen.add(identity)
+      return true
+    })
+  }
+
+  async function processIsAlive(owner) {
+    try {
+      return await probeProcessTree(owner.process) === true
+    } catch {
+      return true
+    }
+  }
+
+  async function stopOwners(owners) {
+    const captured = uniqueOwners(owners)
+    lastStopOwners = captured
+
+    for (const owner of captured) {
+      try {
+        await gracefulStop(owner.process)
+      } catch {
+        // The force/probe sequence below remains authoritative.
+      }
+      try {
+        await waitForExit(owner.process)
+      } catch {
+        // Continue to the liveness probe.
+      }
+    }
+
+    const stillAlive = []
+    for (const owner of captured) {
+      if (await processIsAlive(owner)) stillAlive.push(owner)
+    }
+    for (const owner of stillAlive) {
+      try {
+        await forceStopTree(owner.process)
+      } catch {
+        // Continue to the final liveness probe.
+      }
+      try {
+        await waitForExit(owner.process)
+      } catch {
+        // Continue to the final liveness probe.
+      }
+    }
+
+    const survivors = []
+    for (const owner of captured) {
+      if (await processIsAlive(owner)) survivors.push(owner)
+      else clearOwnedProcess(owner, owner.process)
+    }
+    if (survivors.length > 0) {
+      throw new EnterpriseBackendOwnershipError(
+        BACKEND_OWNERSHIP_ERROR_CODES.STOP_FAILED,
+        'One or more enterprise backend process trees are still alive.'
+      )
+    }
+  }
+
+  async function stopOwnedProcesses() {
+    await stopOwners(listOwnedProcesses())
+  }
+
+  async function verifyResourcesGone() {
+    const owners = uniqueOwners([...listOwnedProcesses(), ...lastStopOwners])
+    for (const owner of owners) {
+      if (await processIsAlive(owner)) return false
+    }
+    return true
+  }
+
+  return Object.freeze({
+    beginStart,
+    bindChild,
+    cancelPendingStarts,
+    cancelStart,
+    checkpoint,
+    finishStart,
+    lifecycleEffects: Object.freeze({
+      cancelPendingStarts,
+      stopOwnedProcesses,
+      verifyResourcesGone
+    }),
+    stopOwnedProcesses,
+    stopOwners,
+    trackStart,
+    verifyResourcesGone
+  })
+}
+
+module.exports = {
+  BACKEND_OWNERSHIP_ERROR_CODES,
+  createEnterpriseBackendOwnership,
+  EnterpriseBackendOwnershipError
+}
