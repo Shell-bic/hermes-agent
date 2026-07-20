@@ -7,7 +7,9 @@ import time
 import types
 from datetime import datetime
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
+
+import pytest
 
 from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 from hermes_cli.active_sessions import active_session_registry_snapshot
@@ -5338,7 +5340,7 @@ def test_session_create_close_race_does_not_orphan_worker(monkeypatch):
     release_build = threading.Event()
     build_entered = threading.Event()
 
-    def _slow_make_agent(sid, key, session_id=None, session_db=None):
+    def _slow_make_agent(sid, key, session_id=None, session_db=None, **kwargs):
         build_started.set()
         build_entered.set()
         release_build.wait(timeout=3.0)
@@ -7106,6 +7108,74 @@ def test_make_agent_reads_nested_max_turns(monkeypatch):
     assert mock_agent.call_args.kwargs["max_iterations"] == 200
 
 
+def test_make_agent_preload_denial_precedes_agent_mcp_and_body(monkeypatch):
+    from agent import skill_commands
+    from hermes_cli import mcp_startup
+    from hermes_cli.enterprise_policy import EnterpriseSkillPolicyDenied
+    from tui_gateway import entry
+
+    denied = EnterpriseSkillPolicyDenied(
+        {
+            "policyKey": "expense-review",
+            "reason": "enterprise_skill_policy_denied",
+        }
+    )
+    shared_wait = MagicMock()
+    tui_wait = MagicMock()
+    body_load = MagicMock()
+    monkeypatch.setattr(server, "_parse_tui_skills_env", lambda: ["expense-review"])
+    monkeypatch.setattr(
+        skill_commands,
+        "preflight_skill_identifiers",
+        lambda skills: (_ for _ in ()).throw(denied),
+    )
+    monkeypatch.setattr(skill_commands, "build_preloaded_skills_prompt", body_load)
+    monkeypatch.setattr(mcp_startup, "wait_for_mcp_discovery", shared_wait)
+    monkeypatch.setattr(entry, "wait_for_mcp_discovery", tui_wait)
+
+    with patch("run_agent.AIAgent") as agent_ctor, pytest.raises(
+        EnterpriseSkillPolicyDenied
+    ) as raised:
+        server._make_agent("sid1", "key1")
+
+    assert raised.value is denied
+    agent_ctor.assert_not_called()
+    shared_wait.assert_not_called()
+    tui_wait.assert_not_called()
+    body_load.assert_not_called()
+
+
+def test_make_agent_reuses_preflight_policy_snapshot_for_body(monkeypatch):
+    from agent import skill_commands
+    from hermes_cli import mcp_startup
+    from tui_gateway import entry
+
+    _setup_make_agent_mocks(monkeypatch, {})
+    snapshot = {"policyVersion": "frozen-v1"}
+    seen = {}
+    monkeypatch.setattr(server, "_parse_tui_skills_env", lambda: ["expense-review"])
+    monkeypatch.setattr(
+        skill_commands, "preflight_skill_identifiers", lambda skills: snapshot
+    )
+
+    def fake_build(skills, task_id=None, *, policy=None):
+        seen.update(skills=list(skills), task_id=task_id, policy=policy)
+        return "skill prompt", ["expense-review"], []
+
+    monkeypatch.setattr(skill_commands, "build_preloaded_skills_prompt", fake_build)
+    monkeypatch.setattr(mcp_startup, "wait_for_mcp_discovery", lambda: None)
+    monkeypatch.setattr(entry, "wait_for_mcp_discovery", lambda: None)
+
+    with patch("run_agent.AIAgent"):
+        server._make_agent("sid1", "key1", session_id="session-123")
+
+    assert seen == {
+        "skills": ["expense-review"],
+        "task_id": "session-123",
+        "policy": snapshot,
+    }
+
+
 def test_make_agent_waits_for_shared_mcp_discovery(monkeypatch):
     _setup_make_agent_mocks(monkeypatch, {})
     waited = []
@@ -8156,5 +8226,47 @@ def test_start_agent_build_passes_session_model_override(monkeypatch):
         assert captured.get("reasoning_config_override") == reasoning
         assert captured.get("service_tier_override") == "priority"
         assert session["agent"].model == "claude-sonnet-4.6"
+    finally:
+        server._sessions.clear()
+
+
+def test_start_agent_build_denial_precedes_profile_session_db(monkeypatch, tmp_path):
+    """Profile state must stay untouched when startup Skill policy denies."""
+    import hermes_state
+    from hermes_cli.enterprise_policy import EnterpriseSkillPolicyDenied
+
+    denied = EnterpriseSkillPolicyDenied(
+        {
+            "policyKey": "expense-review",
+            "reason": "enterprise_skill_policy_denied",
+        }
+    )
+    session_db_ctor = MagicMock()
+    make_agent = MagicMock()
+    monkeypatch.setattr(server, "_set_session_context", lambda target: [])
+    monkeypatch.setattr(server, "_clear_session_context", lambda tokens: None)
+    monkeypatch.setattr(
+        server,
+        "_preflight_tui_startup_skills",
+        lambda: (_ for _ in ()).throw(denied),
+    )
+    monkeypatch.setattr(server, "_make_agent", make_agent)
+    monkeypatch.setattr(hermes_state, "SessionDB", session_db_ctor)
+    monkeypatch.setattr(server, "_emit", lambda *args, **kwargs: None)
+
+    sid = "denied-build-sid"
+    session = {
+        "agent": None,
+        "agent_ready": threading.Event(),
+        "session_key": "denied-key",
+        "profile_home": str(tmp_path),
+    }
+    server._sessions[sid] = session
+    try:
+        server._start_agent_build(sid, session)
+        assert session["agent_ready"].wait(timeout=3), "agent build did not finish"
+        assert "enterprise_skill_policy_denied" in session["agent_error"]
+        session_db_ctor.assert_not_called()
+        make_agent.assert_not_called()
     finally:
         server._sessions.clear()

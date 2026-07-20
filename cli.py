@@ -13657,6 +13657,14 @@ def main(
             toolsets_list = sorted(_get_platform_tools(CLI_CONFIG, "cli"))
     
     parsed_skills = _parse_skills_argument(skills)
+    preloaded_skill_policy = None
+    if parsed_skills:
+        from agent.skill_commands import preflight_skill_identifiers
+
+        # Freeze and authorize the whole preload before HermesCLI opens the
+        # session database or runs either maintenance path.  The same snapshot
+        # is reused for body loading below so policy cannot change mid-entry.
+        preloaded_skill_policy = preflight_skill_identifiers(parsed_skills)
 
     # Create CLI instance
     cli = HermesCLI(
@@ -13675,13 +13683,11 @@ def main(
     )
 
     if parsed_skills:
-        from hermes_cli.enterprise_policy import skill_policy_operation
-
-        with skill_policy_operation():
-            skills_prompt, loaded_skills, missing_skills = build_preloaded_skills_prompt(
-                parsed_skills,
-                task_id=cli.session_id,
-            )
+        skills_prompt, loaded_skills, missing_skills = build_preloaded_skills_prompt(
+            parsed_skills,
+            task_id=cli.session_id,
+            policy=preloaded_skill_policy,
+        )
         if missing_skills:
             missing_display = ", ".join(missing_skills)
             raise ValueError(f"Unknown skill(s): {missing_display}")

@@ -624,6 +624,8 @@ def preflight_skill_identifiers(
 def build_preloaded_skills_prompt(
     skill_identifiers: list[str],
     task_id: str | None = None,
+    *,
+    policy: dict | None = None,
 ) -> tuple[str, list[str], list[str]]:
     """Load one or more skills for session-wide CLI preloading.
 
@@ -631,7 +633,7 @@ def build_preloaded_skills_prompt(
     """
     from hermes_cli.enterprise_policy import skill_policy_operation
 
-    with skill_policy_operation():
+    with skill_policy_operation(policy):
         _preflight_skill_identifiers(skill_identifiers)
         return _build_preloaded_skills_prompt(
             skill_identifiers,

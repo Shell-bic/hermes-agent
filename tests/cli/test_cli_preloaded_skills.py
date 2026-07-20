@@ -70,40 +70,102 @@ class _DummyCLI:
 
 def test_main_applies_preloaded_skills_to_system_prompt(monkeypatch):
     import cli as cli_mod
+    from agent import skill_commands
 
     created = {}
+    snapshot = {"policyVersion": "frozen-v1"}
+    events = []
+
+    def fake_preflight(skills):
+        events.append(("preflight", list(skills)))
+        return snapshot
 
     def fake_cli(**kwargs):
+        events.append(("cli", None))
         created["cli"] = _DummyCLI(**kwargs)
         return created["cli"]
 
+    def fake_build(skills, task_id=None, *, policy=None):
+        events.append(("body", policy))
+        assert policy is snapshot
+        assert task_id == "session-123"
+        return "skill prompt", ["hermes-agent-dev", "github-auth"], []
+
+    monkeypatch.setattr(skill_commands, "preflight_skill_identifiers", fake_preflight)
     monkeypatch.setattr(cli_mod, "HermesCLI", fake_cli)
-    monkeypatch.setattr(
-        cli_mod,
-        "build_preloaded_skills_prompt",
-        lambda skills, task_id=None: ("skill prompt", ["hermes-agent-dev", "github-auth"], []),
-    )
+    monkeypatch.setattr(cli_mod, "build_preloaded_skills_prompt", fake_build)
 
     with pytest.raises(SystemExit):
         cli_mod.main(skills="hermes-agent-dev,github-auth", list_tools=True)
 
     cli_obj = created["cli"]
+    assert events == [
+        ("preflight", ["hermes-agent-dev", "github-auth"]),
+        ("cli", None),
+        ("body", snapshot),
+    ]
     assert cli_obj.system_prompt == "base prompt\n\nskill prompt"
     assert cli_obj.preloaded_skills == ["hermes-agent-dev", "github-auth"]
 
 
 def test_main_raises_for_unknown_preloaded_skill(monkeypatch):
     import cli as cli_mod
+    from agent import skill_commands
 
+    monkeypatch.setattr(skill_commands, "preflight_skill_identifiers", lambda skills: {})
     monkeypatch.setattr(cli_mod, "HermesCLI", lambda **kwargs: _DummyCLI(**kwargs))
     monkeypatch.setattr(
         cli_mod,
         "build_preloaded_skills_prompt",
-        lambda skills, task_id=None: ("", [], ["missing-skill"]),
+        lambda skills, task_id=None, *, policy=None: ("", [], ["missing-skill"]),
     )
 
     with pytest.raises(ValueError, match=r"Unknown skill\(s\): missing-skill"):
         cli_mod.main(skills="missing-skill", list_tools=True)
+
+
+def test_main_preload_denial_precedes_cli_and_state_side_effects(monkeypatch):
+    import cli as cli_mod
+    import hermes_state
+    from agent import skill_commands
+    from hermes_cli.enterprise_policy import EnterpriseSkillPolicyDenied
+    from tools import skill_usage
+
+    denied = EnterpriseSkillPolicyDenied(
+        {
+            "policyKey": "expense-review",
+            "reason": "enterprise_skill_policy_denied",
+        }
+    )
+
+    def fail(label):
+        def _unexpected(*args, **kwargs):
+            pytest.fail(f"{label} ran before preload denial")
+
+        return _unexpected
+
+    monkeypatch.setattr(
+        skill_commands,
+        "preflight_skill_identifiers",
+        lambda skills: (_ for _ in ()).throw(denied),
+    )
+    monkeypatch.setattr(cli_mod, "HermesCLI", fail("HermesCLI constructor"))
+    monkeypatch.setattr(hermes_state, "SessionDB", fail("SessionDB constructor"))
+    monkeypatch.setattr(
+        cli_mod, "_run_state_db_auto_maintenance", fail("state DB maintenance")
+    )
+    monkeypatch.setattr(
+        cli_mod, "_run_checkpoint_auto_maintenance", fail("checkpoint maintenance")
+    )
+    monkeypatch.setattr(
+        cli_mod, "build_preloaded_skills_prompt", fail("Skill body load")
+    )
+    monkeypatch.setattr(skill_usage, "bump_use", fail("Skill usage update"))
+
+    with pytest.raises(EnterpriseSkillPolicyDenied) as raised:
+        cli_mod.main(skills="expense-review", list_tools=True)
+
+    assert raised.value is denied
 
 
 def test_show_banner_does_not_print_skills():

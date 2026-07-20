@@ -935,23 +935,30 @@ def _start_agent_build(sid: str, session: dict) -> None:
         profile_home = current.get("profile_home")
         try:
             tokens = _set_session_context(key)
-            # Build against the session's profile (global-remote): bind its
-            # HERMES_HOME so config/skills/model resolve to it, and hand the
-            # agent that profile's db so turns persist to the right state.db.
-            session_db = None
-            if profile_home:
-                home_token = set_hermes_home_override(profile_home)
-                try:
-                    from hermes_state import SessionDB
-
-                    session_db = SessionDB(db_path=Path(profile_home) / "state.db")
-                except Exception:
-                    session_db = None
             try:
+                # Build against the session's profile (global-remote): bind its
+                # HERMES_HOME so config/skills/model resolve to it.  Authorize
+                # startup Skills before opening that profile's state database;
+                # the frozen snapshot is handed through to body loading.
+                session_db = None
+                if profile_home:
+                    home_token = set_hermes_home_override(profile_home)
+                startup_skills, startup_skill_policy = _preflight_tui_startup_skills()
+                if profile_home:
+                    try:
+                        from hermes_state import SessionDB
+
+                        session_db = SessionDB(db_path=Path(profile_home) / "state.db")
+                    except Exception:
+                        session_db = None
                 # Lazy-resumed (watch) sessions carry the stored conversation
                 # id — pass it through so the upgrade continues that session
                 # instead of starting a fresh one under the same key.
-                kw = {"session_db": session_db}
+                kw = {
+                    "session_db": session_db,
+                    "startup_skills": startup_skills,
+                    "startup_skill_policy": startup_skill_policy,
+                }
                 if resume_sid := current.get("resume_session_id"):
                     kw["session_id"] = resume_sid
                 # Model/effort/fast the desktop picked for a brand-new chat ride
@@ -3297,6 +3304,17 @@ def _parse_tui_skills_env() -> list[str]:
     return skills
 
 
+def _preflight_tui_startup_skills() -> tuple[list[str], dict | None]:
+    """Authorize TUI startup Skills before session or Agent side effects."""
+    startup_skills = _parse_tui_skills_env()
+    if not startup_skills:
+        return startup_skills, None
+
+    from agent.skill_commands import preflight_skill_identifiers
+
+    return startup_skills, preflight_skill_identifiers(startup_skills)
+
+
 def _load_fallback_model():
     """Return the configured fallback chain for TUI-created agents.
 
@@ -3527,7 +3545,16 @@ def _make_agent(
     provider_override: str | None = None,
     reasoning_config_override: dict | None = None,
     service_tier_override: str | None = None,
+    startup_skills: list[str] | None = None,
+    startup_skill_policy: dict | None = None,
 ):
+    if startup_skills is None:
+        startup_skills, startup_skill_policy = _preflight_tui_startup_skills()
+    elif startup_skills and startup_skill_policy is None:
+        from agent.skill_commands import preflight_skill_identifiers
+
+        startup_skill_policy = preflight_skill_identifiers(startup_skills)
+
     from run_agent import AIAgent
     from hermes_cli.runtime_provider import resolve_runtime_provider
 
@@ -3553,13 +3580,13 @@ def _make_agent(
     cfg = _load_cfg()
     agent_cfg = cfg.get("agent") or {}
     system_prompt = _prompt_text(agent_cfg.get("system_prompt", ""))
-    startup_skills = _parse_tui_skills_env()
     if startup_skills:
         from agent.skill_commands import build_preloaded_skills_prompt
 
         skills_prompt, _loaded_skills, missing_skills = build_preloaded_skills_prompt(
             startup_skills,
             task_id=session_id or key,
+            policy=startup_skill_policy,
         )
         if missing_skills:
             raise ValueError(f"Unknown skill(s): {', '.join(missing_skills)}")
