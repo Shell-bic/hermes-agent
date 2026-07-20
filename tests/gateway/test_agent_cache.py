@@ -342,6 +342,7 @@ class TestExtractCacheBustingConfig:
 
     def test_honcho_cache_busting_config_memoized_by_mtime(self, monkeypatch, tmp_path):
         """Repeated Honcho extraction for unchanged honcho.json should reuse parse result."""
+        import os
         from types import SimpleNamespace
         from gateway.run import GatewayRunner
 
@@ -375,7 +376,17 @@ class TestExtractCacheBustingConfig:
         assert first["honcho.user_peer_aliases"] == [("123", "eri")]
         assert parse_calls == [config_path]
 
+        original_mtime_ns = config_path.stat().st_mtime_ns
         config_path.write_text("{\n  \"changed\": true\n}")
+        written_stat = config_path.stat()
+        os.utime(
+            config_path,
+            ns=(
+                written_stat.st_atime_ns,
+                max(written_stat.st_mtime_ns, original_mtime_ns + 1_000_000_000),
+            ),
+        )
+        assert config_path.stat().st_mtime_ns != original_mtime_ns
         third = GatewayRunner._extract_honcho_cache_busting_config()
 
         assert third == first
