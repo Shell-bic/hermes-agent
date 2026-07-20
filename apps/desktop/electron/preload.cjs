@@ -1,6 +1,7 @@
 const { contextBridge, ipcRenderer, webUtils } = require('electron')
 const { isEnterpriseManagedEnv, redactManagedText } = require('./managed-redaction.cjs')
 const { createManagedProfileInvoker } = require('./enterprise-managed-profile.cjs')
+const { WINDOW_CONNECTION_CHANNELS } = require('./enterprise-window-connections.cjs')
 
 const ENTERPRISE_MANAGED_OUTPUTS = isEnterpriseManagedEnv(process.env)
 
@@ -35,6 +36,7 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
     login: payload => ipcRenderer.invoke('hermes:enterprise:login', payload),
     loginMethods: () => ipcRenderer.invoke('hermes:enterprise:login-methods'),
     loginState: () => ipcRenderer.invoke('hermes:enterprise:login-state'),
+    lifecycleStatus: () => ipcRenderer.invoke('hermes:enterprise:lifecycle-status'),
     logout: () => ipcRenderer.invoke('hermes:enterprise:logout'),
     onLoginState: callback => {
       const listener = (_event, state) => callback(state)
@@ -155,6 +157,26 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
     const listener = (_event, payload) => callback(payload)
     ipcRenderer.on('hermes:backend-exit', listener)
     return () => ipcRenderer.removeListener('hermes:backend-exit', listener)
+  },
+  onEnterpriseRuntimeRevoked: callback => {
+    const listener = async (_event, payload) => {
+      let ok = true
+      try {
+        await callback(payload)
+      } catch {
+        ok = false
+      }
+      ipcRenderer.send(WINDOW_CONNECTION_CHANNELS.ACK, {
+        ok,
+        revocationId: payload?.revocationId
+      })
+    }
+    ipcRenderer.on(WINDOW_CONNECTION_CHANNELS.REVOKE, listener)
+    ipcRenderer.send(WINDOW_CONNECTION_CHANNELS.READY)
+    return () => {
+      ipcRenderer.removeListener(WINDOW_CONNECTION_CHANNELS.REVOKE, listener)
+      ipcRenderer.send(WINDOW_CONNECTION_CHANNELS.NOT_READY)
+    }
   },
   onPowerResume: callback => {
     const listener = () => callback()

@@ -40,6 +40,12 @@ class FakeSocket {
   }
 }
 
+class SilentCloseSocket extends FakeSocket {
+  close(): void {
+    this.readyState = WebSocket.CLOSED
+  }
+}
+
 describe('JsonRpcGatewayClient errors', () => {
   it('preserves the numeric JSON-RPC error code on the rejected Error', async () => {
     const socket = new FakeSocket()
@@ -68,5 +74,35 @@ describe('JsonRpcGatewayClient errors', () => {
         name: 'JsonRpcGatewayError'
       })
     )
+  })
+
+  it('close synchronously marks closed and rejects pending calls even when the socket emits no close event', async () => {
+    const socket = new SilentCloseSocket()
+    const client = new JsonRpcGatewayClient({
+      socketFactory: () => socket as unknown as WebSocket
+    })
+    const connecting = client.connect('ws://gateway.test')
+    socket.open()
+    await connecting
+    const pending = client.request('session.send', { text: 'hello' })
+
+    client.close()
+
+    expect(client.connectionState).toBe('closed')
+    await expect(pending).rejects.toThrow('WebSocket closed')
+  })
+
+  it('close rejects an in-flight connect even when the socket close is silent', async () => {
+    const socket = new SilentCloseSocket()
+    const client = new JsonRpcGatewayClient({
+      connectTimeoutMs: 0,
+      socketFactory: () => socket as unknown as WebSocket
+    })
+    const connecting = client.connect('ws://gateway.test')
+
+    client.close()
+
+    expect(client.connectionState).toBe('closed')
+    await expect(connecting).rejects.toThrow('WebSocket closed')
   })
 })

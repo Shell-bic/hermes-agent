@@ -22,10 +22,11 @@ function child(pid) {
   return value
 }
 
-function createHarness({ alive = new Set(), stopCalls = [] } = {}) {
+function createHarness({ alive = new Set(), connectionResources = new Set(), stopCalls = [] } = {}) {
   const owned = new Map()
   let lifecycle
   const ownership = createEnterpriseBackendOwnership({
+    clearConnectionResources: () => connectionResources.clear(),
     clearOwnedProcess: owner => owned.delete(owner.key),
     forceStopTree: async process => stopCalls.push(`force:${process.pid}`),
     getLifecycle: () => lifecycle,
@@ -33,13 +34,14 @@ function createHarness({ alive = new Set(), stopCalls = [] } = {}) {
     isManaged: () => true,
     listOwnedProcesses: () => [...owned.values()],
     probeProcessTree: async process => alive.has(process.pid),
+    verifyConnectionResourcesGone: () => connectionResources.size === 0,
     waitForExit: async process => stopCalls.push(`wait:${process.pid}`)
   })
   lifecycle = createEnterpriseManagedLifecycle({
     hasSession: true,
     effects: ownership.lifecycleEffects
   })
-  return { lifecycle, owned, ownership }
+  return { connectionResources, lifecycle, owned, ownership }
 }
 
 test('pending start is aborted and cleanup waits for its guarded await to settle', async () => {
@@ -134,4 +136,126 @@ test('terminal cleanup probes after force kill and stop_failed blocks spawn unti
   await lifecycle.retryStop({ terminalState: 'blocked', reasonCode: 'policy_denied' })
   assert.equal(lifecycle.getSnapshot().state, 'blocked')
   assert.equal(owned.has('primary'), false)
+})
+
+test('abort-aware start await lets revoke reach child stop even when readiness never resolves', async () => {
+  const alive = new Set([404])
+  const owned = new Map()
+  const stopCalls = []
+  let lifecycle
+  const ownership = createEnterpriseBackendOwnership({
+    clearOwnedProcess: owner => owned.delete(owner.key),
+    forceStopTree: async process => {
+      stopCalls.push(`force:${process.pid}`)
+      alive.delete(process.pid)
+    },
+    getLifecycle: () => lifecycle,
+    gracefulStop: async process => stopCalls.push(`graceful:${process.pid}`),
+    isManaged: () => true,
+    listOwnedProcesses: () => [...owned.values()],
+    probeProcessTree: async process => alive.has(process.pid),
+    waitForExit: async process => stopCalls.push(`wait:${process.pid}`)
+  })
+  lifecycle = createEnterpriseManagedLifecycle({ hasSession: true, effects: ownership.lifecycleEffects })
+  const ticket = ownership.beginStart({ key: 'primary', recovery: true })
+  owned.set('primary', { key: 'primary', process: child(404) })
+  const never = new Promise(() => {})
+  const start = ownership.awaitCheckpoint(ticket, () => never)
+  ownership.trackStart(ticket, start)
+
+  const revoke = lifecycle.revoke({ reasonCode: 'policy_denied', terminalState: 'blocked' })
+  await assert.rejects(start, error => error.code === 'enterprise_backend_start_aborted')
+  await revoke
+
+  assert.equal(lifecycle.getSnapshot().state, 'blocked')
+  assert.deepEqual(stopCalls, ['graceful:404', 'wait:404', 'force:404', 'wait:404'])
+  assert.equal(owned.size, 0)
+})
+
+test('revoke clears remote primary, remote pool, and pending descriptors before a fresh recovery', async () => {
+  const connectionResources = new Set(['remote-primary', 'remote-pool:finance'])
+  const { lifecycle, ownership } = createHarness({ connectionResources })
+  const pending = ownership.beginStart({ key: 'pool:local-pending', recovery: true })
+  const gate = deferred()
+  const start = ownership.awaitCheckpoint(pending, () => gate.promise)
+  ownership.trackStart(pending, start)
+
+  const revoke = lifecycle.revoke({ reasonCode: 'policy_denied', terminalState: 'blocked' })
+  await assert.rejects(start, error => error.code === 'enterprise_backend_start_aborted')
+  await revoke
+  assert.equal(connectionResources.size, 0)
+  assert.equal(lifecycle.getSnapshot().state, 'blocked')
+
+  lifecycle.beginRecovery({ reasonCode: 'explicit_login' })
+  const fresh = ownership.beginStart({ key: 'primary', recovery: true })
+  assert.notEqual(fresh, pending)
+  ownership.finishStart(fresh)
+})
+
+test('retryStop retains a pool survivor after connection registries were cleared', async () => {
+  const alive = new Set([501, 502])
+  const owned = new Map([
+    ['primary', { key: 'primary', process: child(501) }],
+    ['pool:finance', { key: 'pool:finance', process: child(502) }]
+  ])
+  let lifecycle
+  let retryCanKillPool = false
+  const ownership = createEnterpriseBackendOwnership({
+    clearConnectionResources: () => owned.delete('pool:finance'),
+    clearOwnedProcess: owner => owned.delete(owner.key),
+    forceStopTree: async process => {
+      if (process.pid === 501 || retryCanKillPool) alive.delete(process.pid)
+    },
+    getLifecycle: () => lifecycle,
+    gracefulStop: async () => {},
+    isManaged: () => true,
+    listOwnedProcesses: () => [...owned.values()],
+    probeProcessTree: async process => alive.has(process.pid),
+    verifyConnectionResourcesGone: () => true,
+    waitForExit: async () => {}
+  })
+  lifecycle = createEnterpriseManagedLifecycle({ hasSession: true, effects: ownership.lifecycleEffects })
+  lifecycle.markRunning()
+
+  await lifecycle.revoke({ reasonCode: 'policy_denied', terminalState: 'blocked' })
+  assert.equal(lifecycle.getSnapshot().state, 'stop_failed')
+  assert.deepEqual([...alive], [502])
+
+  retryCanKillPool = true
+  await lifecycle.retryStop({ reasonCode: 'policy_denied', terminalState: 'blocked' })
+  assert.equal(lifecycle.getSnapshot().state, 'blocked')
+  assert.equal(alive.size, 0)
+})
+
+test('cancel before the guarded microtask prevents the next start stage from being invoked', async () => {
+  const { ownership } = createHarness()
+  const ticket = ownership.beginStart({ key: 'primary', recovery: true })
+  let stageCalls = 0
+  const stage = ownership.awaitCheckpoint(ticket, async () => {
+    stageCalls += 1
+  })
+  const cancel = ownership.cancelStart(ticket)
+
+  await assert.rejects(stage, error => error.code === 'enterprise_backend_start_aborted')
+  await cancel
+  assert.equal(stageCalls, 0)
+})
+
+test('process identity mismatch is treated as the owned instance already gone and never force-kills a reused PID', async () => {
+  const stopCalls = []
+  const ownedProcess = child(404)
+  const owner = { key: 'primary', process: ownedProcess, processIdentity: 'instance-old' }
+  const ownership = createEnterpriseBackendOwnership({
+    clearOwnedProcess: () => {},
+    forceStopTree: async () => stopCalls.push('force'),
+    gracefulStop: async () => stopCalls.push('graceful'),
+    listOwnedProcesses: () => [owner],
+    probeProcessTree: async (_process, identity) => identity === 'instance-current',
+    waitForExit: async () => stopCalls.push('wait')
+  })
+
+  await ownership.stopOwnedProcesses()
+
+  assert.deepEqual(stopCalls, [])
+  assert.equal(await ownership.verifyResourcesGone(), true)
 })

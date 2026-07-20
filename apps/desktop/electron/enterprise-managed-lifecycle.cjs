@@ -16,6 +16,7 @@ const LIFECYCLE_ERROR_CODES = Object.freeze({
 })
 
 const TERMINAL_STATES = new Set(['blocked', 'unauthenticated'])
+const RECOVERY_EFFECTS = new Set(['ensureBackend', 'gatewayWsUrl', 'spawn'])
 const LEGAL_TRANSITIONS = Object.freeze({
   unauthenticated: new Set(['recovering']),
   recovering: new Set(['running', 'revoking']),
@@ -124,8 +125,8 @@ function createEnterpriseManagedLifecycle(options = {}) {
   }
 
   function guardEffect(_effectName, lease, guardOptions = {}) {
-    const recoverySpawn = guardOptions.recovery === true && _effectName === 'spawn'
-    const allowedState = recoverySpawn ? state === 'recovering' : state === 'running'
+    const recoveryAllowed = guardOptions.recovery === true && RECOVERY_EFFECTS.has(_effectName)
+    const allowedState = state === 'running' || (recoveryAllowed && state === 'recovering')
     if (!allowedState || !isLeaseCurrent(lease)) {
       throw new EnterpriseLifecycleError(LIFECYCLE_ERROR_CODES.EFFECT_DENIED, state)
     }

@@ -183,6 +183,14 @@ test('cleanup failure enters stop_failed and retryStop requires verified absence
   assert.equal(lifecycle.getSnapshot().state, 'blocked')
   lifecycle.beginRecovery()
   lifecycle.guardEffect('spawn', lifecycle.acquireLease(), { recovery: true })
+  assert.throws(
+    () => lifecycle.guardEffect('skillInstall', lifecycle.acquireLease(), { recovery: true }),
+    error => error.code === LIFECYCLE_ERROR_CODES.EFFECT_DENIED
+  )
+  assert.throws(
+    () => lifecycle.guardIpc('hermes:api', lifecycle.acquireLease()),
+    error => error.code === LIFECYCLE_ERROR_CODES.IPC_DENIED
+  )
 })
 
 test('published state is sanitized, epoch-monotonic, and never exposes Error or secret material', async () => {

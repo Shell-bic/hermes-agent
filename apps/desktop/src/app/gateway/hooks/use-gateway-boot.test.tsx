@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { translateNow } from '@/i18n'
 import { $desktopBoot } from '@/store/boot'
+import { beginGatewayRuntime, ensureGatewayForProfile } from '@/store/gateway'
 import { $gatewayState } from '@/store/session'
 
 import { useGatewayBoot } from './use-gateway-boot'
@@ -84,8 +85,18 @@ function fakeDesktop(authMode: 'oauth' | 'token' = 'token') {
     wsUrl: 'wss://vps.example.com/api/ws?token=t'
   }
 
+  let runtimeRevokeCallback: (() => Promise<void> | void) | null = null
+
   return {
-    getConnection: vi.fn(async () => conn),
+    enterprise: {
+      lifecycleStatus: vi.fn(async () => ({
+        authEpoch: 0,
+        lifecycleEpoch: 0,
+        reasonCode: 'ready',
+        state: 'running' as 'blocked' | 'recovering' | 'revoking' | 'running' | 'stop_failed' | 'unauthenticated'
+      }))
+    },
+    getConnection: vi.fn(async (_profile?: string | null) => conn),
     getGatewayWsUrl: vi.fn(async () => conn.wsUrl),
     getBootProgress: vi.fn(async () => ({
       error: null,
@@ -98,10 +109,17 @@ function fakeDesktop(authMode: 'oauth' | 'token' = 'token') {
     })),
     onBootProgress: vi.fn(() => () => undefined),
     onBackendExit: vi.fn(() => () => undefined),
+    onEnterpriseRuntimeRevoked: vi.fn((callback: () => Promise<void> | void) => {
+      runtimeRevokeCallback = callback
+      return () => {
+        runtimeRevokeCallback = null
+      }
+    }),
     onPowerResume: vi.fn(() => () => undefined),
     onWindowStateChanged: vi.fn(() => () => undefined),
     touchBackend: vi.fn(async () => undefined),
-    profile: { get: vi.fn(async () => ({ profile: 'default' })) }
+    profile: { get: vi.fn(async () => ({ profile: 'default' })) },
+    revokeRuntime: async () => runtimeRevokeCallback?.()
   }
 }
 
@@ -310,5 +328,125 @@ describe('useGatewayBoot remote reconnect loop (real hook, fake socket)', () => 
     expect($desktopBoot.get().error).toBe(translateNow('boot.errors.gatewaySignInRequired'))
     expect($desktopBoot.get().error).not.toContain('gateway.example.com')
     expect($desktopBoot.get().error).not.toContain('do-not-render')
+  })
+
+  it('enterprise revoke closes the window socket and permanently suppresses reconnect timers', async () => {
+    const desktop = fakeDesktop()
+
+    ;(window as { hermesDesktop?: unknown }).hermesDesktop = desktop
+    render(<Harness />)
+    await flushAsync()
+    expect($gatewayState.get()).toBe('open')
+    expect(FakeWebSocket.instances).toHaveLength(1)
+
+    await act(async () => {
+      await desktop.revokeRuntime()
+    })
+    expect($gatewayState.get()).toBe('closed')
+
+    window.dispatchEvent(new Event('online'))
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(120_000)
+    })
+    expect(FakeWebSocket.instances).toHaveLength(1)
+    expect(desktop.touchBackend).not.toHaveBeenCalled()
+  })
+
+  it('terminal lifecycle status blocks an unmount/remount and late secondary from issuing connection IPC', async () => {
+    const desktop = fakeDesktop()
+
+    ;(window as { hermesDesktop?: unknown }).hermesDesktop = desktop
+    const mounted = render(<Harness />)
+    await flushAsync()
+    expect(desktop.getConnection).toHaveBeenCalledTimes(1)
+    await act(async () => {
+      await desktop.revokeRuntime()
+    })
+    mounted.unmount()
+
+    desktop.enterprise.lifecycleStatus.mockResolvedValue({
+      authEpoch: 1,
+      lifecycleEpoch: 1,
+      reasonCode: 'policy_denied',
+      state: 'blocked'
+    })
+    render(<Harness />)
+    await flushAsync()
+    await ensureGatewayForProfile('finance')
+
+    expect(desktop.getConnection).toHaveBeenCalledTimes(1)
+    expect(FakeWebSocket.instances).toHaveLength(1)
+  })
+
+  it('revoke during a primary connection handshake closes it and does not schedule another socket', async () => {
+    const desktop = fakeDesktop()
+
+    ;(window as { hermesDesktop?: unknown }).hermesDesktop = desktop
+    render(<Harness />)
+    await act(async () => {
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+    expect(FakeWebSocket.instances).toHaveLength(1)
+    await act(async () => {
+      await desktop.revokeRuntime()
+      await vi.advanceTimersByTimeAsync(120_000)
+    })
+
+    expect($gatewayState.get()).toBe('closed')
+    expect(FakeWebSocket.instances).toHaveLength(1)
+  })
+
+  it('disabled renderer still registers the revoke closure and acknowledges residual teardown', async () => {
+    const desktop = fakeDesktop()
+
+    ;(window as { hermesDesktop?: unknown }).hermesDesktop = desktop
+    render(<DisabledHarness />)
+    expect(desktop.onEnterpriseRuntimeRevoked).toHaveBeenCalledTimes(1)
+    await act(async () => {
+      await desktop.revokeRuntime()
+    })
+    expect($gatewayState.get()).toBe('closed')
+    expect(desktop.getConnection).not.toHaveBeenCalled()
+  })
+
+  it('old deferred secondary work cannot connect or touch after revoke and authoritative new generation', async () => {
+    const desktop = fakeDesktop()
+
+    ;(window as { hermesDesktop?: unknown }).hermesDesktop = desktop
+    render(<Harness />)
+    await flushAsync()
+    let resolveFinance: (value: Awaited<ReturnType<typeof desktop.getConnection>>) => void = () => undefined
+    desktop.getConnection.mockImplementation(profile => {
+      if (profile !== 'finance') {
+        return Promise.resolve({
+          authMode: 'token',
+          baseUrl: 'https://vps.example.com',
+          profile: 'default',
+          token: 't',
+          wsUrl: 'wss://vps.example.com/api/ws?token=t'
+        })
+      }
+      return new Promise(resolve => {
+        resolveFinance = resolve
+      })
+    })
+    const oldOpen = ensureGatewayForProfile('finance')
+    await act(async () => {
+      await Promise.resolve()
+    })
+    await desktop.revokeRuntime()
+    beginGatewayRuntime()
+    resolveFinance({
+      authMode: 'token',
+      baseUrl: 'https://finance.example.com',
+      profile: 'finance',
+      token: 'finance-token',
+      wsUrl: 'wss://finance.example.com/api/ws?token=finance-token'
+    })
+    await oldOpen
+
+    expect(FakeWebSocket.instances).toHaveLength(1)
+    expect(desktop.touchBackend).not.toHaveBeenCalled()
   })
 })

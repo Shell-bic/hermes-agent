@@ -19,6 +19,9 @@ function createEnterpriseBackendOwnership(options = {}) {
   const gracefulStop = options.gracefulStop || (async () => {})
   const forceStopTree = options.forceStopTree || (async () => {})
   const waitForExit = options.waitForExit || (async () => {})
+  const clearConnectionResources = options.clearConnectionResources || (() => {})
+  const verifyConnectionResourcesGone = options.verifyConnectionResourcesGone || (() => true)
+  const captureProcessIdentity = options.captureProcessIdentity || (process => process)
   const probeProcessTree = options.probeProcessTree || (async process => {
     return process?.exitCode === null && process?.signalCode === null && process?.killed !== true
   })
@@ -64,6 +67,34 @@ function createEnterpriseBackendOwnership(options = {}) {
       lifecycle().guardEffect('spawn', ticket.lease, { recovery: ticket.recovery })
     }
     return true
+  }
+
+  async function awaitCheckpoint(ticket, operation) {
+    checkpoint(ticket)
+    if (typeof operation !== 'function') {
+      throw new TypeError('Enterprise backend guarded awaits require a deferred operation function.')
+    }
+    let onAbort
+    const aborted = new Promise((_resolve, reject) => {
+      onAbort = () => reject(new EnterpriseBackendOwnershipError(
+        BACKEND_OWNERSHIP_ERROR_CODES.START_ABORTED,
+        'Enterprise backend start was canceled.'
+      ))
+      ticket.signal.addEventListener('abort', onAbort, { once: true })
+    })
+    try {
+      const value = await Promise.race([
+        Promise.resolve().then(() => {
+          checkpoint(ticket)
+          return operation(ticket.signal)
+        }),
+        aborted
+      ])
+      checkpoint(ticket)
+      return value
+    } finally {
+      ticket.signal.removeEventListener('abort', onAbort)
+    }
   }
 
   function finishStart(ticket) {
@@ -117,33 +148,37 @@ function createEnterpriseBackendOwnership(options = {}) {
     return owners.filter(owner => {
       const process = owner?.process
       if (!process) return false
-      const identity = Number.isInteger(process.pid) ? `pid:${process.pid}` : process
+      const identity = owner.processIdentity || captureProcessIdentity(process)
       if (seen.has(identity)) return false
       seen.add(identity)
+      owner.processIdentity = identity
       return true
     })
   }
 
   async function processIsAlive(owner) {
     try {
-      return await probeProcessTree(owner.process) === true
+      return await probeProcessTree(owner.process, owner.processIdentity) === true
     } catch {
       return true
     }
   }
 
   async function stopOwners(owners) {
-    const captured = uniqueOwners(owners)
-    lastStopOwners = captured
+    const captured = uniqueOwners([...lastStopOwners, ...owners])
 
     for (const owner of captured) {
+      if (!(await processIsAlive(owner))) {
+        clearOwnedProcess(owner, owner.process)
+        continue
+      }
       try {
-        await gracefulStop(owner.process)
+        await gracefulStop(owner.process, owner.processIdentity)
       } catch {
         // The force/probe sequence below remains authoritative.
       }
       try {
-        await waitForExit(owner.process)
+        await waitForExit(owner.process, owner.processIdentity)
       } catch {
         // Continue to the liveness probe.
       }
@@ -155,12 +190,12 @@ function createEnterpriseBackendOwnership(options = {}) {
     }
     for (const owner of stillAlive) {
       try {
-        await forceStopTree(owner.process)
+        await forceStopTree(owner.process, owner.processIdentity)
       } catch {
         // Continue to the final liveness probe.
       }
       try {
-        await waitForExit(owner.process)
+        await waitForExit(owner.process, owner.processIdentity)
       } catch {
         // Continue to the final liveness probe.
       }
@@ -171,6 +206,7 @@ function createEnterpriseBackendOwnership(options = {}) {
       if (await processIsAlive(owner)) survivors.push(owner)
       else clearOwnedProcess(owner, owner.process)
     }
+    lastStopOwners = survivors
     if (survivors.length > 0) {
       throw new EnterpriseBackendOwnershipError(
         BACKEND_OWNERSHIP_ERROR_CODES.STOP_FAILED,
@@ -180,10 +216,13 @@ function createEnterpriseBackendOwnership(options = {}) {
   }
 
   async function stopOwnedProcesses() {
-    await stopOwners(listOwnedProcesses())
+    const captured = listOwnedProcesses()
+    clearConnectionResources()
+    await stopOwners(captured)
   }
 
   async function verifyResourcesGone() {
+    if (pendingStarts.size > 0 || await verifyConnectionResourcesGone() !== true) return false
     const owners = uniqueOwners([...listOwnedProcesses(), ...lastStopOwners])
     for (const owner of owners) {
       if (await processIsAlive(owner)) return false
@@ -193,6 +232,7 @@ function createEnterpriseBackendOwnership(options = {}) {
 
   return Object.freeze({
     beginStart,
+    awaitCheckpoint,
     bindChild,
     cancelPendingStarts,
     cancelStart,

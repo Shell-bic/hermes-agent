@@ -40,6 +40,12 @@ declare global {
         login: (payload: EnterpriseDesktopLoginInput) => Promise<EnterpriseDesktopState>
         loginMethods: () => Promise<EnterpriseLoginState>
         loginState: () => Promise<EnterpriseLoginState>
+        lifecycleStatus: () => Promise<{
+          authEpoch: number
+          lifecycleEpoch: number
+          reasonCode: string
+          state: 'blocked' | 'recovering' | 'revoking' | 'running' | 'stop_failed' | 'unauthenticated'
+        }>
         logout: () => Promise<EnterpriseDesktopState>
         onLoginState: (callback: (state: EnterpriseLoginState) => void) => () => void
         refresh: () => Promise<EnterpriseDesktopState>
@@ -116,6 +122,9 @@ declare global {
       onNotificationAction?: (callback: (payload: { actionId: string; sessionId?: string }) => void) => () => void
       onPreviewFileChanged: (callback: (payload: HermesPreviewFileChanged) => void) => () => void
       onBackendExit: (callback: (payload: BackendExit) => void) => () => void
+      onEnterpriseRuntimeRevoked?: (
+        callback: (payload: { reasonCode: string; revocationId: number }) => Promise<void> | void
+      ) => () => void
       onPowerResume?: (callback: () => void) => () => void
       onBootProgress: (callback: (payload: DesktopBootProgress) => void) => () => void
       getBootstrapState: () => Promise<DesktopBootstrapState>

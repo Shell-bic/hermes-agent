@@ -39,6 +39,17 @@ export function configureGatewayRegistry(cfg: RegistryConfig): void {
 // ── Primary (window) backend ───────────────────────────────────────────────
 let primaryGateway: HermesGateway | null = null
 let primaryProfile = 'default'
+let runtimeGeneration = 0
+let runtimeRevoked = true
+
+export function beginGatewayRuntime(): void {
+  runtimeGeneration += 1
+  runtimeRevoked = false
+}
+
+function runtimeCurrent(generation: number): boolean {
+  return !runtimeRevoked && generation === runtimeGeneration
+}
 
 export function setPrimaryGateway(gateway: HermesGateway | null, profile = 'default'): void {
   primaryGateway = gateway
@@ -104,6 +115,10 @@ function clearTimer(entry: Secondary): void {
 }
 
 async function openSecondary(entry: Secondary): Promise<void> {
+  if (runtimeRevoked) {
+    return
+  }
+  const generation = runtimeGeneration
   const desktop = window.hermesDesktop
 
   if (!desktop) {
@@ -111,13 +126,25 @@ async function openSecondary(entry: Secondary): Promise<void> {
   }
 
   const conn = await desktop.getConnection(entry.profile)
+  if (!runtimeCurrent(generation)) {
+    entry.gateway.close()
+    return
+  }
   const wsUrl = await resolveGatewayWsUrl(desktop, conn)
+  if (!runtimeCurrent(generation)) {
+    entry.gateway.close()
+    return
+  }
   await entry.gateway.connect(wsUrl)
+  if (!runtimeCurrent(generation)) {
+    entry.gateway.close()
+    return
+  }
   void desktop.touchBackend?.(entry.profile).catch(() => undefined)
 }
 
 function scheduleReconnect(entry: Secondary): void {
-  if (entry.reconnecting || entry.reconnectTimer !== null || !entry.wantOpen) {
+  if (runtimeRevoked || entry.reconnecting || entry.reconnectTimer !== null || !entry.wantOpen) {
     return
   }
 
@@ -131,7 +158,7 @@ function scheduleReconnect(entry: Secondary): void {
 }
 
 async function reconnectSecondary(entry: Secondary): Promise<void> {
-  if (entry.reconnecting || !entry.wantOpen || isOpen(entry.gateway)) {
+  if (runtimeRevoked || entry.reconnecting || !entry.wantOpen || isOpen(entry.gateway)) {
     return
   }
 
@@ -185,6 +212,9 @@ function createSecondary(profile: string): Secondary {
 // Make `profile` the active gateway, lazily opening its socket if needed. The
 // primary is a no-op fast path. Background sockets are never closed here.
 export async function ensureGatewayForProfile(profile: string): Promise<void> {
+  if (runtimeRevoked) {
+    return
+  }
   const key = normKey(profile)
 
   if (key === primaryProfile) {
@@ -218,6 +248,9 @@ export async function ensureGatewayForProfile(profile: string): Promise<void> {
 // Reconnect the active gateway after a transient request failure. Primary
 // reconnects are owned by use-gateway-boot, so we only drive secondaries here.
 export async function ensureActiveGatewayOpen(): Promise<HermesGateway | null> {
+  if (runtimeRevoked) {
+    return null
+  }
   if (activeKey === primaryProfile) {
     return primaryGateway
   }
@@ -237,6 +270,9 @@ export async function ensureActiveGatewayOpen(): Promise<HermesGateway | null> {
 
 // Wake signal (sleep/network/visibility): nudge every live secondary back open.
 export function reconnectSecondaryGateways(): void {
+  if (runtimeRevoked) {
+    return
+  }
   for (const entry of secondaries.values()) {
     if (!entry.wantOpen || isOpen(entry.gateway)) {
       continue
@@ -251,6 +287,9 @@ export function reconnectSecondaryGateways(): void {
 // Keep the idle reaper from killing a backend we still need: ping every live
 // secondary. The active one is pinged separately (touchActiveGatewayBackend).
 export function touchSecondaryGateways(): void {
+  if (runtimeRevoked) {
+    return
+  }
   const desktop = window.hermesDesktop
 
   for (const entry of secondaries.values()) {
@@ -287,4 +326,14 @@ export function closeSecondaryGateways(): void {
   }
 
   secondaries.clear()
+}
+
+export function revokeGatewayRuntime(): void {
+  runtimeGeneration += 1
+  runtimeRevoked = true
+  closeSecondaryGateways()
+  primaryGateway?.close()
+  primaryGateway = null
+  $gateway.set(null)
+  setGatewayState('closed')
 }

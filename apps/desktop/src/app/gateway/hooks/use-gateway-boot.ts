@@ -14,12 +14,13 @@ import {
 } from '@/store/boot'
 import {
   $gateway,
-  closeSecondaryGateways,
+  beginGatewayRuntime,
   configureGatewayRegistry,
   ensureGatewayForProfile,
   pruneSecondaryGateways,
   reconnectSecondaryGateways,
   reportPrimaryGatewayState,
+  revokeGatewayRuntime,
   setPrimaryGateway,
   touchSecondaryGateways
 } from '@/store/gateway'
@@ -79,14 +80,10 @@ export function useGatewayBoot({
 
   useEffect(() => {
     let cancelled = false
+    let runtimeRevoked = true
+    let runtimeRevokeObserved = false
+    let keepaliveTimer: ReturnType<typeof setInterval> | null = null
     const desktop = window.hermesDesktop
-
-    if (!enabled) {
-      completeDesktopBoot('Waiting for enterprise sign-in')
-      setSessionsLoading(false)
-
-      return () => void (cancelled = true)
-    }
 
     const publish = (next: HermesConnection | null) => {
       callbacksRef.current.onConnectionReady(next)
@@ -98,6 +95,25 @@ export function useGatewayBoot({
       setSessionsLoading(false)
 
       return () => void (cancelled = true)
+    }
+
+    if (!enabled) {
+      const offEnterpriseRuntimeRevoked = desktop.onEnterpriseRuntimeRevoked?.(() => {
+        runtimeRevokeObserved = true
+        revokeGatewayRuntime()
+        publish(null)
+        callbacksRef.current.onGatewayReady(null)
+      })
+      completeDesktopBoot('Waiting for enterprise sign-in')
+      setSessionsLoading(false)
+
+      return () => {
+        cancelled = true
+        offEnterpriseRuntimeRevoked?.()
+        revokeGatewayRuntime()
+        publish(null)
+        callbacksRef.current.onGatewayReady(null)
+      }
     }
 
     // --- Reconnect-after-sleep machinery -------------------------------------
@@ -132,7 +148,7 @@ export function useGatewayBoot({
     }
 
     const attemptReconnect = async () => {
-      if (cancelled || reconnecting || gatewayOpen()) {
+      if (cancelled || runtimeRevoked || reconnecting || gatewayOpen()) {
         return
       }
 
@@ -148,7 +164,7 @@ export function useGatewayBoot({
 
         const conn = await desktop.getConnection($activeGatewayProfile.get())
 
-        if (cancelled) {
+        if (cancelled || runtimeRevoked) {
           return
         }
 
@@ -163,7 +179,8 @@ export function useGatewayBoot({
         const wsUrl = await resolveGatewayWsUrl(desktop, conn)
         await gateway.connect(wsUrl)
 
-        if (cancelled) {
+        if (cancelled || runtimeRevoked) {
+          gateway.close()
           return
         }
 
@@ -180,12 +197,12 @@ export function useGatewayBoot({
         // backoff in the finally block below.
         const reauthRequired = isGatewayReauthRequired(err)
 
-        if (!cancelled && reauthRequired && !reauthNotified) {
+        if (!cancelled && !runtimeRevoked && reauthRequired && !reauthNotified) {
           reauthNotified = true
           notifyError(err, translateNow('boot.errors.gatewaySignInRequired'))
         }
 
-        if (!cancelled && bootCompleted) {
+        if (!cancelled && !runtimeRevoked && bootCompleted) {
           reconnectFailureCount += 1
 
           if (!reconnectFailureSurfaced && reconnectFailureCount >= POST_BOOT_RECONNECT_FAILURE_THRESHOLD) {
@@ -198,14 +215,14 @@ export function useGatewayBoot({
       } finally {
         reconnecting = false
 
-        if (!cancelled && !gatewayOpen()) {
+        if (!cancelled && !runtimeRevoked && !gatewayOpen()) {
           scheduleReconnect()
         }
       }
     }
 
     function scheduleReconnect() {
-      if (cancelled || reconnecting || reconnectTimer !== null || gatewayOpen()) {
+      if (cancelled || runtimeRevoked || reconnecting || reconnectTimer !== null || gatewayOpen()) {
         return
       }
 
@@ -219,7 +236,7 @@ export function useGatewayBoot({
     }
 
     const reconnectNow = () => {
-      if (cancelled || !bootCompleted) {
+      if (cancelled || runtimeRevoked || !bootCompleted) {
         return
       }
 
@@ -250,6 +267,20 @@ export function useGatewayBoot({
     // Secondary (background-profile) sockets funnel into the same handler.
     configureGatewayRegistry({ onEvent: event => callbacksRef.current.handleGatewayEvent(event) })
 
+    const offEnterpriseRuntimeRevoked = desktop.onEnterpriseRuntimeRevoked?.(() => {
+      runtimeRevokeObserved = true
+      runtimeRevoked = true
+      bootCompleted = false
+      clearReconnectTimer()
+      if (keepaliveTimer !== null) {
+        clearInterval(keepaliveTimer)
+        keepaliveTimer = null
+      }
+      revokeGatewayRuntime()
+      publish(null)
+      callbacksRef.current.onGatewayReady(null)
+    })
+
     const offState = gateway.onState(st => {
       // Mirror to the composer only while the primary is the active profile —
       // a background secondary reconnect mustn't flip the foreground state.
@@ -270,7 +301,7 @@ export function useGatewayBoot({
         if (bootCompleted) {
           completeDesktopBoot()
         }
-      } else if (bootCompleted && (st === 'closed' || st === 'error')) {
+      } else if (!runtimeRevoked && bootCompleted && (st === 'closed' || st === 'error')) {
         // The socket dropped after a healthy boot (typically sleep/wake). Try
         // to bring it back instead of leaving the composer stuck disabled.
         scheduleReconnect()
@@ -296,7 +327,10 @@ export function useGatewayBoot({
 
     // Keep live pool backends alive while this window is open (the main process
     // can't observe the direct renderer↔backend WS). No-op for the primary.
-    const keepaliveTimer = setInterval(() => {
+    keepaliveTimer = setInterval(() => {
+      if (runtimeRevoked || cancelled) {
+        return
+      }
       touchActiveGatewayBackend()
       touchSecondaryGateways()
     }, 60_000)
@@ -347,7 +381,7 @@ export function useGatewayBoot({
       try {
         const conn = await desktop.getConnection()
 
-        if (cancelled) {
+        if (cancelled || runtimeRevoked) {
           return
         }
 
@@ -363,9 +397,13 @@ export function useGatewayBoot({
         // failure, throws a reauth error rather than connecting with a dead
         // ticket (which would surface as an opaque "connection closed").
         const wsUrl = await resolveGatewayWsUrl(desktop, conn)
+        if (cancelled || runtimeRevoked) {
+          return
+        }
         await gateway.connect(wsUrl)
 
-        if (cancelled) {
+        if (cancelled || runtimeRevoked) {
+          gateway.close()
           return
         }
 
@@ -397,7 +435,7 @@ export function useGatewayBoot({
 
         await callbacksRef.current.refreshHermesConfig()
 
-        if (cancelled) {
+        if (cancelled || runtimeRevoked) {
           return
         }
 
@@ -410,7 +448,7 @@ export function useGatewayBoot({
         completeDesktopBoot()
         bootCompleted = true
       } catch (err) {
-        if (!cancelled) {
+        if (!cancelled && !runtimeRevoked) {
           const message = err instanceof Error ? err.message : String(err)
           failDesktopBoot(message)
           notifyError(err, translateNow('boot.errors.desktopBootFailed'))
@@ -419,12 +457,38 @@ export function useGatewayBoot({
       }
     }
 
-    void boot()
+    async function initializeRuntime() {
+      try {
+        const lifecycle = await desktop.enterprise.lifecycleStatus()
+        if (cancelled || runtimeRevokeObserved) {
+          return
+        }
+        if (lifecycle.state !== 'running' && lifecycle.state !== 'recovering') {
+          revokeGatewayRuntime()
+          publish(null)
+          callbacksRef.current.onGatewayReady(null)
+          return
+        }
+        beginGatewayRuntime()
+        runtimeRevoked = false
+        await boot()
+      } catch (error) {
+        if (!cancelled && !runtimeRevokeObserved) {
+          const message = error instanceof Error ? error.message : String(error)
+          failDesktopBoot(message)
+          setSessionsLoading(false)
+        }
+      }
+    }
+
+    void initializeRuntime()
 
     return () => {
       cancelled = true
       clearReconnectTimer()
-      clearInterval(keepaliveTimer)
+      if (keepaliveTimer !== null) {
+        clearInterval(keepaliveTimer)
+      }
       offWorking()
       offAttention()
       offActiveProfile()
@@ -434,10 +498,10 @@ export function useGatewayBoot({
       offState()
       offEvent()
       offExit()
+      offEnterpriseRuntimeRevoked?.()
       offWindowState?.()
       offBootProgress()
-      closeSecondaryGateways()
-      gateway.close()
+      revokeGatewayRuntime()
       publish(null)
       callbacksRef.current.onGatewayReady(null)
       setPrimaryGateway(null)

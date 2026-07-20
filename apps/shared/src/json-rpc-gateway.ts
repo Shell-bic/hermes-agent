@@ -79,6 +79,7 @@ export class JsonRpcGatewayClient {
   private pending = new Map<GatewayRequestId, PendingCall>()
   private socket: WebSocketLike | null = null
   private state: ConnectionState = 'idle'
+  private cancelConnect: (() => void) | null = null
   private readonly eventHandlers = new Map<string, Set<(event: GatewayEvent) => void>>()
   private readonly stateHandlers = new Set<(state: ConnectionState) => void>()
   private readonly options: Required<Omit<GatewayClientOptions, 'socketFactory'>> &
@@ -133,6 +134,7 @@ export class JsonRpcGatewayClient {
     await new Promise<void>((resolve, reject) => {
       let settled = false
       let timer: ReturnType<typeof setTimeout> | undefined
+      let cancelConnect: () => void
 
       const cleanup = () => {
         if (timer !== undefined) {
@@ -141,6 +143,7 @@ export class JsonRpcGatewayClient {
 
         socket.removeEventListener('open', onOpen)
         socket.removeEventListener('error', onError)
+        if (this.cancelConnect === cancelConnect) this.cancelConnect = null
       }
 
       const onOpen = () => {
@@ -164,6 +167,14 @@ export class JsonRpcGatewayClient {
         this.setState('error')
         reject(new Error(this.options.connectErrorMessage))
       }
+
+      cancelConnect = () => {
+        if (settled) return
+        settled = true
+        cleanup()
+        reject(new Error(this.options.closedErrorMessage))
+      }
+      this.cancelConnect = cancelConnect
 
       socket.addEventListener('open', onOpen, { once: true })
       socket.addEventListener('error', onError, { once: true })
@@ -195,8 +206,16 @@ export class JsonRpcGatewayClient {
   }
 
   close(): void {
-    this.socket?.close()
+    const socket = this.socket
     this.socket = null
+    this.cancelConnect?.()
+    this.cancelConnect = null
+    try {
+      socket?.close()
+    } finally {
+      this.setState('closed')
+      this.rejectAllPending(new Error(this.options.closedErrorMessage))
+    }
   }
 
   on<P = unknown>(type: GatewayEventName, handler: (event: GatewayEvent<P>) => void): () => void {

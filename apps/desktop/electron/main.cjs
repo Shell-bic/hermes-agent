@@ -101,6 +101,8 @@ const {
 } = require('./enterprise-managed-profile.cjs')
 const { createEnterpriseSkillHub, publicError: publicEnterpriseSkillHubError } = require('./enterprise-skill-hub.cjs')
 const { createEnterpriseManagedLifecycle } = require('./enterprise-managed-lifecycle.cjs')
+const { createEnterpriseRuntimeAccess } = require('./enterprise-runtime-access.cjs')
+const { createEnterpriseWindowConnections } = require('./enterprise-window-connections.cjs')
 const { isTrustedRendererUrl } = require('./renderer-trust.cjs')
 const { createEnterpriseWeComController } = require('./enterprise-wecom-controller.cjs')
 const { createEnterpriseWeComView } = require('./enterprise-wecom-view.cjs')
@@ -935,6 +937,7 @@ const enterpriseWeComController = createEnterpriseWeComController({
 let enterpriseQuitCleanupPromise = null
 let enterpriseQuitReady = false
 let hermesProcess = null
+let hermesProcessIdentity = null
 let connectionPromise = null
 let primaryStartTicket = null
 // Additional per-profile backends, keyed by profile name. The PRIMARY backend
@@ -945,18 +948,34 @@ let primaryStartTicket = null
 // byte-for-byte the single-backend behavior.
 const backendPool = new Map() // profile -> { process, port, token, connectionPromise, lastActiveAt }
 const enterpriseBackendOwnership = createEnterpriseBackendOwnership({
+  clearConnectionResources: () => {
+    primaryStartTicket = null
+    connectionPromise = null
+    backendPool.clear()
+    if (poolIdleReaper) clearInterval(poolIdleReaper)
+    poolIdleReaper = null
+  },
   clearOwnedProcess: (owner, capturedProcess) => {
     if (owner.key === 'primary') {
-      if (hermesProcess === capturedProcess) hermesProcess = null
+      if (hermesProcess === capturedProcess) {
+        hermesProcess = null
+        hermesProcessIdentity = null
+      }
       return
     }
     const profile = owner.key.slice('pool:'.length)
     const current = backendPool.get(profile)
-    if (current === owner.entry && current?.process === capturedProcess) {
+    const ownedCurrent = current === owner.entry && current?.process === capturedProcess
+    if (owner.entry?.process === capturedProcess) {
+      owner.entry.process = null
+      owner.entry.processIdentity = null
+    }
+    if (ownedCurrent) {
       backendPool.delete(profile)
     }
   },
-  forceStopTree: async child => {
+  forceStopTree: async (child, identity) => {
+    if (backendProcessIdentityMatches(child, identity) !== true) return
     if (IS_WINDOWS && Number.isInteger(child?.pid)) {
       forceKillProcessTree(child.pid)
     } else if (child && child.exitCode === null && child.signalCode === null) {
@@ -964,7 +983,8 @@ const enterpriseBackendOwnership = createEnterpriseBackendOwnership({
     }
   },
   getLifecycle: () => enterpriseLifecycle,
-  gracefulStop: async child => {
+  gracefulStop: async (child, identity) => {
+    if (backendProcessIdentityMatches(child, identity) !== true) return
     if (child && child.exitCode === null && child.signalCode === null) {
       child.kill('SIGTERM')
     }
@@ -972,19 +992,38 @@ const enterpriseBackendOwnership = createEnterpriseBackendOwnership({
   isManaged: () => enterpriseRuntime.isEnabled(),
   listOwnedProcesses: () => {
     const owners = []
-    if (hermesProcess) owners.push({ key: 'primary', process: hermesProcess })
+    if (hermesProcess) owners.push({ key: 'primary', process: hermesProcess, processIdentity: hermesProcessIdentity })
     for (const [profile, entry] of backendPool.entries()) {
-      if (entry.process) owners.push({ entry, key: `pool:${profile}`, process: entry.process })
+      if (entry.process) {
+        owners.push({ entry, key: `pool:${profile}`, process: entry.process, processIdentity: entry.processIdentity })
+      }
     }
     return owners
   },
   probeProcessTree: probeBackendProcess,
-  waitForExit: child => waitForBackendExit(child)
+  verifyConnectionResourcesGone: () => (
+    primaryStartTicket === null &&
+    connectionPromise === null &&
+    backendPool.size === 0 &&
+    poolIdleReaper === null
+  ),
+  waitForExit: (child, identity) => waitForBackendExit(child, 5_000, identity)
+})
+const enterpriseRuntimeAccess = createEnterpriseRuntimeAccess({
+  getLifecycle: () => enterpriseLifecycle,
+  isManaged: () => enterpriseRuntime.isEnabled()
+})
+const enterpriseWindowConnections = createEnterpriseWindowConnections({
+  getWindows: () => BrowserWindow.getAllWindows(),
+  ipcMain,
+  isTrustedWindow: window => isTrustedDesktopRendererUrl(window?.webContents?.getURL?.() || '')
 })
 enterpriseLifecycle = createEnterpriseManagedLifecycle({
   effects: {
     ...enterpriseBackendOwnership.lifecycleEffects,
-    closeWindowConnections: async () => {}
+    closeWindowConnections: () => enterpriseWindowConnections.closeAll({
+      reasonCode: enterpriseLifecycle.getSnapshot().reasonCode
+    })
   },
   hasSession: !enterpriseRuntime.isEnabled() || enterpriseRuntime.hasStoredSession(),
   publish: snapshot => queueMicrotask(() => rememberLog(
@@ -4343,6 +4382,8 @@ async function mintGatewayWsTicket(baseUrl) {
 // carries a freshly-minted ticket. For local/token connections this just
 // reuses the static token (no minting needed).
 async function freshGatewayWsUrl(profile) {
+  const accessOptions = { allowRecovery: true }
+  const lease = enterpriseRuntimeAccess.acquire('gatewayWsUrl', accessOptions)
   // Mint for the requested profile's backend, NOT always the primary. The
   // renderer re-mints right before every gateway.connect(); when swapping to a
   // pooled profile we must return THAT backend's ws URL, otherwise the connect
@@ -4350,8 +4391,10 @@ async function freshGatewayWsUrl(profile) {
   // the wrong profile's DB. A null/empty profile resolves to the primary, so
   // legacy callers and single-profile users are unchanged.
   const connection = await ensureBackend(profile)
+  enterpriseRuntimeAccess.checkpoint('gatewayWsUrl', lease, accessOptions)
   if (connection.authMode === 'oauth') {
     const ticket = await mintGatewayWsTicket(connection.baseUrl)
+    enterpriseRuntimeAccess.checkpoint('gatewayWsUrl', lease, accessOptions)
     return buildGatewayWsUrlWithTicket(connection.baseUrl, ticket)
   }
   // Local/token: the cached wsUrl already carries the (long-lived) token.
@@ -4886,9 +4929,51 @@ function resetHermesConnection() {
   resetBootProgressForReconnect()
 }
 
-function probeBackendProcess(child) {
+function readBackendProcessStartMarker(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return null
+  try {
+    if (IS_WINDOWS) {
+      const script = `(Get-CimInstance Win32_Process -Filter "ProcessId = ${pid}").CreationDate.ToUniversalTime().Ticks`
+      return execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], {
+        encoding: 'utf8',
+        timeout: 2_000,
+        windowsHide: true
+      }).trim() || null
+    }
+    if (process.platform === 'linux') {
+      const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8')
+      const fields = stat.slice(stat.lastIndexOf(')') + 2).trim().split(/\s+/)
+      return fields[19] || null
+    }
+    return execFileSync('ps', ['-o', 'lstart=', '-p', String(pid)], {
+      encoding: 'utf8',
+      timeout: 2_000
+    }).trim() || null
+  } catch {
+    return null
+  }
+}
+
+function captureBackendProcessIdentity(child) {
+  return Object.freeze({
+    pid: Number(child?.pid) || null,
+    startMarker: readBackendProcessStartMarker(Number(child?.pid))
+  })
+}
+
+function backendProcessIdentityMatches(child, identity) {
+  if (!child || !identity || child.pid !== identity.pid || !identity.startMarker) return null
+  if (child.exitCode !== null || child.signalCode !== null) return false
+  const currentMarker = readBackendProcessStartMarker(child.pid)
+  if (!currentMarker) return null
+  return currentMarker === identity.startMarker
+}
+
+function probeBackendProcess(child, identity) {
   if (!child || !Number.isInteger(child.pid) || child.pid <= 0) return false
   if (child.exitCode !== null || child.signalCode !== null) return false
+  const identityMatch = backendProcessIdentityMatches(child, identity)
+  if (identityMatch !== true) return identityMatch === null
   try {
     process.kill(child.pid, 0)
     return true
@@ -4905,10 +4990,8 @@ function beginEnterpriseRecovery(reasonCode = 'enterprise_session_recovery_requi
   }
 }
 
-async function awaitOwnedBackendStart(ticket, promise) {
-  const value = await promise
-  enterpriseBackendOwnership.checkpoint(ticket)
-  return value
+async function awaitOwnedBackendStart(ticket, operation) {
+  return enterpriseBackendOwnership.awaitCheckpoint(ticket, operation)
 }
 
 async function stopBackendsForQuit() {
@@ -4948,25 +5031,30 @@ async function teardownPrimaryBackendAndWait() {
   await enterpriseBackendOwnership.cancelStart(ticket)
 
   const dying = hermesProcess
+  const dyingIdentity = hermesProcessIdentity
   connectionPromise = null
   if (dying) {
-    await enterpriseBackendOwnership.stopOwners([{ key: 'primary', process: dying }])
+    await enterpriseBackendOwnership.stopOwners([{ key: 'primary', process: dying, processIdentity: dyingIdentity }])
   }
   resetBootProgressForReconnect()
 }
 
-async function waitForBackendExit(child, timeoutMs = 5000) {
+async function waitForBackendExit(child, timeoutMs = 5000, identity = null) {
   if (!child) {
     return
   }
   if (child.exitCode !== null || child.signalCode !== null) {
     return
   }
+  if (identity && backendProcessIdentityMatches(child, identity) === false) return
 
   await new Promise(resolve => {
     const timer = setTimeout(() => {
       try {
-        if (IS_WINDOWS && Number.isInteger(child.pid)) {
+        const identityMatch = identity ? backendProcessIdentityMatches(child, identity) : true
+        if (identityMatch !== true) {
+          resolve()
+        } else if (IS_WINDOWS && Number.isInteger(child.pid)) {
           forceKillProcessTree(child.pid)
         } else {
           child.kill('SIGKILL')
@@ -4998,6 +5086,8 @@ function primaryProfileKey() {
 // mode), and any OTHER profile to a lazily-spawned pool backend. An empty /
 // unknown profile resolves to the primary, so all legacy callers are unchanged.
 async function ensureBackend(profile) {
+  const accessOptions = { allowRecovery: true }
+  const lease = enterpriseRuntimeAccess.acquire('ensureBackend', accessOptions)
   if (enterpriseAuthPending()) {
     throw enterpriseAuthRequiredError()
   }
@@ -5007,13 +5097,17 @@ async function ensureBackend(profile) {
     : (profile && String(profile).trim() ? String(profile).trim() : primaryProfileKey())
 
   if (key === primaryProfileKey()) {
-    return startHermes()
+    const connection = await startHermes()
+    enterpriseRuntimeAccess.checkpoint('ensureBackend', lease, accessOptions)
+    return connection
   }
 
   const existing = backendPool.get(key)
   if (existing) {
     existing.lastActiveAt = Date.now()
-    return existing.connectionPromise
+    const connection = await existing.connectionPromise
+    enterpriseRuntimeAccess.checkpoint('ensureBackend', lease, accessOptions)
+    return connection
   }
 
   evictLruPoolBackends(POOL_MAX_BACKENDS - 1)
@@ -5036,7 +5130,9 @@ async function ensureBackend(profile) {
   enterpriseBackendOwnership.trackStart(ticket, entry.connectionPromise)
   backendPool.set(key, entry)
   startPoolIdleReaper()
-  return entry.connectionPromise
+  const connection = await entry.connectionPromise
+  enterpriseRuntimeAccess.checkpoint('ensureBackend', lease, accessOptions)
+  return connection
 }
 
 // Mark a pool profile as recently used so the idle reaper spares it. The
@@ -5101,9 +5197,9 @@ async function spawnPoolBackend(profile, entry, ticket) {
   // remote is reachable and hand back its connection descriptor. The pool
   // entry keeps `entry.process === null`, which stopPoolBackend/evict already
   // tolerate.
-  const remote = await awaitOwnedBackendStart(ticket, resolveRemoteBackend(profile))
+  const remote = await awaitOwnedBackendStart(ticket, () => resolveRemoteBackend(profile))
   if (remote) {
-    await awaitOwnedBackendStart(ticket, waitForHermes(remote.baseUrl, remote.token))
+    await awaitOwnedBackendStart(ticket, () => waitForHermes(remote.baseUrl, remote.token))
     return {
       ...remote,
       profile,
@@ -5117,7 +5213,7 @@ async function spawnPoolBackend(profile, entry, ticket) {
   // step 3 in hermes_cli/main.py), so the child re-homes to this profile.
   // --port 0: the OS assigns an ephemeral port; the child announces it on stdout.
   const dashboardArgs = ['--profile', profile, 'dashboard', '--no-open', '--host', '127.0.0.1', '--port', '0']
-  const backend = await awaitOwnedBackendStart(ticket, ensureRuntime(resolveHermesBackend(dashboardArgs)))
+  const backend = await awaitOwnedBackendStart(ticket, () => ensureRuntime(resolveHermesBackend(dashboardArgs)))
   const hermesCwd = resolveHermesCwd()
   const webDist = resolveWebDist()
 
@@ -5148,6 +5244,7 @@ async function spawnPoolBackend(profile, entry, ticket) {
     })
   )
   entry.process = child
+  entry.processIdentity = captureBackendProcessIdentity(child)
   entry.token = token
 
   child.stdout.on('data', rememberLog)
@@ -5178,13 +5275,13 @@ async function spawnPoolBackend(profile, entry, ticket) {
   })
 
   // Discover the ephemeral port the child bound to
-  const port = await awaitOwnedBackendStart(ticket, Promise.race([waitForDashboardPort(child), startFailed]))
+  const port = await awaitOwnedBackendStart(ticket, () => Promise.race([waitForDashboardPort(child), startFailed]))
   entry.port = port
 
   const baseUrl = `http://127.0.0.1:${port}`
-  await awaitOwnedBackendStart(ticket, Promise.race([waitForHermes(baseUrl, token), startFailed]))
+  await awaitOwnedBackendStart(ticket, () => Promise.race([waitForHermes(baseUrl, token), startFailed]))
   ready = true
-  const authToken = await awaitOwnedBackendStart(ticket, adoptServedDashboardToken(baseUrl, token, {
+  const authToken = await awaitOwnedBackendStart(ticket, () => adoptServedDashboardToken(baseUrl, token, {
     childAlive: () => child.exitCode === null && !child.killed,
     label: `Hermes backend for profile "${profile}"`,
     rememberLog
@@ -5209,7 +5306,12 @@ async function stopPoolBackend(profile) {
   if (!entry) return
   await enterpriseBackendOwnership.cancelStart(entry.startTicket)
   if (entry.process) {
-    await enterpriseBackendOwnership.stopOwners([{ entry, key: `pool:${profile}`, process: entry.process }])
+    await enterpriseBackendOwnership.stopOwners([{
+      entry,
+      key: `pool:${profile}`,
+      process: entry.process,
+      processIdentity: entry.processIdentity
+    }])
   } else if (backendPool.get(profile) === entry) {
     backendPool.delete(profile)
   }
@@ -5291,29 +5393,28 @@ async function startHermes() {
   primaryStartTicket = ticket
   let ownedConnectionPromise = null
   const startOperation = (async () => {
-    await awaitOwnedBackendStart(ticket, advanceBootProgress('backend.resolve', 'Resolving Hermes backend', 8))
+    await awaitOwnedBackendStart(ticket, () => advanceBootProgress('backend.resolve', 'Resolving Hermes backend', 8))
     let enterpriseLaunch = { enabled: false }
 
     if (enterpriseManaged) {
       await awaitOwnedBackendStart(
         ticket,
-        advanceBootProgress('enterprise.runtime', 'Preparing enterprise managed runtime', 18)
+        () => advanceBootProgress('enterprise.runtime', 'Preparing enterprise managed runtime', 18)
       )
-      enterpriseLaunch = await enterpriseRuntime.prepareLaunch()
-      enterpriseBackendOwnership.checkpoint(ticket)
+      enterpriseLaunch = await awaitOwnedBackendStart(ticket, () => enterpriseRuntime.prepareLaunch())
     }
 
     // Resolve for the desktop's primary profile so a per-profile remote
     // override on the active profile is honored (falls back to env / global).
     const remote = enterpriseManaged
       ? null
-      : await awaitOwnedBackendStart(ticket, resolveRemoteBackend(primaryProfileKey()))
+      : await awaitOwnedBackendStart(ticket, () => resolveRemoteBackend(primaryProfileKey()))
     if (remote) {
       await awaitOwnedBackendStart(
         ticket,
-        advanceBootProgress('backend.remote', `Connecting to remote Hermes backend at ${remote.baseUrl}`, 24)
+        () => advanceBootProgress('backend.remote', `Connecting to remote Hermes backend at ${remote.baseUrl}`, 24)
       )
-      await awaitOwnedBackendStart(ticket, waitForHermes(remote.baseUrl, remote.token))
+      await awaitOwnedBackendStart(ticket, () => waitForHermes(remote.baseUrl, remote.token))
       updateBootProgress({
         phase: 'backend.ready',
         message: 'Remote Hermes backend is ready',
@@ -5345,15 +5446,14 @@ async function startHermes() {
     if (!enterpriseManaged && activeProfile) {
       dashboardArgs.unshift('--profile', activeProfile)
     }
-    await awaitOwnedBackendStart(ticket, advanceBootProgress('backend.runtime', 'Resolving Hermes runtime', 28))
-    const backend = await ensureRuntime(resolveHermesBackend(dashboardArgs))
-    enterpriseBackendOwnership.checkpoint(ticket)
+    await awaitOwnedBackendStart(ticket, () => advanceBootProgress('backend.runtime', 'Resolving Hermes runtime', 28))
+    const backend = await awaitOwnedBackendStart(ticket, () => ensureRuntime(resolveHermesBackend(dashboardArgs)))
     const hermesCwd = resolveHermesCwd()
     const webDist = resolveWebDist()
 
     await awaitOwnedBackendStart(
       ticket,
-      advanceBootProgress('backend.spawn', `Starting Hermes backend via ${backend.label}`, 84)
+      () => advanceBootProgress('backend.spawn', `Starting Hermes backend via ${backend.label}`, 84)
     )
     rememberLog(`Starting Hermes backend via ${backend.label}`)
 
@@ -5387,6 +5487,7 @@ async function startHermes() {
         stdio: ['ignore', 'pipe', 'pipe']
       })
     )
+    hermesProcessIdentity = captureBackendProcessIdentity(child)
     child.stdout.on('data', rememberLog)
     child.stderr.on('data', rememberLog)
     let backendReady = false
@@ -5396,7 +5497,10 @@ async function startHermes() {
     })
     enterpriseBackendOwnership.bindChild(ticket, child, {
       clearCurrent: captured => {
-        if (hermesProcess === captured) hermesProcess = null
+        if (hermesProcess === captured) {
+          hermesProcess = null
+          hermesProcessIdentity = null
+        }
         if (connectionPromise === ownedConnectionPromise) connectionPromise = null
       },
       getCurrent: () => hermesProcess,
@@ -5439,19 +5543,19 @@ async function startHermes() {
 
     await awaitOwnedBackendStart(
       ticket,
-      advanceBootProgress('backend.port', 'Waiting for Hermes backend to launch', 86)
+      () => advanceBootProgress('backend.port', 'Waiting for Hermes backend to launch', 86)
     )
     // Discover the ephemeral port the child bound to
-    const port = await awaitOwnedBackendStart(ticket, Promise.race([waitForDashboardPort(child), backendStartFailed]))
+    const port = await awaitOwnedBackendStart(ticket, () => Promise.race([waitForDashboardPort(child), backendStartFailed]))
 
     const baseUrl = `http://127.0.0.1:${port}`
     await awaitOwnedBackendStart(
       ticket,
-      advanceBootProgress('backend.wait', 'Waiting for Hermes backend to become ready', 90)
+      () => advanceBootProgress('backend.wait', 'Waiting for Hermes backend to become ready', 90)
     )
-    await awaitOwnedBackendStart(ticket, Promise.race([waitForHermes(baseUrl, token), backendStartFailed]))
+    await awaitOwnedBackendStart(ticket, () => Promise.race([waitForHermes(baseUrl, token), backendStartFailed]))
     backendReady = true
-    const authToken = await awaitOwnedBackendStart(ticket, adoptServedDashboardToken(baseUrl, token, {
+    const authToken = await awaitOwnedBackendStart(ticket, () => adoptServedDashboardToken(baseUrl, token, {
       // The exit/error handlers null hermesProcess when the child dies.
       childAlive: () => hermesProcess === child && child.exitCode === null && !child.killed,
       rememberLog
@@ -5775,6 +5879,10 @@ ipcMain.handle('hermes:enterprise:status', async event => {
   assertTrustedEnterpriseSender(event)
   return enterpriseRuntime.getPublicState()
 })
+ipcMain.handle('hermes:enterprise:lifecycle-status', async event => {
+  assertTrustedEnterpriseSender(event)
+  return enterpriseLifecycle.getSnapshot()
+})
 ipcMain.handle('hermes:enterprise:refresh', async event => {
   assertTrustedEnterpriseSender(event)
   return enterpriseRuntime.refreshPublicState()
@@ -5861,6 +5969,8 @@ ipcMain.handle('hermes:enterprise:skill-hub:install', async (event, payload) =>
 // not, we drop the cache so the next getConnection() rebuilds it. Local backends
 // self-heal via their child 'exit' handler, so we never touch them here.
 ipcMain.handle('hermes:connection:revalidate', async () => {
+  const accessOptions = { ipc: true }
+  const lease = enterpriseRuntimeAccess.acquire('hermes:connection:revalidate', accessOptions)
   if (!connectionPromise) {
     return { ok: true, rebuilt: false }
   }
@@ -5868,6 +5978,7 @@ ipcMain.handle('hermes:connection:revalidate', async () => {
   let conn = null
   try {
     conn = await connectionPromise
+    enterpriseRuntimeAccess.checkpoint('hermes:connection:revalidate', lease, accessOptions)
   } catch {
     // The cached boot already rejected (its own catch nulls connectionPromise);
     // nothing to revalidate — the next getConnection() builds fresh.
@@ -5881,6 +5992,7 @@ ipcMain.handle('hermes:connection:revalidate', async () => {
   const base = conn.baseUrl.replace(/\/+$/, '')
   try {
     await fetchPublicJson(`${base}/api/status`, { timeoutMs: 2_500 })
+    enterpriseRuntimeAccess.checkpoint('hermes:connection:revalidate', lease, accessOptions)
     return { ok: true, rebuilt: false }
   } catch {
     // Unreachable remote: drop the stale cache so the renderer's next reconnect
@@ -6110,6 +6222,15 @@ async function handleHermesApiRequest(request) {
     return pendingEnterpriseResponse
   }
 
+  const accessOptions = { ipc: true }
+  const lease = enterpriseRuntimeAccess.acquire('hermes:api', accessOptions)
+  const response = await handleHermesApiRequestWithRuntime(request)
+  enterpriseRuntimeAccess.checkpoint('hermes:api', lease, accessOptions)
+  return response
+}
+
+async function handleHermesApiRequestWithRuntime(request) {
+
   // Remote-profile session requests would otherwise hit the local primary off
   // each profile's on-disk state.db — fine for local profiles, but a remote
   // profile's sessions live on its remote host, so the UI's IDs 404 (or mutations
@@ -6153,6 +6274,7 @@ registerEnterpriseManagedProfileIpc({
   actions: {
     connection: ensureBackend,
     touchBackend: profile => {
+      enterpriseRuntimeAccess.acquire('hermes:backend:touch', { ipc: true })
       touchPoolBackend(profile)
       return { ok: true }
     },
