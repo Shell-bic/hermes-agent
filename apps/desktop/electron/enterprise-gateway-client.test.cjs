@@ -7,7 +7,8 @@ const {
   EnterpriseGatewayError,
   createEnterpriseGatewayClient,
   normalizeEnterpriseGatewayBaseUrl,
-  normalizeLoginMethodsResponse
+  normalizeLoginMethodsResponse,
+  normalizeMeResponse
 } = require('./enterprise-gateway-client.cjs')
 
 function jsonResponse(payload, { ok = true, status = 200, statusText = 'OK' } = {}) {
@@ -48,6 +49,33 @@ test('login methods normalize only explicitly enabled known methods and keep aut
       weComAuthorizationOrigin: 'https://auth.example.com'
     }
   )
+})
+
+test('account response normalizes the formal bare UserSummary contract', async () => {
+  const user = { displayName: 'Fixture User', id: 'user-a', userName: 'fixture' }
+  const client = createEnterpriseGatewayClient({
+    baseUrl: 'https://gateway.example.com',
+    fetchImpl: async () => jsonResponse(user)
+  })
+
+  assert.deepEqual(await client.me('dsk_session'), { user })
+})
+
+test('account response keeps compatibility with user and account wrappers', () => {
+  assert.deepEqual(normalizeMeResponse({ user: { id: 'user-a' } }), { user: { id: 'user-a' } })
+  assert.deepEqual(normalizeMeResponse({ account: { accountId: 'account-a' } }), {
+    user: { accountId: 'account-a' }
+  })
+})
+
+test('account response rejects empty and malformed identities without session fallback', () => {
+  const malformed = [null, [], {}, { id: '  ' }, { user: null }, { user: [] }, { user: {} }, { account: { id: {} } }]
+  for (const payload of malformed) {
+    assert.throws(
+      () => normalizeMeResponse(payload),
+      error => error instanceof EnterpriseGatewayError && error.code === 'enterprise_gateway_contract_invalid'
+    )
+  }
 })
 
 test('WeCom client uses the frozen Gateway routes and request bodies', async () => {

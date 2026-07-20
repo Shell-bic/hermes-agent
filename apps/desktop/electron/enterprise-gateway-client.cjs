@@ -55,6 +55,36 @@ function normalizeLoginResponse(payload) {
   }
 }
 
+function normalizeMeResponse(payload) {
+  const isObject = value => Boolean(value) && typeof value === 'object' && !Array.isArray(value)
+  if (!isObject(payload)) {
+    throw new EnterpriseGatewayError('Enterprise account response is invalid.', {
+      code: 'enterprise_gateway_contract_invalid'
+    })
+  }
+
+  const candidate = Object.prototype.hasOwnProperty.call(payload, 'user')
+    ? payload.user
+    : Object.prototype.hasOwnProperty.call(payload, 'account')
+      ? payload.account
+      : payload
+  if (!isObject(candidate)) {
+    throw new EnterpriseGatewayError('Enterprise account response is invalid.', {
+      code: 'enterprise_gateway_contract_invalid'
+    })
+  }
+
+  const rawId = candidate.id ?? candidate.userId ?? candidate.accountId
+  const id = typeof rawId === 'string' || typeof rawId === 'number' ? String(rawId).trim() : ''
+  if (!id) {
+    throw new EnterpriseGatewayError('Enterprise account response is invalid.', {
+      code: 'enterprise_gateway_contract_invalid'
+    })
+  }
+
+  return { user: candidate }
+}
+
 class EnterpriseGatewayError extends Error {
   constructor(message, { code = 'gateway-error', status = 0 } = {}) {
     super(message)
@@ -360,8 +390,8 @@ class EnterpriseGatewayClient {
     })
   }
 
-  me(token) {
-    return this.requestJson('/api/desktop/auth/me', { token })
+  async me(token) {
+    return normalizeMeResponse(await this.requestJson('/api/desktop/auth/me', { token }))
   }
 
   logout(token) {
@@ -473,5 +503,6 @@ module.exports = {
   normalizeLoginMethodsResponse,
   normalizeEnterpriseGatewayBaseUrl,
   normalizeLoginResponse,
+  normalizeMeResponse,
   pickDesktopToken
 }

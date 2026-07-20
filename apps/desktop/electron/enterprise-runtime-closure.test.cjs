@@ -1,8 +1,18 @@
 const test = require('node:test')
 const assert = require('node:assert/strict')
 
+const { createEnterpriseGatewayClient } = require('./enterprise-gateway-client.cjs')
 const { createEnterpriseManagedLifecycle } = require('./enterprise-managed-lifecycle.cjs')
 const { createEnterpriseRuntime } = require('./enterprise-runtime.cjs')
+
+function gatewayJsonResponse(payload) {
+  return {
+    ok: true,
+    status: 200,
+    statusText: 'OK',
+    text: async () => JSON.stringify(payload)
+  }
+}
 
 function deferred() {
   let resolve
@@ -443,16 +453,45 @@ test('policy refresh starts a fresh single-flight after another operation supers
   assert.deepEqual(writes, ['fresh-policy'])
 })
 
-test('a mismatched account response fails closed and never publishes the returned user', async () => {
+test('the real Gateway client normalizes a bare account response and preserves the authenticated user', async () => {
+  const session = { desktopToken: 'dsk_user_a', user: { id: 'user-a', userName: 'fixture' } }
+  const terminalStates = []
+  const lifecycle = runningLifecycle()
+  const client = createEnterpriseGatewayClient({
+    baseUrl: 'https://gateway.example.com',
+    fetchImpl: async () => gatewayJsonResponse({ displayName: 'Current User', id: 'user-a', userName: 'fixture' })
+  })
+  const runtime = createEnterpriseRuntime({
+    authStore: { readSession: () => session },
+    client,
+    enabled: true,
+    getLifecycle: () => lifecycle,
+    onTerminalAuth: async event => terminalStates.push(event.terminalState)
+  })
+
+  const state = await runtime.refreshPublicState()
+
+  assert.equal(state.authenticated, true)
+  assert.equal(state.user.id, 'user-a')
+  assert.equal(session.user.id, 'user-a')
+  assert.equal(lifecycle.getSnapshot().state, 'running')
+  assert.deepEqual(terminalStates, [])
+})
+
+test('a mismatched account response from the real Gateway client fails closed and never publishes the returned user', async () => {
   let session = { desktopToken: 'dsk_user_a', user: { id: 'user-a' } }
   const terminalStates = []
   const lifecycle = runningLifecycle()
+  const client = createEnterpriseGatewayClient({
+    baseUrl: 'https://gateway.example.com',
+    fetchImpl: async () => gatewayJsonResponse({ displayName: 'Wrong user', id: 'user-b' })
+  })
   const runtime = createEnterpriseRuntime({
     authStore: {
       clear: () => { session = null },
       readSession: () => session
     },
-    client: { me: async () => ({ user: { id: 'user-b', displayName: 'Wrong user' } }) },
+    client,
     enabled: true,
     getLifecycle: () => lifecycle,
     onTerminalAuth: async event => terminalStates.push(event.terminalState)
@@ -464,6 +503,38 @@ test('a mismatched account response fails closed and never publishes the returne
   assert.equal(state.user.id, 'user-a')
   assert.equal(session.user.id, 'user-a')
   assert.deepEqual(terminalStates, ['blocked'])
+})
+
+test('a malformed bare account response from the real Gateway client blocks without replacing the authenticated session', async () => {
+  const originalSession = { desktopToken: 'dsk_user_a', user: { id: 'user-a', userName: 'fixture' } }
+  let session = originalSession
+  const lifecycle = runningLifecycle()
+  const client = createEnterpriseGatewayClient({
+    baseUrl: 'https://gateway.example.com',
+    fetchImpl: async () => gatewayJsonResponse({})
+  })
+  const runtime = createEnterpriseRuntime({
+    authStore: {
+      clear: () => { session = null },
+      readSession: () => session
+    },
+    client,
+    enabled: true,
+    getLifecycle: () => lifecycle,
+    onTerminalAuth: async event => lifecycle.revoke({
+      reasonCode: 'test_gateway_contract_invalid',
+      terminalState: event.terminalState
+    })
+  })
+
+  const state = await runtime.refreshPublicState()
+
+  assert.equal(state.status, 'error')
+  assert.equal(state.authenticated, true)
+  assert.equal(state.user.id, 'user-a')
+  assert.equal(state.terminalError.errorCode, 'enterprise_gateway_contract_invalid')
+  assert.equal(lifecycle.getSnapshot().state, 'blocked')
+  assert.strictEqual(session, originalSession)
 })
 
 test('revoking state denies public runtime operations before clients or managed writers run', async () => {
