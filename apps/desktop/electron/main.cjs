@@ -96,6 +96,7 @@ const {
   runBackendStartSequence,
   runBackendMaintenanceHandoff,
   runPlatformBackendMaintenanceHandoff,
+  resumeBackendAfterMaintenance,
   stopOwnedBackendsForMaintenance
 } = require('./enterprise-backend-ownership.cjs')
 const { resolveEnterpriseDesktopConfigPaths } = require('./enterprise-desktop-config.cjs')
@@ -2081,8 +2082,10 @@ async function releaseBackendLockForUpdate(updateRoot) {
 // resources before handoff; Windows additionally verifies its mandatory venv
 // shim lock has cleared.
 async function releaseBackendLock(updateRoot, tag) {
+  const reasonCode = `enterprise_${tag}_maintenance`
+  const maintenanceBarrier = enterpriseBackendOwnership.beginMaintenance({ reasonCode })
   const shim = IS_WINDOWS ? venvHermesShimPath(updateRoot) : null
-  return runPlatformBackendMaintenanceHandoff({
+  const result = await runPlatformBackendMaintenanceHandoff({
     platform: process.platform,
     continueHandoff: () => {
       rememberLog(`[${tag}] owned backends stopped${IS_WINDOWS ? ' and venv shim unlocked' : ''}; safe to proceed`)
@@ -2092,7 +2095,7 @@ async function releaseBackendLock(updateRoot, tag) {
       lifecycle: enterpriseLifecycle,
       managed: enterpriseRuntime.isEnabled(),
       ownership: enterpriseBackendOwnership,
-      reasonCode: `enterprise_${tag}_maintenance`
+      reasonCode
     }),
     verifyWindowsReady: async () => {
       const deadlineMs = Date.now() + 15000
@@ -2102,6 +2105,40 @@ async function releaseBackendLock(updateRoot, tag) {
       }
       return false
     }
+  })
+  return { ...result, maintenanceBarrier }
+}
+
+async function recoverBackendAfterMaintenance(result, reasonCode) {
+  const barrier = result?.maintenanceBarrier
+  return resumeBackendAfterMaintenance({
+    beginRecovery: () => beginEnterpriseRecovery(reasonCode),
+    maintenance: barrier,
+    managed: enterpriseRuntime.isEnabled(),
+    onError: error => rememberLog(`[maintenance] backend recovery failed (${reasonCode}): ${error.message}`),
+    ownership: enterpriseBackendOwnership,
+    startBackend: () => startHermes()
+  })
+}
+
+function spawnDetachedForMaintenance(command, args, options) {
+  return new Promise((resolve, reject) => {
+    let child
+    try {
+      child = spawn(command, args, hiddenWindowsChildOptions(options))
+    } catch (error) {
+      reject(error)
+      return
+    }
+    let settled = false
+    child.once('spawn', () => {
+      settled = true
+      child.unref()
+      resolve(child)
+    })
+    child.on('error', error => {
+      if (!settled) reject(error)
+    })
   })
 }
 
@@ -2176,22 +2213,26 @@ async function applyUpdates(opts = {}) {
     // spawn the updater. Without this the updater races a still-locked
     // hermes.exe (held by the backend child / its grandchildren) and the update
     // bricks. See releaseBackendLockForUpdate for the full failure analysis.
-    await releaseBackendLockForUpdate(updateRoot)
+    const maintenance = await releaseBackendLockForUpdate(updateRoot)
 
     // Detached so the updater outlives this process — it needs us GONE before
     // `hermes update` will run (the venv shim is locked while we live).
-    const child = spawn(updater, updaterArgs, {
-      cwd: HERMES_HOME,
-      env: {
-        ...process.env,
-        HERMES_HOME,
-        PATH: [path.join(HERMES_HOME, 'node', 'bin'), venvBin, process.env.PATH].filter(Boolean).join(path.delimiter)
-      },
-      detached: true,
-      stdio: 'ignore',
-      windowsHide: false
-    })
-    child.unref()
+    try {
+      await spawnDetachedForMaintenance(updater, updaterArgs, {
+        cwd: HERMES_HOME,
+        env: {
+          ...process.env,
+          HERMES_HOME,
+          PATH: [path.join(HERMES_HOME, 'node', 'bin'), venvBin, process.env.PATH].filter(Boolean).join(path.delimiter)
+        },
+        detached: true,
+        stdio: 'ignore',
+        windowsHide: false
+      })
+    } catch (error) {
+      await recoverBackendAfterMaintenance(maintenance, 'enterprise_update_handoff_failed')
+      throw error
+    }
 
     rememberLog(`[updates] launched updater: ${updater} ${updaterArgs.join(' ')}; exiting desktop to release venv shim`)
 
@@ -2222,20 +2263,24 @@ async function handOffWindowsBootstrapRecovery(reason) {
   const venvHermes = path.join(venvBin, IS_WINDOWS ? 'hermes.exe' : 'hermes')
   const updaterArgs = fileExists(venvHermes) ? ['--update', '--branch', branch] : ['--repair', '--branch', branch]
 
-  await releaseBackendLockForUpdate(updateRoot)
+  const maintenance = await releaseBackendLockForUpdate(updateRoot)
 
-  const child = spawn(updater, updaterArgs, {
-    cwd: HERMES_HOME,
-    env: {
-      ...process.env,
-      HERMES_HOME,
-      PATH: [path.join(HERMES_HOME, 'node', 'bin'), venvBin, process.env.PATH].filter(Boolean).join(path.delimiter)
-    },
-    detached: true,
-    stdio: 'ignore',
-    windowsHide: false
-  })
-  child.unref()
+  try {
+    await spawnDetachedForMaintenance(updater, updaterArgs, {
+      cwd: HERMES_HOME,
+      env: {
+        ...process.env,
+        HERMES_HOME,
+        PATH: [path.join(HERMES_HOME, 'node', 'bin'), venvBin, process.env.PATH].filter(Boolean).join(path.delimiter)
+      },
+      detached: true,
+      stdio: 'ignore',
+      windowsHide: false
+    })
+  } catch (error) {
+    await recoverBackendAfterMaintenance(maintenance, 'enterprise_bootstrap_handoff_failed')
+    throw error
+  }
 
   rememberLog(`[bootstrap] handed off ${reason} recovery to updater: ${updater} ${updaterArgs.join(' ')}; exiting desktop to release app.asar`)
   setTimeout(() => {
@@ -2331,7 +2376,7 @@ async function applyUpdatesPosixInApp() {
   // Updating mutates the managed runtime itself. Close every owned process and
   // resource before the first update command; a stop failure aborts update,
   // rebuild, and any later app-bundle swap.
-  await releaseBackendLockForUpdate(updateRoot)
+  const maintenance = await releaseBackendLockForUpdate(updateRoot)
 
   emitUpdateProgress({ stage: 'update', message: 'Updating Hermes (git + dependencies)…', percent: 10 })
   const updated = await runStreamedUpdate(hermes, ['update', '--yes', ...branchArgs], {
@@ -2340,8 +2385,12 @@ async function applyUpdatesPosixInApp() {
     stage: 'update'
   })
   if (updated.code !== 0) {
-    emitUpdateProgress({ stage: 'error', message: 'hermes update failed.', error: updated.error || 'update-failed' })
-    return { ok: false, error: 'hermes update failed' }
+    emitUpdateProgress({
+      stage: 'error',
+      message: 'Hermes update failed. Restart or repair Hermes before reconnecting.',
+      error: updated.error || 'update-failed'
+    })
+    return { ok: false, error: 'hermes update failed', maintenanceBlocked: true, recovery: 'restart-or-repair' }
   }
 
   emitUpdateProgress({ stage: 'rebuild', message: 'Rebuilding the desktop app…', percent: 60 })
@@ -2360,7 +2409,11 @@ async function applyUpdatesPosixInApp() {
       message: 'Backend updated, but the desktop rebuild failed. Restart Hermes to retry.',
       error: rebuilt.error || 'rebuild-failed'
     })
-    return { ok: false, backendUpdated: true, error: 'desktop rebuild failed' }
+    const backendRecovered = await recoverBackendAfterMaintenance(
+      maintenance,
+      'enterprise_desktop_rebuild_failed'
+    )
+    return { ok: false, backendUpdated: true, backendRecovered, error: 'desktop rebuild failed' }
   }
 
   const rebuiltApp = [
@@ -2377,7 +2430,11 @@ async function applyUpdatesPosixInApp() {
       message: 'Backend updated. Restart Hermes to load the new version.',
       percent: 100
     })
-    return { ok: true, backendUpdated: true, rebuiltApp: rebuiltApp || null }
+    const backendRecovered = await recoverBackendAfterMaintenance(
+      maintenance,
+      'enterprise_update_restart_deferred'
+    )
+    return { ok: true, backendUpdated: true, backendRecovered, rebuiltApp: rebuiltApp || null }
   }
 
   emitUpdateProgress({ stage: 'restart', message: 'Installing the updated app and restarting…', percent: 95 })
@@ -2399,11 +2456,22 @@ async function applyUpdatesPosixInApp() {
       percent: 100
     })
     rememberLog(`[updates] could not write swap script: ${err.message}; rebuilt app at ${rebuiltApp}`)
-    return { ok: true, backendUpdated: true, rebuiltApp }
+    const backendRecovered = await recoverBackendAfterMaintenance(
+      maintenance,
+      'enterprise_update_swap_script_failed'
+    )
+    return { ok: true, backendUpdated: true, backendRecovered, rebuiltApp }
   }
 
-  const child = spawn('/bin/bash', [scriptPath], { detached: true, stdio: 'ignore' })
-  child.unref()
+  try {
+    await spawnDetachedForMaintenance('/bin/bash', [scriptPath], { detached: true, stdio: 'ignore' })
+  } catch (error) {
+    const backendRecovered = await recoverBackendAfterMaintenance(
+      maintenance,
+      'enterprise_update_swap_spawn_failed'
+    )
+    return { ok: false, backendUpdated: true, backendRecovered, error: error.message }
+  }
   rememberLog(`[updates] launched mac swap+relaunch: ${scriptPath} (${rebuiltApp} -> ${targetApp})`)
 
   setTimeout(() => app.quit(), 600)
@@ -5063,6 +5131,7 @@ function primaryProfileKey() {
 // mode), and any OTHER profile to a lazily-spawned pool backend. An empty /
 // unknown profile resolves to the primary, so all legacy callers are unchanged.
 async function ensureBackend(profile) {
+  enterpriseBackendOwnership.assertMaintenanceStartAllowed()
   const accessOptions = { allowRecovery: true }
   const lease = enterpriseRuntimeAccess.acquire('ensureBackend', accessOptions)
   if (enterpriseAuthPending()) {
@@ -5350,6 +5419,7 @@ async function prepareProfileDeleteRequest(request) {
 }
 
 async function startHermes() {
+  enterpriseBackendOwnership.assertMaintenanceStartAllowed()
   // Latched-failure short-circuit: once bootstrap has failed in this
   // process, every subsequent startHermes() call re-throws the same error
   // without re-running install.ps1. This prevents the renderer's
@@ -6020,7 +6090,10 @@ ipcMain.handle('hermes:bootstrap:repair', async () => {
   // venv), and clear any latched failure + live connection. The renderer
   // reloads afterwards to re-drive the boot flow from scratch.
   rememberLog('[bootstrap] repair requested by renderer; clearing marker + latched failure')
-  return runBackendMaintenanceHandoff({
+  const maintenance = enterpriseBackendOwnership.beginMaintenance({
+    reasonCode: 'enterprise_bootstrap_repair'
+  })
+  const result = await runBackendMaintenanceHandoff({
     continueHandoff: () => {
       try {
         if (fileExists(BOOTSTRAP_COMPLETE_MARKER)) {
@@ -6040,6 +6113,8 @@ ipcMain.handle('hermes:bootstrap:repair', async () => {
       reasonCode: 'enterprise_bootstrap_repair'
     })
   })
+  enterpriseBackendOwnership.endMaintenance(maintenance)
+  return result
 })
 ipcMain.handle('hermes:bootstrap:cancel', async () => {
   // Renderer's Cancel button during first-launch install. Abort the running
@@ -7000,8 +7075,8 @@ async function runDesktopUninstall(mode) {
   // the venv, and even gui-only removes the install tree's GUI artifacts — a
   // live backend grandchild (gateway / pty / REPL) holding a mandatory file
   // lock would make the script's rmdir half-fail (#37532 for the update path).
-  // Reuses the incident-hardened update teardown; no-op on macOS/Linux.
-  await releaseBackendLock(ACTIVE_HERMES_ROOT, 'uninstall')
+  // Reuses the incident-hardened update teardown on every platform.
+  const maintenance = await releaseBackendLock(ACTIVE_HERMES_ROOT, 'uninstall')
 
   const scriptArgs = {
     desktopPid: process.pid,
@@ -7029,18 +7104,25 @@ async function runDesktopUninstall(mode) {
       runnerArgs = [scriptPath]
     }
   } catch (error) {
-    return { ok: false, error: 'script-write-failed', message: error.message }
+    const backendRecovered = await recoverBackendAfterMaintenance(
+      maintenance,
+      'enterprise_uninstall_script_failed'
+    )
+    return { ok: false, backendRecovered, error: 'script-write-failed', message: error.message }
   }
 
   try {
-    const child = spawn(runner, runnerArgs, {
+    await spawnDetachedForMaintenance(runner, runnerArgs, {
       detached: true,
       stdio: 'ignore',
       windowsHide: true
     })
-    child.unref()
   } catch (error) {
-    return { ok: false, error: 'spawn-failed', message: error.message }
+    const backendRecovered = await recoverBackendAfterMaintenance(
+      maintenance,
+      'enterprise_uninstall_spawn_failed'
+    )
+    return { ok: false, backendRecovered, error: 'spawn-failed', message: error.message }
   }
 
   rememberLog(

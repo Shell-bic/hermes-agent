@@ -8,6 +8,7 @@ const {
   runBackendStartSequence,
   runBackendMaintenanceHandoff,
   runPlatformBackendMaintenanceHandoff,
+  resumeBackendAfterMaintenance,
   stopOwnedBackendsForMaintenance
 } = require('./enterprise-backend-ownership.cjs')
 
@@ -179,6 +180,164 @@ test('platform maintenance closes POSIX ownership and preserves the Windows read
       }
     }), error => error.code === 'enterprise_backend_stop_failed')
     assert.deepEqual(calls, ['stop', 'verify'])
+  })
+})
+
+test('maintenance barrier blocks cached and fresh backend starts until its owning lease releases', async () => {
+  const { ownership } = createHarness()
+  const pending = ownership.beginStart({ key: 'primary', recovery: true })
+  const maintenance = ownership.beginMaintenance({ reasonCode: 'enterprise_updates_maintenance' })
+
+  assert.equal(pending.signal.aborted, true)
+  assert.equal(
+    ownership.beginMaintenance({ reasonCode: 'enterprise_updates_maintenance' }),
+    maintenance
+  )
+  assert.throws(
+    () => ownership.beginMaintenance({ reasonCode: 'enterprise_uninstall_maintenance' }),
+    error => error.code === 'enterprise_backend_maintenance_active'
+  )
+  assert.throws(
+    () => ownership.assertMaintenanceStartAllowed(),
+    error => error.code === 'enterprise_backend_maintenance_active'
+  )
+  assert.throws(
+    () => ownership.beginStart({ key: 'pool:finance' }),
+    error => error.code === 'enterprise_backend_maintenance_active'
+  )
+  assert.equal(ownership.endMaintenance({ id: maintenance.id }), false)
+  assert.equal(ownership.endMaintenance(maintenance), true)
+
+  ownership.assertMaintenanceStartAllowed()
+  const resumed = ownership.beginStart({ key: 'primary', recovery: true })
+  ownership.checkpoint(resumed)
+  ownership.finishStart(resumed)
+})
+
+test('terminal maintenance handoff keeps every backend spawn side effect blocked', async () => {
+  const { ownership } = createHarness()
+  const calls = []
+  ownership.beginMaintenance({ reasonCode: 'enterprise_uninstall_maintenance' })
+
+  await assert.rejects((async () => {
+    ownership.assertMaintenanceStartAllowed()
+    calls.push('resolve-cache')
+    const ticket = ownership.beginStart({ key: 'primary', recovery: true })
+    return runBackendStartSequence({
+      managed: true,
+      prepareLaunch: async () => calls.push('prepare'),
+      resolveRuntime: async () => calls.push('resolve'),
+      spawnBackend: async () => {
+        ownership.checkpoint(ticket)
+        calls.push('spawn')
+      }
+    })
+  })(), error => error.code === 'enterprise_backend_maintenance_active')
+  assert.deepEqual(calls, [])
+})
+
+test('stop failure keeps the reusable maintenance barrier active', async () => {
+  const { ownership } = createHarness()
+  const maintenance = ownership.beginMaintenance({ reasonCode: 'enterprise_updates_maintenance' })
+  await assert.rejects(runPlatformBackendMaintenanceHandoff({
+    platform: 'linux',
+    continueHandoff: async () => undefined,
+    stopBackends: async () => {
+      throw new Error('stop failed')
+    }
+  }), /stop failed/)
+  assert.throws(
+    () => ownership.beginStart({ key: 'primary', recovery: true }),
+    error => error.code === 'enterprise_backend_maintenance_active'
+  )
+  assert.equal(
+    ownership.beginMaintenance({ reasonCode: 'enterprise_updates_maintenance' }),
+    maintenance
+  )
+})
+
+test('maintenance recovery releases then prepares managed lifecycle before explicit start', async t => {
+  await t.test('managed recovery order', async () => {
+    const { ownership } = createHarness()
+    const maintenance = ownership.beginMaintenance({ reasonCode: 'enterprise_updates_maintenance' })
+    const calls = []
+    const recovered = await resumeBackendAfterMaintenance({
+      beginRecovery: async () => {
+        ownership.assertMaintenanceStartAllowed()
+        calls.push('recover')
+      },
+      maintenance,
+      managed: true,
+      ownership,
+      startBackend: async () => {
+        ownership.assertMaintenanceStartAllowed()
+        calls.push('start')
+      }
+    })
+    assert.equal(recovered, true)
+    assert.deepEqual(calls, ['recover', 'start'])
+  })
+
+  await t.test('unmanaged recovery skips lifecycle preparation', async () => {
+    const ownership = createEnterpriseBackendOwnership({ isManaged: () => false })
+    const maintenance = ownership.beginMaintenance({ reasonCode: 'enterprise_updates_maintenance' })
+    const calls = []
+    const recovered = await resumeBackendAfterMaintenance({
+      beginRecovery: async () => calls.push('recover'),
+      maintenance,
+      managed: false,
+      ownership,
+      startBackend: async () => calls.push('start')
+    })
+    assert.equal(recovered, true)
+    assert.deepEqual(calls, ['start'])
+  })
+
+  await t.test('start failure reports false after the barrier is released', async () => {
+    const ownership = createEnterpriseBackendOwnership({ isManaged: () => false })
+    const maintenance = ownership.beginMaintenance({ reasonCode: 'enterprise_updates_maintenance' })
+    const errors = []
+    const recovered = await resumeBackendAfterMaintenance({
+      maintenance,
+      ownership,
+      onError: error => errors.push(error.message),
+      startBackend: async () => {
+        throw new Error('restart failed')
+      }
+    })
+    assert.equal(recovered, false)
+    ownership.assertMaintenanceStartAllowed()
+    assert.deepEqual(errors, ['restart failed'])
+  })
+
+  await t.test('foreign lease has no lifecycle or start side effects', async () => {
+    const ownership = createEnterpriseBackendOwnership({ isManaged: () => false })
+    ownership.beginMaintenance({ reasonCode: 'enterprise_updates_maintenance' })
+    const calls = []
+    const recovered = await resumeBackendAfterMaintenance({
+      beginRecovery: async () => calls.push('recover'),
+      maintenance: { id: 999 },
+      managed: true,
+      ownership,
+      startBackend: async () => calls.push('start')
+    })
+    assert.equal(recovered, false)
+    assert.deepEqual(calls, [])
+  })
+
+  await t.test('invalid managed recovery configuration keeps the barrier closed', async () => {
+    const { ownership } = createHarness()
+    const maintenance = ownership.beginMaintenance({ reasonCode: 'enterprise_updates_maintenance' })
+    await assert.rejects(resumeBackendAfterMaintenance({
+      maintenance,
+      managed: true,
+      ownership,
+      startBackend: async () => undefined
+    }), /recovery preparation must be deferred/)
+    assert.throws(
+      () => ownership.assertMaintenanceStartAllowed(),
+      error => error.code === 'enterprise_backend_maintenance_active'
+    )
   })
 })
 

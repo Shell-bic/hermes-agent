@@ -294,7 +294,8 @@ test('buildWindowsCleanupScript waits (bounded) for PID, runs uninstall, rmdir b
   assert.match(script, /set "PYTHONPATH=C:\\hermes;%PYTHONPATH%"/)
   assert.match(script, /"C:\\Python313\\python.exe" "-m" "hermes_cli\.uninstall" "--mode" "full"/)
   // Bounded wait-loop (no infinite loop), whole-token PID match (no substring).
-  assert.match(script, /if %waited% geq 60 goto waited_done/)
+  assert.match(script, /if %waited% geq 60 goto wait_timeout/)
+  assert.match(script, /:wait_timeout[\s\S]*exit \/b 1[\s\S]*:waited_done/)
   assert.match(script, /findstr \/r \/c:" %PID% "/)
   assert.doesNotMatch(script, /find "%PID%"/) // the old substring-prone form is gone
   // Removal is a retry loop (Windows releases dir handles lazily).
@@ -302,6 +303,34 @@ test('buildWindowsCleanupScript waits (bounded) for PID, runs uninstall, rmdir b
   assert.match(script, /rmdir \/s \/q "C:\\Users\\x\\AppData\\Local\\Programs\\Hermes" >nul 2>&1/)
   assert.match(script, /if %tries% geq 10 goto rmdone/)
   assert.match(script, /del "%~f0"/)
+})
+
+test('Windows cleanup timeout exits nonzero without running uninstall or rmdir', {
+  skip: process.platform !== 'win32'
+}, t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'hermes-windows-uninstall-timeout-'))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const appPath = path.join(root, 'Hermes')
+  const uninstallMarker = path.join(root, 'uninstalled.txt')
+  const probePath = path.join(root, 'probe.cmd')
+  const cleanupPath = path.join(root, 'cleanup.cmd')
+  fs.mkdirSync(appPath)
+  fs.writeFileSync(probePath, `@echo off\r\necho ran>"${uninstallMarker}"\r\n`)
+  fs.writeFileSync(cleanupPath, buildWindowsCleanupScript({
+    desktopPid: process.pid,
+    pythonExe: probePath,
+    pythonPath: null,
+    agentRoot: root,
+    uninstallArgs: [],
+    appPath,
+    hermesHome: root,
+    waitAttempts: 1
+  }))
+
+  const result = spawnSync(process.env.ComSpec || 'cmd.exe', ['/d', '/c', cleanupPath])
+  assert.equal(result.status, 1)
+  assert.equal(fs.existsSync(uninstallMarker), false)
+  assert.equal(fs.existsSync(appPath), true)
 })
 
 test('buildWindowsCleanupScript omits PYTHONPATH + rmdir when not needed (gui, no bundle)', () => {

@@ -221,8 +221,18 @@ fi
  * Removal: even after the desktop PID is gone, Windows releases directory
  * handles lazily, so a single `rmdir /s /q` can half-fail — retry up to 10x.
  */
-function buildWindowsCleanupScript({ desktopPid, pythonExe, pythonPath, agentRoot, uninstallArgs, appPath, hermesHome }) {
+function buildWindowsCleanupScript({
+  desktopPid,
+  pythonExe,
+  pythonPath,
+  agentRoot,
+  uninstallArgs,
+  appPath,
+  hermesHome,
+  waitAttempts = 60
+}) {
   const pid = Number(desktopPid) || 0
+  const attempts = Math.max(1, Math.floor(Number(waitAttempts) || 60))
   // cmd.exe has no string escaping inside quotes; strip embedded quotes (paths
   // under %LOCALAPPDATA% never contain them). `&`/`^` in a path would still be
   // a problem, but Hermes install paths don't use them.
@@ -246,9 +256,12 @@ function buildWindowsCleanupScript({ desktopPid, pythonExe, pythonPath, agentRoo
     'tasklist /NH /FI "PID eq %PID%" 2>nul | findstr /r /c:" %PID% " >nul',
     'if %ERRORLEVEL% neq 0 goto waited_done',
     'set /a waited+=1',
-    'if %waited% geq 60 goto waited_done',
+    `if %waited% geq ${attempts} goto wait_timeout`,
     'timeout /t 1 /nobreak >nul',
     'goto waitloop',
+    ':wait_timeout',
+    'echo Hermes desktop did not exit before uninstall timeout. 1>&2',
+    'exit /b 1',
     ':waited_done',
     `cd /d ${q(agentRoot)}`,
     `${q(pythonExe)} ${uninstallArgs.map(q).join(' ')}`

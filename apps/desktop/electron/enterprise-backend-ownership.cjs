@@ -1,4 +1,5 @@
 const BACKEND_OWNERSHIP_ERROR_CODES = Object.freeze({
+  MAINTENANCE_ACTIVE: 'enterprise_backend_maintenance_active',
   START_ABORTED: 'enterprise_backend_start_aborted',
   STOP_FAILED: 'enterprise_backend_stop_failed'
 })
@@ -94,6 +95,36 @@ async function runPlatformBackendMaintenanceHandoff({
   })
 }
 
+async function resumeBackendAfterMaintenance({
+  ownership,
+  maintenance,
+  managed = false,
+  beginRecovery,
+  startBackend,
+  onError
+} = {}) {
+  if (!ownership || typeof ownership.endMaintenance !== 'function') {
+    throw new TypeError('Backend ownership is required for maintenance recovery.')
+  }
+  if (typeof startBackend !== 'function') {
+    throw new TypeError('Backend recovery start must be deferred.')
+  }
+  if (managed && typeof beginRecovery !== 'function') {
+    throw new TypeError('Managed backend recovery preparation must be deferred.')
+  }
+  if (ownership.endMaintenance(maintenance) !== true) return false
+  try {
+    if (managed) {
+      await beginRecovery()
+    }
+    await startBackend()
+    return true
+  } catch (error) {
+    if (typeof onError === 'function') onError(error)
+    return false
+  }
+}
+
 function createEnterpriseBackendOwnership(options = {}) {
   const getLifecycle = options.getLifecycle
   const isManaged = typeof options.isManaged === 'function' ? options.isManaged : () => true
@@ -112,7 +143,9 @@ function createEnterpriseBackendOwnership(options = {}) {
 
   const pendingStarts = new Map()
   let nextStartId = 1
+  let nextMaintenanceId = 1
   let lastStopOwners = []
+  let maintenance = null
 
   function lifecycle() {
     const value = getLifecycle?.()
@@ -120,7 +153,38 @@ function createEnterpriseBackendOwnership(options = {}) {
     return value
   }
 
+  function assertMaintenanceStartAllowed() {
+    if (maintenance) {
+      throw new EnterpriseBackendOwnershipError(
+        BACKEND_OWNERSHIP_ERROR_CODES.MAINTENANCE_ACTIVE,
+        `Backend maintenance is active (${maintenance.reasonCode}).`
+      )
+    }
+    return true
+  }
+
+  function beginMaintenance(options = {}) {
+    const reasonCode = String(options.reasonCode || 'backend_maintenance')
+    if (maintenance) {
+      if (maintenance.reasonCode === reasonCode) return maintenance
+      throw new EnterpriseBackendOwnershipError(
+        BACKEND_OWNERSHIP_ERROR_CODES.MAINTENANCE_ACTIVE,
+        `Backend maintenance is already active (${maintenance.reasonCode}).`
+      )
+    }
+    maintenance = Object.freeze({ id: nextMaintenanceId++, reasonCode })
+    for (const ticket of pendingStarts.values()) ticket.controller.abort()
+    return maintenance
+  }
+
+  function endMaintenance(lease) {
+    if (!lease || maintenance !== lease) return false
+    maintenance = null
+    return true
+  }
+
   function beginStart(owner = {}) {
+    assertMaintenanceStartAllowed()
     const managed = isManaged() === true
     const controller = new AbortController()
     const ticket = {
@@ -141,6 +205,7 @@ function createEnterpriseBackendOwnership(options = {}) {
   }
 
   function checkpoint(ticket) {
+    assertMaintenanceStartAllowed()
     if (!ticket || ticket.signal?.aborted) {
       throw new EnterpriseBackendOwnershipError(
         BACKEND_OWNERSHIP_ERROR_CODES.START_ABORTED,
@@ -316,12 +381,15 @@ function createEnterpriseBackendOwnership(options = {}) {
   }
 
   return Object.freeze({
+    assertMaintenanceStartAllowed,
+    beginMaintenance,
     beginStart,
     awaitCheckpoint,
     bindChild,
     cancelPendingStarts,
     cancelStart,
     checkpoint,
+    endMaintenance,
     finishStart,
     lifecycleEffects: Object.freeze({
       cancelPendingStarts,
@@ -342,5 +410,6 @@ module.exports = {
   runBackendStartSequence,
   runBackendMaintenanceHandoff,
   runPlatformBackendMaintenanceHandoff,
+  resumeBackendAfterMaintenance,
   stopOwnedBackendsForMaintenance
 }
