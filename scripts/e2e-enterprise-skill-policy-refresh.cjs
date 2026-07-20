@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 /**
- * U5 P2 partial cross-process acceptance harness.
+ * U5 P2 strict policy-refresh cross-process acceptance harness (partial).
  *
  * Starts the real Gateway and the built Electron application. Electron owns
  * the real Python backend; this harness talks to the production preload bridge
@@ -17,6 +17,7 @@
  */
 
 const assert = require('node:assert/strict')
+const crypto = require('node:crypto')
 const fs = require('node:fs')
 const http = require('node:http')
 const net = require('node:net')
@@ -36,16 +37,24 @@ const FIXTURE_ROOT = path.join(
   'valid',
   FIXTURE_NAME
 )
-const DEFAULT_PASSWORD = 'ChangeMe!12345'
+const FIXTURE_ADMIN = 'u5-p2-admin-fixture'
+const FIXTURE_USER = 'u5-p2-view-fixture'
+const FIXTURE_PASSWORD = 'U5P2-not-a-real-secret-fixture-only-20260721!'
 const GATES = [
   'real Gateway and built Electron startup',
   'renderer login and Python backend connection',
   'available-to-blocked policy hash refresh',
-  'invalid bootstrap preserves stale last-known-good',
-  'Electron and backend PID stability',
-  'Gateway-down stale last-known-good refresh',
+  'invalid-200 terminal blocks runtime without adopting LKG',
+  'invalid-200 preserves managed-home evidence bytes',
+  'invalid-200 terminal revokes Python backend',
+  'same-user 503 adopts stale last-known-good',
+  'terminal HTTP status matrix',
+  'full bootstrap envelope mutation matrix',
+  'cross-user never adopts another user LKG',
   'no-LKG fail-closed',
-  'prompt and new-session behavior',
+  'current-session prompt hash remains stable',
+  'new-session skill index changes after policy refresh',
+  'blocked linked skill read is denied through real tool call',
   'Bundle and Cron operation snapshots',
   'desktop-token-only artifact scan',
   'Gateway/backend token sentinel scan',
@@ -77,11 +86,14 @@ function recordGate(results, gate, status, detail) {
 }
 
 function printResults(results) {
+  let complete = true
   for (const gate of GATES) {
     const result = results.get(gate) || { status: 'NOT-RUN', detail: 'blocked by an earlier gate' }
     console.log(`${result.status} ${gate}: ${result.detail}`)
+    if (result.status !== 'PASS') complete = false
   }
-  console.log([...results.values()].some(result => result.status === 'FAIL') ? 'overall=failed' : 'overall=partial')
+  console.log(complete ? 'overall=passed' : 'overall=failed')
+  return complete
 }
 
 async function reservePort() {
@@ -113,7 +125,6 @@ function isRuntimeManifestPath(requestUrl) {
 
 function mutateBootstrapPayload(payload, fault) {
   const result = structuredClone(payload)
-  result.harnessFaultMarker = fault.marker
 
   switch (fault.kind) {
     case 'locked-missing':
@@ -143,7 +154,29 @@ async function startGatewayFaultProxy({ targetBaseUrl }) {
     bootstrapFault: null,
     desktopTokens: new Set(),
     faultMarkers: new Set(),
-    gatewayTokens: new Set()
+    gatewayTokens: new Set(),
+    requestJournal: []
+  }
+
+  function recordRequest(request, status, source = 'upstream') {
+    const authorization = String(request.headers.authorization || '')
+    const bearer = authorization.match(/^Bearer\s+(.+)$/i)?.[1] || ''
+    let pathname = '<invalid-path>'
+    try {
+      pathname = new URL(request.url, 'http://fault-proxy.local').pathname
+    } catch {
+      // Keep the invalid-path sentinel; never record a raw URL or query.
+    }
+    state.requestJournal.push({
+      bearerHash: bearer ? crypto.createHash('sha256').update(bearer).digest('hex').slice(0, 10) : null,
+      hasDskBearer: bearer.startsWith('dsk_'),
+      method: request.method,
+      pathname,
+      source,
+      status
+    })
+    if (state.requestJournal.length > 200) state.requestJournal.splice(0, state.requestJournal.length - 200)
+    assert.ok(state.requestJournal.length <= 200, 'sanitized request journal exceeded its in-memory bound')
   }
 
   const server = http.createServer(async (request, response) => {
@@ -166,6 +199,7 @@ async function startGatewayFaultProxy({ targetBaseUrl }) {
           'Content-Type': 'application/problem+json'
         })
         response.end(body)
+        recordRequest(request, 503, 'fault')
         return
       }
 
@@ -202,6 +236,7 @@ async function startGatewayFaultProxy({ targetBaseUrl }) {
       headers['content-type'] = contentType
       response.writeHead(upstream.status, headers)
       response.end(body)
+      recordRequest(request, upstream.status)
     } catch {
       const body = Buffer.from(JSON.stringify({
         detail: 'Enterprise Gateway upstream request failed.',
@@ -213,6 +248,7 @@ async function startGatewayFaultProxy({ targetBaseUrl }) {
         'Content-Type': 'application/problem+json'
       })
       response.end(body)
+      recordRequest(request, 502, 'proxy-error')
     }
   })
 
@@ -355,7 +391,7 @@ async function waitForGateway(info, baseUrl, timeoutMs = 90000) {
       const response = await fetch(`${baseUrl}/api/desktop/auth/login`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ username: 'view', password: DEFAULT_PASSWORD })
+        body: JSON.stringify({ username: FIXTURE_USER, password: FIXTURE_PASSWORD })
       })
       if (response.ok) return
       lastError = new Error(`HTTP ${response.status}`)
@@ -375,6 +411,11 @@ async function startGateway(context) {
       'ConnectionStrings__EnterpriseGateway': `Data Source=${context.databasePath}`,
       'Gateway__PublicBaseUrl': `${context.gatewayBaseUrl}/v1`,
       'Kestrel__Endpoints__http__Url': context.gatewayBaseUrl,
+      'SeedAdmin__Password': FIXTURE_PASSWORD,
+      'SeedAdmin__UserName': FIXTURE_ADMIN,
+      'SeedDesktopUser__DisplayName': 'U5 P2 View Fixture',
+      'SeedDesktopUser__Password': FIXTURE_PASSWORD,
+      'SeedDesktopUser__UserName': FIXTURE_USER,
       'SkillHub__ArtifactRoot': context.artifactRoot,
       'SkillHub__CatalogRoot': context.catalogRoot,
       'SkillHub__Enabled': 'true'
@@ -409,7 +450,7 @@ async function jsonRequest(url, { body, method = 'GET', token } = {}) {
 async function setSkillPolicy(baseUrl, status) {
   const login = await jsonRequest(`${baseUrl}/api/admin/auth/login`, {
     method: 'POST',
-    body: { username: 'admin', password: DEFAULT_PASSWORD }
+    body: { username: FIXTURE_ADMIN, password: FIXTURE_PASSWORD }
   })
   const token = login.token
   const roles = await jsonRequest(`${baseUrl}/api/admin/roles`, { token })
@@ -418,15 +459,33 @@ async function setSkillPolicy(baseUrl, status) {
   const policy = await jsonRequest(`${baseUrl}/api/admin/roles/${role.id}/tool-policy`, { token })
   const skill = policy.skills.find(item => item.key === FIXTURE_NAME)
   assert.ok(skill, `${FIXTURE_NAME} is not in the role policy catalog`)
+  assert.ok(String(policy.policyVersion || '').trim(), 'role tool policy response did not include policyVersion')
+  const entriesToRequest = (entries, targetId = null) => {
+    assert.ok(Array.isArray(entries), 'role tool policy response omitted a resource collection')
+    return entries.map(entry => ({
+      id: entry.id,
+      reason: entry.id === targetId
+        ? `U5 P2 acceptance ${status}`
+        : entry.hasRoleOverride
+          ? String(entry.roleReason || '').trim() || null
+          : null,
+      status: entry.id === targetId
+        ? status
+        : entry.hasRoleOverride
+          ? entry.roleStatus ?? null
+          : null
+    }))
+  }
   await jsonRequest(`${baseUrl}/api/admin/roles/${role.id}/tool-policy`, {
     method: 'PUT',
     token,
     body: {
-      skills: [{
-        id: skill.id,
-        status,
-        reason: `U5 P2 acceptance ${status}`
-      }]
+      capabilityFlags: entriesToRequest(policy.capabilityFlags),
+      expectedPolicyVersion: policy.policyVersion,
+      mcpServers: entriesToRequest(policy.mcpServers),
+      skills: entriesToRequest(policy.skills, skill.id),
+      tools: entriesToRequest(policy.tools),
+      toolSets: entriesToRequest(policy.toolSets)
     }
   })
 }
@@ -509,8 +568,87 @@ async function waitForRendererBridge(cdp, timeoutMs = 90000) {
   throw new Error('Timed out waiting for the production preload bridge')
 }
 
+async function waitForManagedConnection(cdp, timeoutMs = 90000) {
+  const deadline = Date.now() + timeoutMs
+  let lastError = null
+  while (Date.now() < deadline) {
+    const lifecycle = await evaluate(cdp, '(async () => window.hermesDesktop.enterprise.lifecycleStatus())()')
+    if (lifecycle?.state === 'blocked' || lifecycle?.state === 'stop_failed') {
+      const terminal = await evaluate(
+        cdp,
+        `(async () => {
+          const lifecycle = await window.hermesDesktop.enterprise.lifecycleStatus()
+          const state = await window.hermesDesktop.enterprise.status()
+          return {
+            lifecycle: {
+              authEpoch: lifecycle.authEpoch,
+              lifecycleEpoch: lifecycle.lifecycleEpoch,
+              reasonCode: lifecycle.reasonCode,
+              state: lifecycle.state
+            },
+            publicStatus: state?.status || null,
+            terminalError: state?.terminalError ? {
+              errorCode: state.terminalError.errorCode || null,
+              httpStatus: state.terminalError.httpStatus || state.terminalError.status || null,
+              recoveryKind: state.terminalError.recoveryKind || null
+            } : null
+          }
+        })()`
+      )
+      assert.deepEqual(Object.keys(terminal).sort(), ['lifecycle', 'publicStatus', 'terminalError'])
+      assert.deepEqual(
+        Object.keys(terminal.lifecycle || {}).sort(),
+        ['authEpoch', 'lifecycleEpoch', 'reasonCode', 'state']
+      )
+      if (terminal.terminalError) {
+        assert.deepEqual(
+          Object.keys(terminal.terminalError).sort(),
+          ['errorCode', 'httpStatus', 'recoveryKind']
+        )
+      }
+      throw new Error(`managed lifecycle terminal before backend connection: ${JSON.stringify(terminal)}`)
+    }
+    try {
+      const connection = await evaluate(cdp, '(async () => window.hermesDesktop.getConnection())()')
+      if (connection?.baseUrl) return connection
+    } catch (error) {
+      lastError = error
+    }
+    await new Promise(resolve => setTimeout(resolve, 250))
+  }
+  throw new Error(`Timed out waiting for managed backend connection: ${lastError?.message || 'no connection'}`)
+}
+
 function policyStatus(state) {
   return state?.toolPolicySnapshot?.skills?.find(item => item.key === FIXTURE_NAME)?.status || null
+}
+
+function findManagedHermesHome(userDataRoot) {
+  const usersRoot = path.join(userDataRoot, 'enterprise', 'users')
+  assert.ok(fs.existsSync(usersRoot), 'managed enterprise users root was not created')
+  const homes = fs.readdirSync(usersRoot, { withFileTypes: true })
+    .filter(entry => entry.isDirectory())
+    .map(entry => path.join(usersRoot, entry.name, 'hermes-home'))
+    .filter(candidate => fs.existsSync(candidate))
+  assert.equal(homes.length, 1, `expected exactly one managed Hermes home, found ${homes.length}`)
+  return homes[0]
+}
+
+function managedHomeEvidence(hermesHome) {
+  const evidence = {}
+  for (const name of ['.env', 'config.yaml', 'enterprise-policy.json']) {
+    const filePath = path.join(hermesHome, name)
+    assert.ok(fs.existsSync(filePath), `managed runtime file missing: ${name}`)
+    evidence[name] = fs.readFileSync(filePath)
+  }
+  return evidence
+}
+
+function assertManagedHomeEvidenceUnchanged(before, after) {
+  assert.deepEqual(Object.keys(after).sort(), Object.keys(before).sort())
+  for (const name of Object.keys(before)) {
+    assert.ok(before[name].equals(after[name]), `${name} changed after invalid-200 terminal refresh`)
+  }
 }
 
 function portFromBaseUrl(baseUrl) {
@@ -543,6 +681,15 @@ async function waitForPortClosed(port, label, timeoutMs = 15000) {
   throw new Error(`${label} port ${port} remained open after process termination`)
 }
 
+async function waitForProcessExit(pid, label, timeoutMs = 15000) {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    if (!processExists(pid)) return
+    await new Promise(resolve => setTimeout(resolve, 250))
+  }
+  throw new Error(`${label} PID ${pid} remained alive after terminal policy revocation`)
+}
+
 function processExists(pid) {
   if (!Number.isInteger(pid) || pid <= 0) return false
   try {
@@ -553,7 +700,7 @@ function processExists(pid) {
   }
 }
 
-async function scanTokenArtifacts(runRoot) {
+async function scanSensitiveArtifacts(runRoot) {
   const findings = []
   const allowedExtensions = new Set(['.json', '.log', '.md', '.txt', '.yaml', '.yml'])
   const pending = [runRoot]
@@ -575,7 +722,10 @@ async function scanTokenArtifacts(runRoot) {
       const stat = await fs.promises.stat(target).catch(() => null)
       if (!stat || stat.size > 5 * 1024 * 1024) continue
       const content = await fs.promises.readFile(target, 'utf8').catch(() => '')
-      if (/dsk_[A-Za-z0-9_-]{8,}/.test(content)) findings.push(path.relative(runRoot, target))
+      const reasons = []
+      if (/dsk_[A-Za-z0-9_-]{8,}/.test(content)) reasons.push('desktop-token')
+      if (content.includes(FIXTURE_PASSWORD)) reasons.push('fixture-password')
+      if (reasons.length) findings.push(`${path.relative(runRoot, target)} (${reasons.join(',')})`)
     }
   }
   return findings
@@ -590,7 +740,12 @@ async function main() {
 
   const results = new Map()
   recordGate(results, 'no-LKG fail-closed', 'NOT-RUN', 'a second isolated Electron run is outside this partial harness')
-  recordGate(results, 'prompt and new-session behavior', 'NOT-RUN', 'hard-coded partial-harness exclusion')
+  recordGate(results, 'terminal HTTP status matrix', 'NOT-RUN', 'not implemented in the first strict-refresh slice')
+  recordGate(results, 'full bootstrap envelope mutation matrix', 'NOT-RUN', 'only the first lockedSurfaces mutation runs in this slice')
+  recordGate(results, 'cross-user never adopts another user LKG', 'NOT-RUN', 'not implemented in the first strict-refresh slice')
+  recordGate(results, 'current-session prompt hash remains stable', 'NOT-RUN', 'not implemented in the first strict-refresh slice')
+  recordGate(results, 'new-session skill index changes after policy refresh', 'NOT-RUN', 'not implemented in the first strict-refresh slice')
+  recordGate(results, 'blocked linked skill read is denied through real tool call', 'NOT-RUN', 'not implemented in the first strict-refresh slice')
   recordGate(results, 'Bundle and Cron operation snapshots', 'NOT-RUN', 'hard-coded partial-harness exclusion')
   recordGate(
     results,
@@ -601,12 +756,14 @@ async function main() {
 
   let runRoot = null
   let gateway = null
+  let gatewayProxy = null
   let electron = null
   let cdp = null
   let electronPid = null
   let backendPid = null
   let backendPort = null
   let gatewayPort = null
+  let gatewayProxyPort = null
   let fatal = null
 
   try {
@@ -638,6 +795,9 @@ async function main() {
     await fs.promises.cp(FIXTURE_ROOT, path.join(context.catalogRoot, FIXTURE_NAME), { recursive: true })
 
     gateway = await startGateway(context)
+    gatewayProxy = await startGatewayFaultProxy({ targetBaseUrl: context.gatewayBaseUrl })
+    gatewayProxyPort = gatewayProxy.port
+    const userDataRoot = path.join(runRoot, 'desktop-user-data')
     electron = startProcess(
       'electron',
       electronExecutable,
@@ -648,9 +808,9 @@ async function main() {
           HERMES_DESKTOP_CWD: runRoot,
           HERMES_DESKTOP_HERMES_ROOT: DESKTOP_ROOT,
           HERMES_DESKTOP_PYTHON: python,
-          HERMES_DESKTOP_USER_DATA_DIR: path.join(runRoot, 'desktop-user-data'),
+          HERMES_DESKTOP_USER_DATA_DIR: userDataRoot,
           HERMES_ENTERPRISE_DESKTOP: '1',
-          HERMES_ENTERPRISE_GATEWAY_URL: context.gatewayBaseUrl,
+          HERMES_ENTERPRISE_GATEWAY_URL: gatewayProxy.baseUrl,
           HERMES_HOME: path.join(runRoot, 'bootstrap-hermes-home')
         },
         logPath: path.join(runRoot, 'desktop-launcher.log')
@@ -662,11 +822,17 @@ async function main() {
     await waitForRendererBridge(cdp)
     recordGate(results, 'real Gateway and built Electron startup', 'PASS', `Gateway and Electron PID ${electronPid} became ready`)
 
-    await evaluate(
+    const loginMethodsState = await evaluate(cdp, '(async () => window.hermesDesktop.enterprise.loginMethods())()')
+    assert.ok(loginMethodsState?.methods?.includes('password'), 'isolated Gateway did not advertise password login')
+    assert.equal(loginMethodsState.selectedMethod, 'password')
+    assert.equal(loginMethodsState.status, 'password-ready')
+    const loginState = await evaluate(
       cdp,
-      `(async () => window.hermesDesktop.enterprise.login(${JSON.stringify({ username: 'view', password: DEFAULT_PASSWORD })}))()`
+      `(async () => window.hermesDesktop.enterprise.login(${JSON.stringify({ username: FIXTURE_USER, password: FIXTURE_PASSWORD })}))()`
     )
-    const connection = await evaluate(cdp, '(async () => window.hermesDesktop.getConnection())()')
+    assert.equal(loginState.authenticated, true)
+    assert.equal(loginState.user?.userName, FIXTURE_USER)
+    const connection = await waitForManagedConnection(cdp)
     assert.ok(connection?.baseUrl, 'getConnection did not return a backend baseUrl')
     backendPort = portFromBaseUrl(connection.baseUrl)
     const backendDeadline = Date.now() + 15000
@@ -694,27 +860,74 @@ async function main() {
       `${initialState.policyHash} -> ${blockedState.policyHash}`
     )
 
-    assert.equal(electron.child.pid, electronPid, 'Electron PID changed during policy refresh')
-    assert.equal(electron.child.exitCode, null, 'Electron exited during policy refresh')
-    assert.equal(listeningProcessId(backendPort), backendPid, 'Python backend PID changed during policy refresh')
+    assert.equal(electron.child.pid, electronPid, 'Electron PID changed during ordinary policy refresh')
+    assert.equal(electron.child.exitCode, null, 'Electron exited during ordinary policy refresh')
+    assert.equal(listeningProcessId(backendPort), backendPid, 'Python backend PID changed during ordinary policy refresh')
 
-    await stopProcess(gateway)
-    gateway = null
-    await waitForPortClosed(gatewayPort, 'Gateway')
+    const managedHermesHome = findManagedHermesHome(userDataRoot)
+    const evidenceBefore = managedHomeEvidence(managedHermesHome)
+
+    gatewayProxy.setBootstrapFault({ kind: 'status-503', marker: 'u5-p2-same-user-503' })
     const staleState = await evaluate(cdp, '(async () => window.hermesDesktop.enterprise.refreshPolicy())()')
     assert.equal(staleState.policyRefreshStatus, 'stale')
     assert.equal(staleState.policyStale, true)
     assert.equal(staleState.policyHash, blockedState.policyHash)
     assert.equal(policyStatus(staleState), 'blocked')
-    assert.match(staleState.policyRefreshError || '', /failed/i)
-    recordGate(results, 'Gateway-down stale last-known-good refresh', 'PASS', 'blocked policy hash was retained and marked stale')
+    assert.match(staleState.policyRefreshError || '', /HTTP 503/)
+    assertManagedHomeEvidenceUnchanged(evidenceBefore, managedHomeEvidence(managedHermesHome))
+    assert.equal(electron.child.pid, electronPid, 'Electron PID changed during same-user 503 LKG refresh')
+    assert.equal(electron.child.exitCode, null, 'Electron exited during same-user 503 LKG refresh')
+    assert.equal(listeningProcessId(backendPort), backendPid, 'Python backend listener changed during same-user 503 LKG refresh')
+    assert.equal(processExists(backendPid), true, 'Python backend process exited during same-user 503 LKG refresh')
+    recordGate(
+      results,
+      'same-user 503 adopts stale last-known-good',
+      'PASS',
+      `policy ${blockedState.policyHash} and Electron/Python PIDs remained stable`
+    )
 
-    assert.equal(electron.child.pid, electronPid, 'Electron PID changed after Gateway-down refresh')
-    assert.equal(electron.child.exitCode, null, 'Electron exited after Gateway-down refresh')
-    assert.equal(listeningProcessId(backendPort), backendPid, 'Python backend PID changed after Gateway-down refresh')
-    recordGate(results, 'Electron and backend PID stability', 'PASS', `Electron ${electronPid}; Python ${backendPid}`)
+    gatewayProxy.setBootstrapFault(null)
+    gatewayProxy.setBootstrapFault({ kind: 'locked-missing', marker: 'u5-p2-invalid-200-locked-missing' })
+    const invalidState = await evaluate(cdp, '(async () => window.hermesDesktop.enterprise.refreshPolicy())()')
+    assert.equal(invalidState.status, 'error')
+    assert.equal(invalidState.authenticated, true)
+    assert.equal(invalidState.policyStale, false)
+    assert.equal(invalidState.policyHash, null)
+    assert.equal(invalidState.toolPolicySnapshot, null)
+    assert.notEqual(invalidState.policyRefreshStatus, 'stale')
+    assert.equal(policyStatus(invalidState), null)
+    assert.match(invalidState.terminalError?.errorCode || '', /enterprise_policy_payload_invalid/)
+    recordGate(
+      results,
+      'invalid-200 terminal blocks runtime without adopting LKG',
+      'PASS',
+      'renderer received blocked terminal state with no effective policy snapshot'
+    )
+
+    const evidenceAfter = managedHomeEvidence(managedHermesHome)
+    assertManagedHomeEvidenceUnchanged(evidenceBefore, evidenceAfter)
+    recordGate(
+      results,
+      'invalid-200 preserves managed-home evidence bytes',
+      'PASS',
+      '.env, config.yaml, and enterprise-policy.json remained byte-identical for forensic recovery'
+    )
+
+    await waitForPortClosed(backendPort, 'Python backend')
+    await waitForProcessExit(backendPid, 'Python backend')
+    assert.equal(electron.child.exitCode, null, 'Electron exited instead of remaining in managed blocked state')
+    recordGate(
+      results,
+      'invalid-200 terminal revokes Python backend',
+      'PASS',
+      `Python backend PID ${backendPid} stopped while Electron PID ${electronPid} remained alive`
+    )
   } catch (error) {
     fatal = error
+    if (gatewayProxy?.state?.requestJournal?.length) {
+      assert.ok(gatewayProxy.state.requestJournal.length <= 200, 'sanitized request journal exceeded its in-memory bound')
+      console.error(`SANITIZED gateway request journal (last 30): ${JSON.stringify(gatewayProxy.state.requestJournal.slice(-30))}`)
+    }
     const firstUnrecorded = GATES.find(gate => !results.has(gate) && ![
       'desktop-token-only artifact scan',
       'cleanup'
@@ -732,8 +945,10 @@ async function main() {
     try {
       await stopProcess(electron, true)
       await stopProcess(gateway)
+      if (gatewayProxy) await gatewayProxy.close()
       if (backendPort) await waitForPortClosed(backendPort, 'Python backend')
       if (gatewayPort) await waitForPortClosed(gatewayPort, 'Gateway')
+      if (gatewayProxyPort) await waitForPortClosed(gatewayProxyPort, 'Gateway fault proxy')
     } catch (error) {
       cleanupError = error
       fatal ||= error
@@ -741,16 +956,16 @@ async function main() {
 
     if (runRoot) {
       try {
-        const findings = await scanTokenArtifacts(runRoot)
+        const findings = await scanSensitiveArtifacts(runRoot)
         if (findings.length) {
-          recordGate(results, 'desktop-token-only artifact scan', 'FAIL', `dsk_ token-shaped value found in ${findings.join(', ')}`)
-          fatal ||= new Error('Desktop token leaked to isolated text artifacts')
+          recordGate(results, 'desktop-token-only artifact scan', 'FAIL', `sensitive fixture value found in ${findings.join(', ')}`)
+          fatal ||= new Error('Sensitive fixture value leaked to isolated text artifacts')
         } else {
           recordGate(
             results,
             'desktop-token-only artifact scan',
             'PASS',
-            'no persisted dsk_ desktop token found in isolated text artifacts'
+            'no persisted dsk_ desktop token or fixture password found in isolated text artifacts'
           )
         }
       } catch (error) {
@@ -784,8 +999,8 @@ async function main() {
     }
   }
 
-  printResults(results)
-  if (fatal || [...results.values()].some(result => result.status === 'FAIL')) process.exitCode = 1
+  const complete = printResults(results)
+  if (fatal || !complete) process.exitCode = 1
 }
 
 main().catch(error => {
