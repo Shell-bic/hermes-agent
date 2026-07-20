@@ -66,11 +66,15 @@ echo "  (TZ=UTC LANG=C.UTF-8 PYTHONHASHSEED=0; clean env)"
 
 cd "$REPO_ROOT"
 
+# Windows Known Folder expansion uses SYSTEMDRIVE as a non-secret drive root.
+# Without it, native resource-cache initialization writes a literal
+# ``%SystemDrive%`` tree below the test working directory.
 exec env -i \
   PATH="$PATH" \
   HOME="$HOME" \
   ${USERPROFILE:+USERPROFILE="$USERPROFILE"} \
   ${LOCALAPPDATA:+LOCALAPPDATA="$LOCALAPPDATA"} \
+  ${SYSTEMDRIVE:+SYSTEMDRIVE="$SYSTEMDRIVE"} \
   TZ=UTC \
   LANG=C.UTF-8 \
   LC_ALL=C.UTF-8 \
