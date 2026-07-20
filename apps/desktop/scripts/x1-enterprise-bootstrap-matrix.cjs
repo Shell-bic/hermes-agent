@@ -22,7 +22,8 @@ const MAX_OWNED_TEMP_PATH_LENGTH = 120
 const SYNTHETIC_DESKTOP_TOKEN = 'dsk_x1_private_fixture'
 const SYNTHETIC_GATEWAY_TOKEN = 'gw_x1_private_fixture'
 const FIXED_SYNTHETIC_USER_ID = '11111111-2222-4333-8444-555555555555'
-const GATEWAY_EXPORTER_REF = '609c509952be368c914a5e64e23cf5e48831f530'
+const GATEWAY_EXPORTER_REF = '06b02773f7e3ec35cdf3737467b4c7839c148f20'
+const GATEWAY_EXPORTER_TREE = 'f8e0551e1f642cb2aad05021c0d4669794d74993'
 
 const CASES = Object.freeze([
   {
@@ -1344,6 +1345,7 @@ async function executeMatrix(options) {
   let exporterProject
   let exporterProjectSha256 = null
   let exporterArchiveSha256 = null
+  let exporterTree = null
   let runnerIdentity = null
   let rollbackHome = null
   let expectedSyntheticUserId = null
@@ -1381,6 +1383,13 @@ async function executeMatrix(options) {
         ['rev-parse', '--verify', `${GATEWAY_EXPORTER_REF}^{commit}`]
       )).toString('utf8').trim().toLowerCase()
       if (exporterActual !== GATEWAY_EXPORTER_REF) throw new MatrixError('matrix_gateway_exporter_ref_mismatch')
+      exporterTree = (await gitBytes(
+        runner,
+        'verify-gateway-exporter-tree',
+        options.gatewaySourceRoot,
+        ['rev-parse', '--verify', `${GATEWAY_EXPORTER_REF}^{tree}`]
+      )).toString('utf8').trim().toLowerCase()
+      if (exporterTree !== GATEWAY_EXPORTER_TREE) throw new MatrixError('matrix_gateway_exporter_tree_mismatch')
       setAssertion(assertions, 'preflight.fixed-refs', 'PASS')
 
       const archives = new Map()
@@ -1622,6 +1631,7 @@ async function executeMatrix(options) {
     fixedRefs: FIXED_REFS,
     gatewayExporter: {
       ref: GATEWAY_EXPORTER_REF,
+      tree: exporterTree,
       archiveSha256: exporterArchiveSha256,
       archiveProjectSha256: exporterProjectSha256
     },
@@ -1676,6 +1686,7 @@ module.exports = {
   FIXED_REFS,
   FIXED_SYNTHETIC_USER_ID,
   GATEWAY_EXPORTER_REF,
+  GATEWAY_EXPORTER_TREE,
   MAX_OWNED_TEMP_PATH_LENGTH,
   MATRIX_MANIFEST_FILE,
   assertionIds,

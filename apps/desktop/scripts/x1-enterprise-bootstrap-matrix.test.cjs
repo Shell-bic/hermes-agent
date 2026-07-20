@@ -10,6 +10,7 @@ const {
   FIXED_REFS,
   FIXED_SYNTHETIC_USER_ID,
   GATEWAY_EXPORTER_REF,
+  GATEWAY_EXPORTER_TREE,
   MAX_OWNED_TEMP_PATH_LENGTH,
   assertionIds,
   createProcessRunner,
@@ -158,7 +159,8 @@ test('matrix pins the four approved refs and all required compatibility cases', 
     desktopP1: '39b5be1c7e7ccf89fde91540d3e7e61c60d07186',
     desktopP2: '1622148f80de3c71f22df2a485da09c65c201911'
   })
-  assert.equal(GATEWAY_EXPORTER_REF, '609c509952be368c914a5e64e23cf5e48831f530')
+  assert.equal(GATEWAY_EXPORTER_REF, '06b02773f7e3ec35cdf3737467b4c7839c148f20')
+  assert.equal(GATEWAY_EXPORTER_TREE, 'f8e0551e1f642cb2aad05021c0d4669794d74993')
   assert.equal(FIXED_SYNTHETIC_USER_ID, '11111111-2222-4333-8444-555555555555')
   assert.deepEqual(
     CASES.slice(0, 6).map(item => item.id),
