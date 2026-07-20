@@ -1000,6 +1000,7 @@ def test_session_resume_passes_stored_runtime_to_agent(monkeypatch):
         "provider": "openai-codex",
         "base_url": "https://custom.example/v1",
         "api_mode": "chat_completions",
+        "model_profile_id": None,
     }
     assert captured["provider_override"] == "openai-codex"
     assert captured["reasoning_config_override"] == {"enabled": True, "effort": "high"}
@@ -8166,7 +8167,12 @@ def test_session_create_records_ui_model_as_session_override(monkeypatch):
         )
         sid = resp["result"]["session_id"]
         sess = server._sessions[sid]
-        assert sess["model_override"] == {"model": "claude-sonnet-4.6", "provider": "anthropic"}
+        assert sess["model_override"] == {
+            "model": "claude-sonnet-4.6",
+            "provider": "anthropic",
+            "model_profile_id": None,
+            "request_overrides": None,
+        }
         assert sess["create_reasoning_override"] is not None
         assert sess["create_service_tier_override"] == "priority"
         # The immediate response reflects the override (not the global default) so
