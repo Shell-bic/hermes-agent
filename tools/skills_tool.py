@@ -783,10 +783,45 @@ def skills_list(category: str = None, task_id: str = None) -> str:
         )
 
     except Exception as e:
+        from hermes_cli.enterprise_policy import is_enterprise_managed
+
+        if is_enterprise_managed():
+            return json.dumps(
+                {
+                    "success": False,
+                    "errorCode": "enterprise_skill_policy_unavailable",
+                    "error": "Enterprise Skill authorization is unavailable.",
+                },
+                ensure_ascii=False,
+            )
         return tool_error(str(e), success=False)
 
 
 # ── Plugin skill serving ──────────────────────────────────────────────────
+
+
+def _plugin_skill_policy_decision(namespace: str, bare: str) -> dict[str, Any]:
+    """Return the managed runtime decision for one qualified plugin Skill."""
+    from hermes_cli.enterprise_policy import skill_runtime_decision, skill_runtime_identity
+
+    return skill_runtime_decision(
+        skill_runtime_identity(f"{namespace}:{bare}", provenance="plugin")
+    )
+
+
+def _visible_plugin_skills(namespace: str, skill_names: list[str]) -> list[str]:
+    """Filter plugin discovery metadata through the same content-load guard."""
+    visible: list[str] = []
+    for bare in skill_names:
+        try:
+            if _plugin_skill_policy_decision(namespace, bare)["allowed"]:
+                visible.append(bare)
+        except Exception:
+            from hermes_cli.enterprise_policy import is_enterprise_managed
+
+            if not is_enterprise_managed():
+                visible.append(bare)
+    return visible
 
 
 def _serve_plugin_skill(
@@ -794,19 +829,14 @@ def _serve_plugin_skill(
     namespace: str,
     bare: str,
     *,
+    file_path: str | None = None,
     preprocess: bool = True,
     session_id: str | None = None,
 ) -> str:
     """Read a plugin-provided skill, apply guards, return JSON."""
-    from hermes_cli.enterprise_policy import (
-        skill_policy_error_payload,
-        skill_runtime_decision,
-        skill_runtime_identity,
-    )
+    from hermes_cli.enterprise_policy import skill_policy_error_payload
 
-    decision = skill_runtime_decision(
-        skill_runtime_identity(f"{namespace}:{bare}", provenance="plugin")
-    )
+    decision = _plugin_skill_policy_decision(namespace, bare)
     if not decision["allowed"]:
         return json.dumps(skill_policy_error_payload(decision), ensure_ascii=False)
 
@@ -820,6 +850,65 @@ def _serve_plugin_skill(
                     f"Plugin '{namespace}' is disabled. "
                     f"Re-enable with: hermes plugins enable {namespace}"
                 ),
+            },
+            ensure_ascii=False,
+        )
+
+    skill_dir = skill_md.parent
+    if file_path:
+        from tools.path_security import has_traversal_component, validate_within_dir
+
+        if has_traversal_component(file_path):
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": "Path traversal ('..') is not allowed.",
+                    "hint": "Use a relative path within the skill directory",
+                },
+                ensure_ascii=False,
+            )
+        target_file = skill_dir / file_path
+        traversal_error = validate_within_dir(target_file, skill_dir)
+        if traversal_error:
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": traversal_error,
+                    "hint": "Use a relative path within the skill directory",
+                },
+                ensure_ascii=False,
+            )
+        if not target_file.is_file():
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": f"File '{file_path}' not found in skill '{namespace}:{bare}'.",
+                },
+                ensure_ascii=False,
+            )
+        try:
+            linked_content = target_file.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            return json.dumps(
+                {
+                    "success": True,
+                    "name": f"{namespace}:{bare}",
+                    "file": file_path,
+                    "content": (
+                        f"[Binary file: {target_file.name}, "
+                        f"size: {target_file.stat().st_size} bytes]"
+                    ),
+                    "is_binary": True,
+                },
+                ensure_ascii=False,
+            )
+        return json.dumps(
+            {
+                "success": True,
+                "name": f"{namespace}:{bare}",
+                "file": file_path,
+                "content": linked_content,
+                "file_type": target_file.suffix,
             },
             ensure_ascii=False,
         )
@@ -861,10 +950,13 @@ def _serve_plugin_skill(
 
     # Bundle context banner — tells the agent about sibling skills
     try:
-        siblings = [
-            s for s in get_plugin_manager().list_plugin_skills(namespace)
-            if s != bare
-        ]
+        siblings = _visible_plugin_skills(
+            namespace,
+            [
+                s for s in get_plugin_manager().list_plugin_skills(namespace)
+                if s != bare
+            ],
+        )
         if siblings:
             sib_list = ", ".join(siblings)
             banner = (
@@ -892,13 +984,36 @@ def _serve_plugin_skill(
                 "Could not preprocess plugin skill %s:%s", namespace, bare, exc_info=True
             )
 
+    linked_files: dict[str, list[str]] = {}
+    for directory, patterns in {
+        "references": ("*.md",),
+        "templates": ("*.md", "*.py", "*.yaml", "*.yml", "*.json", "*.tex", "*.sh"),
+        "assets": ("*",),
+        "scripts": ("*.py", "*.sh", "*.bash", "*.js", "*.ts", "*.rb"),
+    }.items():
+        base = skill_dir / directory
+        if not base.is_dir():
+            continue
+        files: list[str] = []
+        for pattern in patterns:
+            for candidate in base.rglob(pattern):
+                if not candidate.is_file():
+                    continue
+                from tools.path_security import validate_within_dir
+
+                if validate_within_dir(candidate, skill_dir):
+                    continue
+                files.append(candidate.relative_to(skill_dir).as_posix())
+        if files:
+            linked_files[directory] = sorted(set(files))
+
     return json.dumps(
         {
             "success": True,
             "name": f"{namespace}:{bare}",
             "content": f"{banner}{rendered_content}" if banner else rendered_content,
             "description": description,
-            "linked_files": None,
+            "linked_files": linked_files or None,
             "readiness_status": SkillReadinessStatus.AVAILABLE.value,
         },
         ensure_ascii=False,
@@ -1130,7 +1245,7 @@ def skill_view(
                         {
                             "success": False,
                             "error": (
-                                f"Skill '{name}' is unavailable. Its stale registry "
+                                f"Skill '{name}' no longer exists. Its stale registry "
                                 "entry was cleaned up; reload the plugin and try again."
                             ),
                         },
@@ -1140,12 +1255,16 @@ def skill_view(
                     plugin_skill_md,
                     namespace,
                     bare,
+                    file_path=file_path,
                     preprocess=preprocess,
                     session_id=task_id,
                 )
 
             # Plugin exists but this specific skill is missing?
-            available = pm.list_plugin_skills(namespace)
+            available = _visible_plugin_skills(
+                namespace,
+                pm.list_plugin_skills(namespace),
+            )
             if available:
                 return json.dumps(
                     {
@@ -1647,6 +1766,17 @@ def skill_view(
         return json.dumps(result, ensure_ascii=False)
 
     except Exception as e:
+        from hermes_cli.enterprise_policy import is_enterprise_managed
+
+        if is_enterprise_managed():
+            return json.dumps(
+                {
+                    "success": False,
+                    "errorCode": "enterprise_skill_policy_unavailable",
+                    "error": "Enterprise Skill authorization is unavailable.",
+                },
+                ensure_ascii=False,
+            )
         return tool_error(str(e), success=False)
 
 

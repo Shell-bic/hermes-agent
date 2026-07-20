@@ -34,7 +34,7 @@ from pathlib import Path
 from typing import Optional
 
 from hermes_cli import profiles as profiles_mod
-from agent.skill_utils import is_excluded_skill_path
+from agent.skill_utils import is_excluded_skill_path, read_skill_frontmatter
 
 logger = logging.getLogger(__name__)
 
@@ -97,42 +97,76 @@ class DescribeOutcome:
     description: Optional[str] = None
 
 
+def _authorized_skill_names(profile_dir: Path) -> list[str]:
+    """Collect names that the active managed policy permits the LLM to see."""
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    from hermes_cli.enterprise_policy import (
+        is_enterprise_managed,
+        skill_runtime_decision,
+        skill_runtime_identity,
+    )
+
+    skills_dir = profile_dir / "skills"
+    if not skills_dir.is_dir():
+        return []
+    names: list[str] = []
+    token = set_hermes_home_override(str(profile_dir))
+    try:
+        for md in skills_dir.rglob("SKILL.md"):
+            if is_excluded_skill_path(md):
+                continue
+            try:
+                rel = md.relative_to(skills_dir)
+                parts = rel.parts[:-1]
+                if not parts:
+                    continue
+                frontmatter = read_skill_frontmatter(md)
+                canonical_name = str(frontmatter.get("name") or parts[-1])
+                decision = skill_runtime_decision(
+                    skill_runtime_identity(canonical_name, skill_path=md)
+                )
+                if not decision["allowed"]:
+                    continue
+            except Exception as exc:
+                logger.warning("Failed to authorize profile skill %s: %s", md, exc)
+                if is_enterprise_managed():
+                    continue
+                try:
+                    rel = md.relative_to(skills_dir)
+                    parts = rel.parts[:-1]
+                except ValueError:
+                    continue
+            if len(parts) == 1:
+                names.append(parts[0])
+            else:
+                names.append(f"{parts[0]}/{parts[-1]}")
+    finally:
+        reset_hermes_home_override(token)
+    names.sort()
+    return names
+
+
+def _sample_skill_names(names: list[str]) -> list[str]:
+    """Return a stable, evenly-spaced prompt sample from one inventory."""
+    if len(names) <= MAX_SKILLS_FOR_PROMPT:
+        return list(names)
+    step = len(names) / MAX_SKILLS_FOR_PROMPT
+    return [names[int(i * step)] for i in range(MAX_SKILLS_FOR_PROMPT)]
+
+
 def _collect_skills(profile_dir: Path) -> list[str]:
-    """Return a stable, capped list of skill names for the prompt.
+    """Return a stable, capped list of authorized skill names for the prompt.
 
     Format: ``category/skill_name`` where category is the immediate
     subdir under ``skills/`` (e.g. ``devops``, ``research``). Skills
     that live directly under ``skills/`` show as bare ``skill_name``.
     """
-    skills_dir = profile_dir / "skills"
-    if not skills_dir.is_dir():
-        return []
-    names: list[str] = []
-    for md in skills_dir.rglob("SKILL.md"):
-        if is_excluded_skill_path(md):
-            continue
-        try:
-            rel = md.relative_to(skills_dir)
-        except ValueError:
-            continue
-        parts = rel.parts[:-1]  # drop SKILL.md filename
-        if not parts:
-            continue
-        # parts[-1] is the skill dir name; parts[:-1] is the category path
-        if len(parts) == 1:
-            names.append(parts[0])
-        else:
-            names.append(f"{parts[0]}/{parts[-1]}")
-    names.sort()
+    names = _authorized_skill_names(profile_dir)
     # Keep within prompt budget. Skills earlier in alphabet aren't more
     # important — we'll let the LLM see a sample. Pick evenly-spaced
     # entries instead of just the head so a profile with skills A..Z
     # doesn't get described as "starts with A".
-    if len(names) <= MAX_SKILLS_FOR_PROMPT:
-        return names
-    step = len(names) / MAX_SKILLS_FOR_PROMPT
-    sampled = [names[int(i * step)] for i in range(MAX_SKILLS_FOR_PROMPT)]
-    return sampled
+    return _sample_skill_names(names)
 
 
 def _extract_json_blob(raw: str) -> Optional[dict]:
@@ -196,12 +230,10 @@ def describe_profile(
             "(use --overwrite to replace)",
         )
 
-    skill_names = _collect_skills(profile_dir)
+    all_skill_names = _authorized_skill_names(profile_dir)
+    skill_names = _sample_skill_names(all_skill_names)
     skill_list = "\n".join(f"  - {n}" for n in skill_names) or "  (no skills installed)"
-    skill_count = sum(
-        1 for _ in (profile_dir / "skills").rglob("SKILL.md")
-        if not is_excluded_skill_path(_)
-    ) if (profile_dir / "skills").is_dir() else 0
+    skill_count = len(all_skill_names)
 
     # Read model + provider from the profile's config.
     try:

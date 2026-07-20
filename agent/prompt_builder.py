@@ -1144,6 +1144,24 @@ def _build_snapshot_entry(
 # Skills index
 # =========================================================================
 
+def _skill_runtime_allows_entry(skill_name: str, skill_file: Path) -> bool:
+    """Authorize one prompt-index entry without making managed mode fail open."""
+    from hermes_cli.enterprise_policy import (
+        is_enterprise_managed,
+        skill_runtime_decision,
+        skill_runtime_identity,
+    )
+
+    try:
+        return bool(
+            skill_runtime_decision(
+                skill_runtime_identity(skill_name, skill_path=skill_file)
+            )["allowed"]
+        )
+    except Exception as exc:
+        logger.warning("Failed to authorize skill index entry %s: %s", skill_file, exc)
+        return not is_enterprise_managed()
+
 def _parse_skill_file(skill_file: Path) -> tuple[bool, dict, str]:
     """Read a SKILL.md once and return platform compatibility, frontmatter, and description.
 
@@ -1153,15 +1171,8 @@ def _parse_skill_file(skill_file: Path) -> tuple[bool, dict, str]:
     try:
         frontmatter = read_skill_frontmatter(skill_file)
 
-        from hermes_cli.enterprise_policy import (
-            skill_runtime_decision,
-            skill_runtime_identity,
-        )
-
         canonical_name = str(frontmatter.get("name") or skill_file.parent.name)
-        if not skill_runtime_decision(
-            skill_runtime_identity(canonical_name, skill_path=skill_file)
-        )["allowed"]:
+        if not _skill_runtime_allows_entry(canonical_name, skill_file):
             # The disk snapshot is policy-neutral metadata. Keep the bounded
             # description even while current rendering filters this Skill out,
             # so a later policy-only allow does not reuse an empty entry.
@@ -1185,7 +1196,9 @@ def _parse_skill_file(skill_file: Path) -> tuple[bool, dict, str]:
         return True, frontmatter, extract_skill_description(frontmatter)
     except Exception as e:
         logger.warning("Failed to parse skill file %s: %s", skill_file, e)
-        return True, {}, ""
+        from hermes_cli.enterprise_policy import is_enterprise_managed
+
+        return (not is_enterprise_managed()), {}, ""
 
 
 def _skill_should_show(
@@ -1298,17 +1311,10 @@ def build_skills_system_prompt(
                 continue
             if frontmatter_name in disabled or skill_name in disabled:
                 continue
-            from hermes_cli.enterprise_policy import (
-                skill_runtime_decision,
-                skill_runtime_identity,
-            )
-
-            if not skill_runtime_decision(
-                skill_runtime_identity(
-                    frontmatter_name,
-                    skill_path=skills_dir / relative_path,
-                )
-            )["allowed"]:
+            if not _skill_runtime_allows_entry(
+                frontmatter_name,
+                skills_dir / relative_path,
+            ):
                 continue
             if not _skill_should_show(
                 entry.get("conditions") or {},

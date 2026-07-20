@@ -10049,6 +10049,12 @@ def _clear_skills_prompt_cache() -> None:
 async def get_skill_content(name: str, profile: Optional[str] = None):
     """Return the raw SKILL.md text for a skill, for the dashboard editor."""
     from tools.skill_manager_tool import _find_skill
+    from tools.skills_tool import _read_frontmatter_only
+    from hermes_cli.enterprise_policy import (
+        skill_policy_error_payload,
+        skill_runtime_decision,
+        skill_runtime_identity,
+    )
 
     with _profile_scope(profile):
         found = _find_skill(name)
@@ -10057,6 +10063,16 @@ async def get_skill_content(name: str, profile: Optional[str] = None):
         skill_md = found["path"] / "SKILL.md"
         if not skill_md.exists():
             raise HTTPException(status_code=404, detail=f"Skill '{name}' has no SKILL.md.")
+        frontmatter = _read_frontmatter_only(skill_md)
+        canonical_name = str(frontmatter.get("name") or found["path"].name)
+        decision = skill_runtime_decision(
+            skill_runtime_identity(canonical_name, skill_path=skill_md)
+        )
+        if not decision["allowed"]:
+            raise HTTPException(
+                status_code=403,
+                detail=skill_policy_error_payload(decision),
+            )
         try:
             content = skill_md.read_text(encoding="utf-8")
         except OSError as exc:

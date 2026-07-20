@@ -550,8 +550,15 @@ def build_skill_invocation_message(
     Returns:
         The formatted message string, or None if the skill wasn't found.
     """
+    # Keep the last resolved entry long enough to re-authorize it.  A policy
+    # refresh deliberately removes a newly-blocked Skill from the active
+    # command catalog, but a user may still invoke the slash command that was
+    # advertised earlier in the same session.  Re-resolving that trusted,
+    # previously-scanned path lets ``skill_view`` return the canonical
+    # enterprise denial instead of degrading to a generic load failure.
+    stale_skill_info = (_skill_commands or {}).get(cmd_key)
     commands = get_skill_commands()
-    skill_info = commands.get(cmd_key)
+    skill_info = commands.get(cmd_key) or stale_skill_info
     if not skill_info:
         return None
 
@@ -582,6 +589,38 @@ def build_skill_invocation_message(
     )
 
 
+def _preflight_skill_identifiers(skill_identifiers: list[str]) -> None:
+    """Authorize a multi-Skill entry before any body/setup/usage side effect."""
+    from hermes_cli.enterprise_policy import EnterpriseSkillPolicyDenied
+    from tools.skills_tool import skill_runtime_preflight
+
+    seen: set[str] = set()
+    for raw_identifier in skill_identifiers:
+        identifier = (raw_identifier or "").strip()
+        if not identifier or identifier in seen:
+            continue
+        seen.add(identifier)
+        result = json.loads(skill_runtime_preflight(identifier))
+        if (
+            not result.get("success")
+            and result.get("errorCode") == "enterprise_skill_policy_denied"
+        ):
+            raise EnterpriseSkillPolicyDenied(result)
+
+
+def preflight_skill_identifiers(
+    skill_identifiers: list[str],
+    *,
+    policy: dict | None = None,
+) -> dict:
+    """Freeze and authorize one multi-Skill entry without loading content."""
+    from hermes_cli.enterprise_policy import skill_policy_operation
+
+    with skill_policy_operation(policy) as snapshot:
+        _preflight_skill_identifiers(skill_identifiers)
+        return dict(snapshot)
+
+
 def build_preloaded_skills_prompt(
     skill_identifiers: list[str],
     task_id: str | None = None,
@@ -590,6 +629,21 @@ def build_preloaded_skills_prompt(
 
     Returns (prompt_text, loaded_skill_names, missing_identifiers).
     """
+    from hermes_cli.enterprise_policy import skill_policy_operation
+
+    with skill_policy_operation():
+        _preflight_skill_identifiers(skill_identifiers)
+        return _build_preloaded_skills_prompt(
+            skill_identifiers,
+            task_id=task_id,
+        )
+
+
+def _build_preloaded_skills_prompt(
+    skill_identifiers: list[str],
+    task_id: str | None = None,
+) -> tuple[str, list[str], list[str]]:
+    """Build a preloaded prompt under the caller's frozen policy snapshot."""
     prompt_parts: list[str] = []
     loaded_names: list[str] = []
     missing: list[str] = []
@@ -631,3 +685,55 @@ def build_preloaded_skills_prompt(
         loaded_names.append(skill_name)
 
     return "\n\n".join(prompt_parts), loaded_names, missing
+
+
+def build_auto_loaded_skills_message(
+    skill_identifiers: list[str],
+    user_message: str,
+    task_id: str | None = None,
+    *,
+    policy: dict | None = None,
+) -> tuple[str, list[str], list[str]]:
+    """Build one gateway topic/channel auto-load operation atomically.
+
+    All installed members are authorized before the first Skill body is read
+    or preprocessed.  Missing ordinary Skills remain non-fatal for backwards
+    compatibility; an enterprise denial aborts the complete auto-load.
+    """
+    from hermes_cli.enterprise_policy import skill_policy_operation
+
+    with skill_policy_operation(policy):
+        _preflight_skill_identifiers(skill_identifiers)
+
+        combined_parts: list[str] = []
+        loaded_names: list[str] = []
+        missing: list[str] = []
+        seen: set[str] = set()
+        for raw_identifier in skill_identifiers:
+            identifier = (raw_identifier or "").strip()
+            if not identifier or identifier in seen:
+                continue
+            seen.add(identifier)
+            loaded = _load_skill_payload(identifier, task_id=task_id)
+            if not loaded:
+                missing.append(identifier)
+                continue
+            loaded_skill, skill_dir, display_name = loaded
+            note = (
+                f'[IMPORTANT: The "{display_name}" skill is auto-loaded. '
+                "Follow its instructions for this session.]"
+            )
+            part = _build_skill_message(
+                loaded_skill,
+                skill_dir,
+                note,
+                session_id=task_id,
+            )
+            if part:
+                combined_parts.append(part)
+                loaded_names.append(identifier)
+
+        if not combined_parts:
+            return user_message, loaded_names, missing
+        combined_parts.append(user_message)
+        return "\n\n".join(combined_parts), loaded_names, missing
