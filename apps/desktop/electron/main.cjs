@@ -23,7 +23,7 @@ const http = require('node:http')
 const https = require('node:https')
 const path = require('node:path')
 const { fileURLToPath, pathToFileURL } = require('node:url')
-const { execFileSync, spawn } = require('node:child_process')
+const { execFile, execFileSync, spawn } = require('node:child_process')
 const {
   detectRemoteDisplay,
   isWindowsBinaryPathInWsl,
@@ -90,7 +90,12 @@ const {
   resolveTimeoutMs
 } = require('./hardening.cjs')
 const { createEnterpriseAuthStore } = require('./enterprise-auth-store.cjs')
-const { createEnterpriseBackendOwnership } = require('./enterprise-backend-ownership.cjs')
+const {
+  createEnterpriseBackendOwnership,
+  runBackendStartSequence,
+  runBackendMaintenanceHandoff,
+  stopOwnedBackendsForMaintenance
+} = require('./enterprise-backend-ownership.cjs')
 const { resolveEnterpriseDesktopConfigPaths } = require('./enterprise-desktop-config.cjs')
 const { createEnterpriseGatewayClient } = require('./enterprise-gateway-client.cjs')
 const { createEnterpriseRuntime, resolveEnterpriseRuntimeOptions } = require('./enterprise-runtime.cjs')
@@ -975,7 +980,7 @@ const enterpriseBackendOwnership = createEnterpriseBackendOwnership({
     }
   },
   forceStopTree: async (child, identity) => {
-    if (backendProcessIdentityMatches(child, identity) !== true) return
+    if (await backendProcessIdentityMatches(child, identity) !== true) return
     if (IS_WINDOWS && Number.isInteger(child?.pid)) {
       forceKillProcessTree(child.pid)
     } else if (child && child.exitCode === null && child.signalCode === null) {
@@ -984,7 +989,7 @@ const enterpriseBackendOwnership = createEnterpriseBackendOwnership({
   },
   getLifecycle: () => enterpriseLifecycle,
   gracefulStop: async (child, identity) => {
-    if (backendProcessIdentityMatches(child, identity) !== true) return
+    if (await backendProcessIdentityMatches(child, identity) !== true) return
     if (child && child.exitCode === null && child.signalCode === null) {
       child.kill('SIGTERM')
     }
@@ -1007,6 +1012,7 @@ const enterpriseBackendOwnership = createEnterpriseBackendOwnership({
     backendPool.size === 0 &&
     poolIdleReaper === null
   ),
+  waitForProcessIdentity: identity => identity?.capturePromise,
   waitForExit: (child, identity) => waitForBackendExit(child, 5_000, identity)
 })
 const enterpriseRuntimeAccess = createEnterpriseRuntimeAccess({
@@ -2079,35 +2085,27 @@ async function releaseBackendLockForUpdate(updateRoot) {
 async function releaseBackendLock(updateRoot, tag) {
   if (!IS_WINDOWS) return { unlocked: true }
 
-  // Collect every backend PID the desktop owns: primary window backend + pool.
-  const pids = []
-  if (hermesProcess && Number.isInteger(hermesProcess.pid)) pids.push(hermesProcess.pid)
-  for (const entry of backendPool.values()) {
-    if (entry.process && Number.isInteger(entry.process.pid)) pids.push(entry.process.pid)
-  }
-
-  // Graceful first (lets Python flush), then tree-kill to catch grandchildren.
-  if (hermesProcess && !hermesProcess.killed) {
-    try {
-      hermesProcess.kill('SIGTERM')
-    } catch {
-      void 0
-    }
-  }
-  await stopAllPoolBackends()
-  for (const pid of pids) forceKillProcessTree(pid)
-
   const shim = venvHermesShimPath(updateRoot)
-  const deadlineMs = Date.now() + 15000
-  while (Date.now() < deadlineMs) {
-    if (!isShimLocked(shim)) {
+  return runBackendMaintenanceHandoff({
+    continueHandoff: () => {
       rememberLog(`[${tag}] venv shim unlocked; safe to proceed`)
       return { unlocked: true }
+    },
+    stopBackends: () => stopOwnedBackendsForMaintenance({
+      lifecycle: enterpriseLifecycle,
+      managed: enterpriseRuntime.isEnabled(),
+      ownership: enterpriseBackendOwnership,
+      reasonCode: `enterprise_${tag}_maintenance`
+    }),
+    verifyReady: async () => {
+      const deadlineMs = Date.now() + 15000
+      while (Date.now() < deadlineMs) {
+        if (!isShimLocked(shim)) return true
+        await new Promise(r => setTimeout(r, 300))
+      }
+      return false
     }
-    await new Promise(r => setTimeout(r, 300))
-  }
-  rememberLog(`[${tag}] venv shim still locked after 15s; proceeding anyway (force)`)
-  return { unlocked: false }
+  })
 }
 
 // applyUpdates — hand off to the installer's --update flow, then exit.
@@ -4929,50 +4927,70 @@ function resetHermesConnection() {
   resetBootProgressForReconnect()
 }
 
-function readBackendProcessStartMarker(pid) {
+function execFileText(command, args, options = {}) {
+  return new Promise((resolve, reject) => {
+    execFile(command, args, { ...options, encoding: 'utf8' }, (error, stdout) => {
+      if (error) reject(error)
+      else resolve(String(stdout || ''))
+    })
+  })
+}
+
+async function readBackendProcessStartMarker(pid, signal) {
   if (!Number.isInteger(pid) || pid <= 0) return null
   try {
     if (IS_WINDOWS) {
       const script = `(Get-CimInstance Win32_Process -Filter "ProcessId = ${pid}").CreationDate.ToUniversalTime().Ticks`
-      return execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], {
-        encoding: 'utf8',
+      return (await execFileText('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], {
+        signal,
         timeout: 2_000,
         windowsHide: true
-      }).trim() || null
+      })).trim() || null
     }
     if (process.platform === 'linux') {
-      const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8')
+      const stat = await fs.promises.readFile(`/proc/${pid}/stat`, { encoding: 'utf8', signal })
       const fields = stat.slice(stat.lastIndexOf(')') + 2).trim().split(/\s+/)
       return fields[19] || null
     }
-    return execFileSync('ps', ['-o', 'lstart=', '-p', String(pid)], {
-      encoding: 'utf8',
+    return (await execFileText('ps', ['-o', 'lstart=', '-p', String(pid)], {
+      signal,
       timeout: 2_000
-    }).trim() || null
+    })).trim() || null
   } catch {
     return null
   }
 }
 
-function captureBackendProcessIdentity(child) {
-  return Object.freeze({
+function beginBackendProcessIdentityCapture(child) {
+  const identity = {
+    capturePromise: null,
     pid: Number(child?.pid) || null,
-    startMarker: readBackendProcessStartMarker(Number(child?.pid))
+    startMarker: null
+  }
+  identity.capturePromise = readBackendProcessStartMarker(identity.pid).then(startMarker => {
+    identity.startMarker = startMarker
+    return identity
   })
+  return identity
 }
 
-function backendProcessIdentityMatches(child, identity) {
+async function awaitBackendProcessIdentity(identity) {
+  await identity?.capturePromise
+  return identity
+}
+
+async function backendProcessIdentityMatches(child, identity) {
   if (!child || !identity || child.pid !== identity.pid || !identity.startMarker) return null
   if (child.exitCode !== null || child.signalCode !== null) return false
-  const currentMarker = readBackendProcessStartMarker(child.pid)
+  const currentMarker = await readBackendProcessStartMarker(child.pid)
   if (!currentMarker) return null
   return currentMarker === identity.startMarker
 }
 
-function probeBackendProcess(child, identity) {
+async function probeBackendProcess(child, identity) {
   if (!child || !Number.isInteger(child.pid) || child.pid <= 0) return false
   if (child.exitCode !== null || child.signalCode !== null) return false
-  const identityMatch = backendProcessIdentityMatches(child, identity)
+  const identityMatch = await backendProcessIdentityMatches(child, identity)
   if (identityMatch !== true) return identityMatch === null
   try {
     process.kill(child.pid, 0)
@@ -5046,12 +5064,12 @@ async function waitForBackendExit(child, timeoutMs = 5000, identity = null) {
   if (child.exitCode !== null || child.signalCode !== null) {
     return
   }
-  if (identity && backendProcessIdentityMatches(child, identity) === false) return
+  if (identity && await backendProcessIdentityMatches(child, identity) === false) return
 
   await new Promise(resolve => {
-    const timer = setTimeout(() => {
+    const timer = setTimeout(async () => {
       try {
-        const identityMatch = identity ? backendProcessIdentityMatches(child, identity) : true
+        const identityMatch = identity ? await backendProcessIdentityMatches(child, identity) : true
         if (identityMatch !== true) {
           resolve()
         } else if (IS_WINDOWS && Number.isInteger(child.pid)) {
@@ -5244,7 +5262,7 @@ async function spawnPoolBackend(profile, entry, ticket) {
     })
   )
   entry.process = child
-  entry.processIdentity = captureBackendProcessIdentity(child)
+  entry.processIdentity = beginBackendProcessIdentityCapture(child)
   entry.token = token
 
   child.stdout.on('data', rememberLog)
@@ -5273,6 +5291,8 @@ async function spawnPoolBackend(profile, entry, ticket) {
       }
     }
   })
+
+  await awaitOwnedBackendStart(ticket, () => awaitBackendProcessIdentity(entry.processIdentity))
 
   // Discover the ephemeral port the child bound to
   const port = await awaitOwnedBackendStart(ticket, () => Promise.race([waitForDashboardPort(child), startFailed]))
@@ -5394,14 +5414,11 @@ async function startHermes() {
   let ownedConnectionPromise = null
   const startOperation = (async () => {
     await awaitOwnedBackendStart(ticket, () => advanceBootProgress('backend.resolve', 'Resolving Hermes backend', 8))
-    let enterpriseLaunch = { enabled: false }
-
     if (enterpriseManaged) {
       await awaitOwnedBackendStart(
         ticket,
         () => advanceBootProgress('enterprise.runtime', 'Preparing enterprise managed runtime', 18)
       )
-      enterpriseLaunch = await awaitOwnedBackendStart(ticket, () => enterpriseRuntime.prepareLaunch())
     }
 
     // Resolve for the desktop's primary profile so a per-profile remote
@@ -5446,48 +5463,48 @@ async function startHermes() {
     if (!enterpriseManaged && activeProfile) {
       dashboardArgs.unshift('--profile', activeProfile)
     }
-    await awaitOwnedBackendStart(ticket, () => advanceBootProgress('backend.runtime', 'Resolving Hermes runtime', 28))
-    const backend = await awaitOwnedBackendStart(ticket, () => ensureRuntime(resolveHermesBackend(dashboardArgs)))
     const hermesCwd = resolveHermesCwd()
     const webDist = resolveWebDist()
+    await awaitOwnedBackendStart(ticket, () => advanceBootProgress('backend.runtime', 'Resolving Hermes runtime', 28))
+    const prerequisites = await runBackendStartSequence({
+      managed: enterpriseManaged,
+      prepareLaunch: () => awaitOwnedBackendStart(ticket, () => enterpriseRuntime.prepareLaunch()),
+      resolveRuntime: () => awaitOwnedBackendStart(ticket, () => ensureRuntime(resolveHermesBackend(dashboardArgs))),
+      spawnBackend: async ({ backend, enterpriseLaunch: launch }) => {
+        await awaitOwnedBackendStart(
+          ticket,
+          () => advanceBootProgress('backend.spawn', `Starting Hermes backend via ${backend.label}`, 84)
+        )
+        rememberLog(`Starting Hermes backend via ${backend.label}`)
 
-    await awaitOwnedBackendStart(
-      ticket,
-      () => advanceBootProgress('backend.spawn', `Starting Hermes backend via ${backend.label}`, 84)
-    )
-    rememberLog(`Starting Hermes backend via ${backend.label}`)
-
-    enterpriseBackendOwnership.checkpoint(ticket)
-    const child = hermesProcess = spawn(
-      backend.command,
-      backend.args,
-      hiddenWindowsChildOptions({
-        cwd: hermesCwd,
-        env: {
-          ...process.env,
-          ...backend.env,
-          // Explicitly pin HERMES_HOME for the child so Python's get_hermes_home()
-          // resolves to the SAME location our resolveHermesHome() picked. Without
-          // this pin, Python falls back to ~/.hermes on every platform — fine on
-          // mac/linux (where our default matches), but on Windows our default is
-          // %LOCALAPPDATA%\hermes, which differs from C:\Users\<u>\.hermes.
-          // Mismatch would split config / sessions / .env / logs across two
-          // directories. install.ps1 sets HERMES_HOME via setx; the desktop
-          // can't reliably do that, so we set it inline for every spawn.
-          HERMES_HOME: enterpriseLaunch.hermesHome || HERMES_HOME,
-          ...(enterpriseLaunch.env || {}),
-          TERMINAL_CWD: hermesCwd,
-          HERMES_DASHBOARD_SESSION_TOKEN: token,
-          // Marks this dashboard backend as desktop-spawned so it runs the cron
-          // scheduler tick loop (the gateway isn't running under the app).
-          HERMES_DESKTOP: '1',
-          HERMES_WEB_DIST: webDist
-        },
-        shell: backend.shell,
-        stdio: ['ignore', 'pipe', 'pipe']
-      })
-    )
-    hermesProcessIdentity = captureBackendProcessIdentity(child)
+        enterpriseBackendOwnership.checkpoint(ticket)
+        const spawned = hermesProcess = spawn(
+          backend.command,
+          backend.args,
+          hiddenWindowsChildOptions({
+            cwd: hermesCwd,
+            env: {
+              ...process.env,
+              ...backend.env,
+              // Keep the Python child on the exact managed home prepared above.
+              HERMES_HOME: launch.hermesHome || HERMES_HOME,
+              ...(launch.env || {}),
+              TERMINAL_CWD: hermesCwd,
+              HERMES_DASHBOARD_SESSION_TOKEN: token,
+              // Desktop-spawned dashboards own the cron scheduler tick loop.
+              HERMES_DESKTOP: '1',
+              HERMES_WEB_DIST: webDist
+            },
+            shell: backend.shell,
+            stdio: ['ignore', 'pipe', 'pipe']
+          })
+        )
+        const identity = beginBackendProcessIdentityCapture(spawned)
+        hermesProcessIdentity = identity
+        return { child: spawned, identity }
+      }
+    })
+    const child = prerequisites.spawned.child
     child.stdout.on('data', rememberLog)
     child.stderr.on('data', rememberLog)
     let backendReady = false
@@ -5540,6 +5557,8 @@ async function startHermes() {
         }
       }
     })
+
+    await awaitOwnedBackendStart(ticket, () => awaitBackendProcessIdentity(hermesProcessIdentity))
 
     await awaitOwnedBackendStart(
       ticket,
@@ -6042,16 +6061,26 @@ ipcMain.handle('hermes:bootstrap:repair', async () => {
   // venv), and clear any latched failure + live connection. The renderer
   // reloads afterwards to re-drive the boot flow from scratch.
   rememberLog('[bootstrap] repair requested by renderer; clearing marker + latched failure')
-  try {
-    if (fileExists(BOOTSTRAP_COMPLETE_MARKER)) {
-      fs.rmSync(BOOTSTRAP_COMPLETE_MARKER, { force: true })
-    }
-  } catch (error) {
-    rememberLog(`[bootstrap] failed to remove marker during repair: ${error.message}`)
-  }
-  bootstrapFailure = null
-  resetHermesConnection()
-  return { ok: true }
+  return runBackendMaintenanceHandoff({
+    continueHandoff: () => {
+      try {
+        if (fileExists(BOOTSTRAP_COMPLETE_MARKER)) {
+          fs.rmSync(BOOTSTRAP_COMPLETE_MARKER, { force: true })
+        }
+      } catch (error) {
+        rememberLog(`[bootstrap] failed to remove marker during repair: ${error.message}`)
+      }
+      bootstrapFailure = null
+      resetBootProgressForReconnect()
+      return { ok: true }
+    },
+    stopBackends: () => stopOwnedBackendsForMaintenance({
+      lifecycle: enterpriseLifecycle,
+      managed: enterpriseRuntime.isEnabled(),
+      ownership: enterpriseBackendOwnership,
+      reasonCode: 'enterprise_bootstrap_repair'
+    })
+  })
 })
 ipcMain.handle('hermes:bootstrap:cancel', async () => {
   // Renderer's Cancel button during first-launch install. Abort the running
@@ -7013,11 +7042,7 @@ async function runDesktopUninstall(mode) {
   // live backend grandchild (gateway / pty / REPL) holding a mandatory file
   // lock would make the script's rmdir half-fail (#37532 for the update path).
   // Reuses the incident-hardened update teardown; no-op on macOS/Linux.
-  try {
-    await releaseBackendLock(ACTIVE_HERMES_ROOT, 'uninstall')
-  } catch (error) {
-    rememberLog(`[uninstall] backend teardown errored (continuing): ${error.message}`)
-  }
+  await releaseBackendLock(ACTIVE_HERMES_ROOT, 'uninstall')
 
   const scriptArgs = {
     desktopPid: process.pid,

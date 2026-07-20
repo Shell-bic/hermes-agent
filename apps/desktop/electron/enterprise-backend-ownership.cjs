@@ -11,6 +11,73 @@ class EnterpriseBackendOwnershipError extends Error {
   }
 }
 
+async function runBackendStartSequence({ managed = false, prepareLaunch, resolveRuntime, spawnBackend } = {}) {
+  if (typeof resolveRuntime !== 'function') {
+    throw new TypeError('Backend runtime resolution must be deferred.')
+  }
+  if (managed && typeof prepareLaunch !== 'function') {
+    throw new TypeError('Managed backend policy preparation must be deferred.')
+  }
+  if (typeof spawnBackend !== 'function') {
+    throw new TypeError('Backend spawn must be deferred.')
+  }
+
+  const enterpriseLaunch = managed ? await prepareLaunch() : { enabled: false }
+  const backend = await resolveRuntime(enterpriseLaunch)
+  const spawned = await spawnBackend({ backend, enterpriseLaunch })
+
+  return { backend, enterpriseLaunch, spawned }
+}
+
+async function stopOwnedBackendsForMaintenance({ lifecycle, managed = false, ownership, reasonCode } = {}) {
+  if (!ownership) throw new TypeError('Backend ownership is required for maintenance teardown.')
+
+  if (managed) {
+    if (!lifecycle) throw new TypeError('Enterprise lifecycle is required for managed maintenance teardown.')
+    const state = lifecycle.getSnapshot().state
+    if (state === 'running' || state === 'recovering' || state === 'revoking') {
+      await lifecycle.revoke({ reasonCode, terminalState: 'blocked' })
+    } else if (state === 'stop_failed') {
+      await lifecycle.retryStop({ reasonCode, terminalState: 'blocked' })
+    } else {
+      await ownership.cancelPendingStarts()
+      await ownership.stopOwnedProcesses()
+    }
+  } else {
+    await ownership.cancelPendingStarts()
+    await ownership.stopOwnedProcesses()
+  }
+
+  if (managed && lifecycle.getSnapshot().state === 'stop_failed') {
+    throw new EnterpriseBackendOwnershipError(
+      BACKEND_OWNERSHIP_ERROR_CODES.STOP_FAILED,
+      'Enterprise backend process trees are still alive.'
+    )
+  }
+  if (await ownership.verifyResourcesGone() !== true) {
+    throw new EnterpriseBackendOwnershipError(
+      BACKEND_OWNERSHIP_ERROR_CODES.STOP_FAILED,
+      'Backend resources remain after maintenance teardown.'
+    )
+  }
+  return true
+}
+
+async function runBackendMaintenanceHandoff({ continueHandoff, stopBackends, verifyReady = null } = {}) {
+  if (typeof stopBackends !== 'function' || typeof continueHandoff !== 'function') {
+    throw new TypeError('Maintenance teardown and handoff must be deferred.')
+  }
+
+  await stopBackends()
+  if (verifyReady && await verifyReady() !== true) {
+    throw new EnterpriseBackendOwnershipError(
+      BACKEND_OWNERSHIP_ERROR_CODES.STOP_FAILED,
+      'Backend maintenance handoff is not safe to continue.'
+    )
+  }
+  return continueHandoff()
+}
+
 function createEnterpriseBackendOwnership(options = {}) {
   const getLifecycle = options.getLifecycle
   const isManaged = typeof options.isManaged === 'function' ? options.isManaged : () => true
@@ -22,6 +89,7 @@ function createEnterpriseBackendOwnership(options = {}) {
   const clearConnectionResources = options.clearConnectionResources || (() => {})
   const verifyConnectionResourcesGone = options.verifyConnectionResourcesGone || (() => true)
   const captureProcessIdentity = options.captureProcessIdentity || (process => process)
+  const waitForProcessIdentity = options.waitForProcessIdentity || (async identity => identity)
   const probeProcessTree = options.probeProcessTree || (async process => {
     return process?.exitCode === null && process?.signalCode === null && process?.killed !== true
   })
@@ -158,6 +226,7 @@ function createEnterpriseBackendOwnership(options = {}) {
 
   async function processIsAlive(owner) {
     try {
+      await waitForProcessIdentity(owner.processIdentity)
       return await probeProcessTree(owner.process, owner.processIdentity) === true
     } catch {
       return true
@@ -253,5 +322,8 @@ function createEnterpriseBackendOwnership(options = {}) {
 module.exports = {
   BACKEND_OWNERSHIP_ERROR_CODES,
   createEnterpriseBackendOwnership,
-  EnterpriseBackendOwnershipError
+  EnterpriseBackendOwnershipError,
+  runBackendStartSequence,
+  runBackendMaintenanceHandoff,
+  stopOwnedBackendsForMaintenance
 }

@@ -88,7 +88,7 @@ function bootstrapPolicy(overrides = {}) {
     lockedSurfaces: ['skills'],
     policyHash,
     policyVersion,
-    user: { displayName: 'Ada' },
+    user: { id: 'user-a', displayName: 'Ada' },
     ...overrides,
     toolPolicySnapshot: {
       ...baseSnapshot,
@@ -267,7 +267,7 @@ test('managed policy LKG is persisted with and read only for the same enterprise
 test('managed policy refresh atomically replaces only enterprise-policy.json', () => {
   const hermesHome = fs.mkdtempSync(path.join(os.tmpdir(), 'hermes-enterprise-policy-refresh-'))
   writeManagedRuntimeHome({
-    bootstrap: { user: { displayName: 'Ada' } },
+    bootstrap: { user: { id: 'user-a', displayName: 'Ada' } },
     hermesHome,
     manifest: manifest()
   })
@@ -292,6 +292,27 @@ test('managed policy refresh atomically replaces only enterprise-policy.json', (
   assert.equal(fs.readFileSync(envPath, 'utf8'), envBefore)
   assert.deepEqual(fs.readdirSync(hermesHome).filter(name => name.endsWith('.tmp')), [])
   assert.equal(readManagedPolicySnapshot({ hermesHome }).valid, true)
+})
+
+test('managed policy refresh never inherits runtime fields from another user in the same home', () => {
+  const hermesHome = fs.mkdtempSync(path.join(os.tmpdir(), 'hermes-enterprise-policy-user-switch-'))
+  writeManagedRuntimeHome({
+    bootstrap: { user: { id: 'user-a', displayName: 'Ada' } },
+    hermesHome,
+    manifest: manifest()
+  })
+
+  const result = replaceManagedPolicySnapshot({
+    bootstrap: bootstrapPolicy({ user: { id: 'user-b', displayName: 'Grace' } }),
+    hermesHome
+  })
+
+  assert.equal(result.replacedExistingPolicy, false)
+  assert.equal(result.policy.enterpriseUserId, 'user-b')
+  assert.deepEqual(result.policy.allowedModels, [])
+  assert.equal(result.policy.currentModel, null)
+  assert.equal(result.policy.manifestId, null)
+  assert.equal(result.policy.sessionId, null)
 })
 
 test('managed policy reader rejects missing and locally damaged snapshots', () => {
@@ -883,15 +904,60 @@ test('managed config falls back to zh when existing display language is unsuppor
 })
 
 test('managed runtime home is scoped by enterprise user identity', () => {
-  assert.equal(enterpriseUserPathSegment({ id: 'B4EBB599-6E5C-443F-A823-EE3D534FB6C5' }), 'b4ebb599-6e5c-443f-a823-ee3d534fb6c5')
-  assert.equal(enterpriseUserPathSegment({ userName: 'view@example.com' }), 'view-example.com')
-  assert.equal(enterpriseUserPathSegment({ userName: '../其它 用户' }), 'unknown')
-  assert.equal(
-    resolveManagedHermesHome('C:\\Users\\Ada\\AppData\\Roaming\\Hermes', { id: 'user-a' }),
-    path.join('C:\\Users\\Ada\\AppData\\Roaming\\Hermes', 'enterprise', 'users', 'user-a', 'hermes-home')
+  assert.match(
+    enterpriseUserPathSegment({ id: 'B4EBB599-6E5C-443F-A823-EE3D534FB6C5' }),
+    /^b4ebb599-6e5c-443f-a823-ee3d534fb6c5-[a-f0-9]{16}$/
   )
+  assert.match(enterpriseUserPathSegment({ userName: 'view@example.com' }), /^view-example\.com-[a-f0-9]{16}$/)
+  assert.match(enterpriseUserPathSegment({ userName: '../其它 用户' }), /^user-[a-f0-9]{16}$/)
   assert.notEqual(
     resolveManagedHermesHome('/tmp/hermes', { id: 'user-a' }),
     resolveManagedHermesHome('/tmp/hermes', { id: 'user-b' })
   )
+  assert.notEqual(
+    resolveManagedHermesHome('/tmp/hermes', { id: 'a/b' }),
+    resolveManagedHermesHome('/tmp/hermes', { id: 'a-b' })
+  )
+})
+
+test('managed home upgrade atomically carries forward same-user enterprise skills', t => {
+  const userDataPath = fs.mkdtempSync(path.join(os.tmpdir(), 'hermes-enterprise-home-upgrade-'))
+  t.after(() => fs.rmSync(userDataPath, { force: true, recursive: true }))
+  const legacyHome = path.join(userDataPath, 'enterprise', 'users', 'user-a', 'hermes-home')
+  writeManagedRuntimeHome({
+    bootstrap: { user: { id: 'user-a', displayName: 'Ada' } },
+    hermesHome: legacyHome,
+    manifest: manifest()
+  })
+  const skillPath = path.join(legacyHome, 'skills', 'expense-review', 'SKILL.md')
+  fs.mkdirSync(path.dirname(skillPath), { recursive: true })
+  fs.writeFileSync(skillPath, '# Expense review', 'utf8')
+
+  const upgradedHome = resolveManagedHermesHome(userDataPath, { id: 'user-a' })
+
+  assert.notEqual(upgradedHome, legacyHome)
+  assert.equal(fs.existsSync(legacyHome), false)
+  assert.equal(fs.readFileSync(path.join(upgradedHome, 'skills', 'expense-review', 'SKILL.md'), 'utf8'), '# Expense review')
+  assert.equal(readManagedPolicySnapshot({ expectedUserId: 'user-a', hermesHome: upgradedHome }).valid, true)
+})
+
+test('managed home upgrade never adopts a colliding legacy directory owned by another user', t => {
+  const userDataPath = fs.mkdtempSync(path.join(os.tmpdir(), 'hermes-enterprise-home-mismatch-'))
+  t.after(() => fs.rmSync(userDataPath, { force: true, recursive: true }))
+  const legacyHome = path.join(userDataPath, 'enterprise', 'users', 'a-b', 'hermes-home')
+  writeManagedRuntimeHome({
+    bootstrap: { user: { id: 'a/b', displayName: 'Legacy owner' } },
+    hermesHome: legacyHome,
+    manifest: manifest()
+  })
+  const skillPath = path.join(legacyHome, 'skills', 'private-skill', 'SKILL.md')
+  fs.mkdirSync(path.dirname(skillPath), { recursive: true })
+  fs.writeFileSync(skillPath, '# Private', 'utf8')
+
+  const currentHome = resolveManagedHermesHome(userDataPath, { id: 'a-b' })
+
+  assert.notEqual(currentHome, legacyHome)
+  assert.equal(fs.existsSync(currentHome), false)
+  assert.equal(fs.existsSync(skillPath), true)
+  assert.equal(readManagedPolicySnapshot({ expectedUserId: 'a-b', hermesHome: legacyHome }).valid, false)
 })

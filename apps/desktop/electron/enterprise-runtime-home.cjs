@@ -1,5 +1,6 @@
 const fs = require('node:fs')
 const path = require('node:path')
+const crypto = require('node:crypto')
 
 const MANAGED_PROVIDER = 'company-gateway'
 const GATEWAY_TOKEN_ENV = 'COMPANY_GATEWAY_TOKEN'
@@ -133,13 +134,29 @@ function enterpriseUserPathSegment(user) {
   const record = user
   const raw = record.id || record.userId || record.desktopUserId || record.userName || record.username || record.email || ''
   const value = String(raw || '').trim().toLowerCase()
-  const safe = value.replace(/[^a-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '')
-
-  if (!safe || safe === '.' || safe === '..' || safe.includes('..')) {
+  if (!value || value.length > 256 || hasControlCharacters(value)) {
     return 'unknown'
   }
 
-  return safe
+  const safe = value
+    .replace(/[^a-z0-9._-]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .replace(/\.{2,}/g, '.')
+    .slice(0, 48)
+  const label = safe && safe !== '.' && safe !== '..' ? safe : 'user'
+  const digest = crypto.createHash('sha256').update(value).digest('hex').slice(0, 16)
+
+  return `${label}-${digest}`
+}
+
+function legacyEnterpriseUserPathSegment(user) {
+  if (!user || typeof user !== 'object') return 'unknown'
+
+  const raw = user.id || user.userId || user.desktopUserId || user.userName || user.username || user.email || ''
+  const value = String(raw || '').trim().toLowerCase()
+  const safe = value.replace(/[^a-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '')
+
+  return !safe || safe === '.' || safe === '..' || safe.includes('..') ? 'unknown' : safe
 }
 
 function enterpriseUserId(user) {
@@ -740,7 +757,12 @@ function replaceManagedPolicySnapshot({ bootstrap, fsImpl = fs, hermesHome } = {
     throw new Error('Managed Hermes home path is required.')
   }
 
-  const current = readManagedPolicySnapshot({ fsImpl, hermesHome })
+  const expectedUserId = enterpriseUserId(bootstrap?.user || bootstrap?.account)
+  if (!expectedUserId) {
+    throw new Error('Managed policy snapshot requires a valid enterprise user identity.')
+  }
+
+  const current = readManagedPolicySnapshot({ expectedUserId, fsImpl, hermesHome })
   const policy = buildRefreshedPolicySnapshot({ bootstrap, currentPolicy: current.policy })
   const policyPath = path.join(hermesHome, 'enterprise-policy.json')
   const temporaryPath = path.join(
@@ -967,8 +989,26 @@ function writeManagedRuntimeHome({ bootstrap, fsImpl = fs, hermesHome, manifest,
   }
 }
 
-function resolveManagedHermesHome(userDataPath, user = null) {
-  return path.join(userDataPath, 'enterprise', 'users', enterpriseUserPathSegment(user), 'hermes-home')
+function resolveManagedHermesHome(userDataPath, user = null, { fsImpl = fs } = {}) {
+  const usersRoot = path.join(userDataPath, 'enterprise', 'users')
+  const hermesHome = path.join(usersRoot, enterpriseUserPathSegment(user), 'hermes-home')
+  if (fsImpl.existsSync(hermesHome)) return hermesHome
+
+  const legacyHome = path.join(usersRoot, legacyEnterpriseUserPathSegment(user), 'hermes-home')
+  const expectedUserId = enterpriseUserId(user)
+  if (legacyHome === hermesHome || !expectedUserId || !fsImpl.existsSync(legacyHome)) return hermesHome
+
+  const legacyPolicy = readManagedPolicySnapshot({ expectedUserId, fsImpl, hermesHome: legacyHome })
+  if (!legacyPolicy.valid) return hermesHome
+
+  fsImpl.mkdirSync(path.dirname(hermesHome), { recursive: true })
+  try {
+    fsImpl.renameSync(legacyHome, hermesHome)
+    return hermesHome
+  } catch {
+    // A verified legacy home remains safe to adopt when an atomic rename is unavailable.
+    return fsImpl.existsSync(hermesHome) ? hermesHome : legacyHome
+  }
 }
 
 module.exports = {

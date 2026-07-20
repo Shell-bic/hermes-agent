@@ -3,7 +3,12 @@ const assert = require('node:assert/strict')
 const { EventEmitter } = require('node:events')
 
 const { createEnterpriseManagedLifecycle } = require('./enterprise-managed-lifecycle.cjs')
-const { createEnterpriseBackendOwnership } = require('./enterprise-backend-ownership.cjs')
+const {
+  createEnterpriseBackendOwnership,
+  runBackendStartSequence,
+  runBackendMaintenanceHandoff,
+  stopOwnedBackendsForMaintenance
+} = require('./enterprise-backend-ownership.cjs')
 
 function deferred() {
   let resolve
@@ -43,6 +48,105 @@ function createHarness({ alive = new Set(), connectionResources = new Set(), sto
   })
   return { connectionResources, lifecycle, owned, ownership }
 }
+
+test('managed policy preparation resolves before runtime resolution and spawn effects', async () => {
+  const prepared = deferred()
+  const calls = []
+  const prerequisites = runBackendStartSequence({
+    managed: true,
+    prepareLaunch: async () => {
+      calls.push('prepare:start')
+      const launch = await prepared.promise
+      calls.push('prepare:done')
+      return launch
+    },
+    resolveRuntime: async launch => {
+      calls.push(`runtime:${launch.hermesHome}`)
+      return { command: 'python' }
+    },
+    spawnBackend: async ({ backend }) => {
+      calls.push(`spawn:${backend.command}`)
+      return { pid: 101 }
+    }
+  })
+
+  await Promise.resolve()
+  assert.deepEqual(calls, ['prepare:start'])
+  prepared.resolve({ enabled: true, hermesHome: 'managed-home' })
+  const result = await prerequisites
+
+  assert.equal(result.enterpriseLaunch.hermesHome, 'managed-home')
+  assert.equal(result.spawned.pid, 101)
+  assert.deepEqual(calls, ['prepare:start', 'prepare:done', 'runtime:managed-home', 'spawn:python'])
+})
+
+test('rejected managed policy preparation prevents runtime resolution and spawn effects', async () => {
+  const calls = []
+  const start = runBackendStartSequence({
+    managed: true,
+    prepareLaunch: async () => {
+      calls.push('prepare')
+      throw Object.assign(new Error('revoked'), { code: 'enterprise_operation_superseded' })
+    },
+    resolveRuntime: async () => {
+      calls.push('runtime')
+      return { command: 'python' }
+    },
+    spawnBackend: async () => calls.push('spawn')
+  })
+
+  await assert.rejects(start, error => error.code === 'enterprise_operation_superseded')
+  assert.deepEqual(calls, ['prepare'])
+})
+
+test('maintenance handoff stops and verifies ownership before destructive continuation', async () => {
+  const calls = []
+  const result = await runBackendMaintenanceHandoff({
+    continueHandoff: async () => {
+      calls.push('continue')
+      return 'continued'
+    },
+    stopBackends: async () => calls.push('stop'),
+    verifyReady: async () => {
+      calls.push('verify')
+      return true
+    }
+  })
+
+  assert.equal(result, 'continued')
+  assert.deepEqual(calls, ['stop', 'verify', 'continue'])
+})
+
+test('maintenance handoff never continues after stop or unlock verification failure', async t => {
+  await t.test('stop failure', async () => {
+    const calls = []
+    await assert.rejects(runBackendMaintenanceHandoff({
+      continueHandoff: async () => calls.push('continue'),
+      stopBackends: async () => {
+        calls.push('stop')
+        throw new Error('stop failed')
+      },
+      verifyReady: async () => {
+        calls.push('verify')
+        return true
+      }
+    }), /stop failed/)
+    assert.deepEqual(calls, ['stop'])
+  })
+
+  await t.test('unlock failure', async () => {
+    const calls = []
+    await assert.rejects(runBackendMaintenanceHandoff({
+      continueHandoff: async () => calls.push('continue'),
+      stopBackends: async () => calls.push('stop'),
+      verifyReady: async () => {
+        calls.push('verify')
+        return false
+      }
+    }), error => error.code === 'enterprise_backend_stop_failed')
+    assert.deepEqual(calls, ['stop', 'verify'])
+  })
+})
 
 test('pending start is aborted and cleanup waits for its guarded await to settle', async () => {
   const { lifecycle, ownership } = createHarness()
@@ -258,4 +362,126 @@ test('process identity mismatch is treated as the owned instance already gone an
 
   assert.deepEqual(stopCalls, [])
   assert.equal(await ownership.verifyResourcesGone(), true)
+})
+
+test('revocation waits for in-flight identity capture and stops the captured process instance', async () => {
+  const identityCapture = deferred()
+  const ownedProcess = child(606)
+  const identity = { capturePromise: identityCapture.promise, marker: null }
+  const owned = new Map([['primary', { key: 'primary', process: ownedProcess, processIdentity: identity }]])
+  const calls = []
+  let alive = true
+  let lifecycle
+  const ownership = createEnterpriseBackendOwnership({
+    clearOwnedProcess: owner => owned.delete(owner.key),
+    forceStopTree: async () => {
+      calls.push('force')
+      alive = false
+    },
+    getLifecycle: () => lifecycle,
+    gracefulStop: async (_process, captured) => calls.push(`graceful:${captured.marker}`),
+    isManaged: () => true,
+    listOwnedProcesses: () => [...owned.values()],
+    probeProcessTree: async (_process, captured) => alive && captured.marker === 'instance-606',
+    waitForExit: async () => calls.push('wait'),
+    waitForProcessIdentity: async captured => captured.capturePromise
+  })
+  lifecycle = createEnterpriseManagedLifecycle({ hasSession: true, effects: ownership.lifecycleEffects })
+  lifecycle.markRunning()
+
+  let settled = false
+  const revoke = lifecycle.revoke({ terminalState: 'blocked' }).then(() => { settled = true })
+  await Promise.resolve()
+  assert.equal(settled, false)
+  assert.deepEqual(calls, [])
+
+  identity.marker = 'instance-606'
+  identityCapture.resolve(identity)
+  await revoke
+
+  assert.equal(lifecycle.getSnapshot().state, 'blocked')
+  assert.deepEqual(calls, ['graceful:instance-606', 'wait', 'force', 'wait'])
+  assert.equal(owned.size, 0)
+})
+
+test('maintenance during the post-spawn orchestration gap waits for identity and stops that instance', async () => {
+  const identityCapture = deferred()
+  const spawnReturned = deferred()
+  const spawned = deferred()
+  const ownedProcess = child(707)
+  const owned = new Map()
+  const calls = []
+  let alive = true
+  let lifecycle
+  const ownership = createEnterpriseBackendOwnership({
+    clearOwnedProcess: owner => owned.delete(owner.key),
+    forceStopTree: async (_process, identity) => {
+      calls.push(`force:${identity.marker}`)
+      alive = false
+    },
+    getLifecycle: () => lifecycle,
+    gracefulStop: async (_process, identity) => calls.push(`graceful:${identity.marker}`),
+    isManaged: () => true,
+    listOwnedProcesses: () => [...owned.values()],
+    probeProcessTree: async (_process, identity) => alive && identity.marker === 'instance-707',
+    waitForExit: async () => calls.push('wait'),
+    waitForProcessIdentity: async identity => identity.capturePromise
+  })
+  lifecycle = createEnterpriseManagedLifecycle({ hasSession: true, effects: ownership.lifecycleEffects })
+  lifecycle.markRunning()
+  const ticket = ownership.beginStart({ key: 'primary' })
+  const sequence = runBackendStartSequence({
+    managed: true,
+    prepareLaunch: async () => ({ enabled: true }),
+    resolveRuntime: async () => ({ command: 'python' }),
+    spawnBackend: async () => {
+      const identity = { capturePromise: identityCapture.promise, marker: null }
+      owned.set('primary', { key: 'primary', process: ownedProcess, processIdentity: identity })
+      spawned.resolve(identity)
+      await spawnReturned.promise
+      return { child: ownedProcess, identity }
+    }
+  })
+  ownership.trackStart(ticket, sequence)
+
+  const identity = await spawned.promise
+  assert.equal(owned.get('primary').processIdentity, identity)
+  let maintenanceSettled = false
+  const maintenance = stopOwnedBackendsForMaintenance({
+    lifecycle,
+    managed: true,
+    ownership,
+    reasonCode: 'enterprise_test_maintenance'
+  }).then(() => { maintenanceSettled = true })
+  spawnReturned.resolve()
+  await sequence
+  await Promise.resolve()
+  assert.equal(maintenanceSettled, false)
+  assert.deepEqual(calls, [])
+
+  identity.marker = 'instance-707'
+  identityCapture.resolve(identity)
+  await maintenance
+
+  assert.equal(lifecycle.getSnapshot().state, 'blocked')
+  assert.deepEqual(calls, ['graceful:instance-707', 'wait', 'force:instance-707', 'wait'])
+  assert.equal(owned.size, 0)
+})
+
+test('maintenance fails closed when identity-checked ownership cannot stop a live process', async () => {
+  const alive = new Set([808])
+  const { lifecycle, owned, ownership } = createHarness({ alive })
+  lifecycle.markRunning()
+  owned.set('primary', { key: 'primary', process: child(808), processIdentity: 'instance-808' })
+
+  await assert.rejects(
+    stopOwnedBackendsForMaintenance({
+      lifecycle,
+      managed: true,
+      ownership,
+      reasonCode: 'enterprise_test_maintenance'
+    }),
+    error => error.code === 'enterprise_backend_stop_failed'
+  )
+  assert.equal(lifecycle.getSnapshot().state, 'stop_failed')
 })

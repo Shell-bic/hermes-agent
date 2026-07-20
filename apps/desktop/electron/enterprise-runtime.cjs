@@ -46,10 +46,6 @@ function numericStatus(error) {
   return Number.isInteger(status) ? status : null
 }
 
-function isTerminalAuthError(error) {
-  return TERMINAL_AUTH_STATUSES.has(numericStatus(error))
-}
-
 function canUseLastKnownGoodPolicy(error) {
   if (error?.code === 'enterprise_policy_payload_invalid') return false
   const status = numericStatus(error)
@@ -308,17 +304,37 @@ class EnterpriseRuntime {
     this.lastLaunch = null
     this.policyRefreshPromise = null
     this.policyRefreshLease = null
+    this.policyRefreshOperation = null
     this.policyRefreshSessionKey = null
+    this.latestOperations = new Map()
   }
 
   lifecycle() {
     return this.getLifecycle?.() || null
   }
 
-  beginOperation({ advanceAuth = false, reasonCode = 'enterprise_operation_started' } = {}) {
+  beginOperation({ advanceAuth = false, allowedStates = null, reasonCode = 'enterprise_operation_started' } = {}) {
     const lifecycle = this.lifecycle()
     if (!lifecycle) return null
+    if (Array.isArray(allowedStates) && !allowedStates.includes(lifecycle.getSnapshot().state)) {
+      throw new EnterpriseRuntimeOperationError()
+    }
     return advanceAuth ? lifecycle.advanceAuthEpoch(reasonCode) : lifecycle.acquireLease()
+  }
+
+  beginLatestOperation(scope, options = {}) {
+    const generation = (this.latestOperations.get(scope) || 0) + 1
+    const lease = this.beginOperation(options)
+    this.latestOperations.set(scope, generation)
+    return Object.freeze({ generation, lease, scope })
+  }
+
+  latestCheckpoint(operation, options) {
+    this.checkpoint(operation?.lease, options)
+    if (!operation || this.latestOperations.get(operation.scope) !== operation.generation) {
+      throw new EnterpriseRuntimeOperationError()
+    }
+    return true
   }
 
   checkpoint(lease, { states = null } = {}) {
@@ -333,10 +349,23 @@ class EnterpriseRuntime {
     return true
   }
 
-  async awaitCheckpoint(lease, promise, options) {
+  async awaitCheckpoint(lease, operation, options) {
     this.checkpoint(lease, options)
-    const value = await promise
+    if (typeof operation !== 'function') {
+      throw new TypeError('Enterprise runtime guarded awaits require a deferred operation function.')
+    }
+    const value = await operation()
     this.checkpoint(lease, options)
+    return value
+  }
+
+  async awaitLatestCheckpoint(latestOperation, operation, options) {
+    this.latestCheckpoint(latestOperation, options)
+    if (typeof operation !== 'function') {
+      throw new TypeError('Enterprise runtime guarded awaits require a deferred operation function.')
+    }
+    const value = await operation()
+    this.latestCheckpoint(latestOperation, options)
     return value
   }
 
@@ -384,9 +413,10 @@ class EnterpriseRuntime {
       return disabledState()
     }
 
-    const lease = this.beginOperation({ advanceAuth: true, reasonCode: 'enterprise_login_started' })
-    const session = await this.awaitCheckpoint(lease, this.client.login(credentials), {
-      states: ['unauthenticated', 'recovering', 'running']
+    const allowedStates = ['unauthenticated', 'recovering', 'running']
+    const lease = this.beginOperation({ advanceAuth: true, allowedStates, reasonCode: 'enterprise_login_started' })
+    const session = await this.awaitCheckpoint(lease, () => this.client.login(credentials), {
+      states: allowedStates
     })
     return this.acceptLoginSessionWithLease(session, lease)
   }
@@ -396,7 +426,11 @@ class EnterpriseRuntime {
       return disabledState()
     }
 
-    const lease = this.beginOperation({ advanceAuth: true, reasonCode: 'enterprise_login_session_received' })
+    const lease = this.beginOperation({
+      advanceAuth: true,
+      allowedStates: ['unauthenticated', 'recovering', 'running'],
+      reasonCode: 'enterprise_login_session_received'
+    })
     return this.acceptLoginSessionWithLease(session, lease)
   }
 
@@ -408,10 +442,11 @@ class EnterpriseRuntime {
       this.authStore.writeSession(session)
       this.checkpoint(lease, checkpointOptions)
     } catch (error) {
-      if (!lease || this.lifecycle()?.isLeaseCurrent(lease)) {
+      const leaseCurrent = !lease || this.lifecycle()?.isLeaseCurrent(lease)
+      if (leaseCurrent) {
         this.authStore.clear?.()
       }
-      if (session?.desktopToken) {
+      if (leaseCurrent && session?.desktopToken) {
         await this.client.logout(session.desktopToken).catch(logoutError => {
           this.rememberLog(`[enterprise] rejected session revoke failed: ${logoutError.message}`)
         })
@@ -435,14 +470,18 @@ class EnterpriseRuntime {
       return disabledState()
     }
 
-    const lease = this.beginOperation({ advanceAuth: true, reasonCode: 'enterprise_logout_started' })
+    const lease = this.beginOperation({
+      advanceAuth: true,
+      allowedStates: ['blocked', 'recovering', 'running', 'unauthenticated'],
+      reasonCode: 'enterprise_logout_started'
+    })
     this.checkpoint(lease)
     const session = this.authStore.readSession()
 
     if (session?.desktopToken) {
       await this.awaitCheckpoint(
         lease,
-        this.client.logout(session.desktopToken).catch(error => {
+        () => this.client.logout(session.desktopToken).catch(error => {
           this.rememberLog(`[enterprise] logout request failed: ${error.message}`)
         })
       )
@@ -462,31 +501,40 @@ class EnterpriseRuntime {
       return disabledState()
     }
 
-    const lease = this.beginOperation()
+    const operation = this.beginLatestOperation('runtimeState')
+    const lease = operation.lease
     const session = this.authStore.readSession()
 
     if (!session?.desktopToken) {
-      this.checkpoint(lease)
+      this.latestCheckpoint(operation)
       this.lastPublicState = unauthenticatedState()
       return this.lastPublicState
     }
 
     try {
-      const me = await this.awaitCheckpoint(lease, this.client.me(session.desktopToken), {
-        states: ['recovering', 'running']
-      })
-      this.checkpoint(lease, { states: ['recovering', 'running'] })
+      const checkpointOptions = { states: ['recovering', 'running'] }
+      const me = await this.awaitLatestCheckpoint(operation, () => this.client.me(session.desktopToken), checkpointOptions)
+      const expectedUserId = enterpriseUserId(session.user)
+      const actualUser = me?.user || me?.account || null
+      const actualUserId = enterpriseUserId(actualUser)
+      if (!expectedUserId || !actualUserId || expectedUserId !== actualUserId) {
+        const error = new Error('Enterprise account response does not match the authenticated desktop session.')
+        error.code = 'enterprise_policy_user_mismatch'
+        throw error
+      }
+      this.latestCheckpoint(operation, checkpointOptions)
       this.lastPublicState = {
         ...this.lastPublicState,
         authenticated: true,
         error: null,
         status: 'authenticated',
-        user: me?.user || me?.account || session.user || null
+        user: actualUser
       }
     } catch (error) {
-      this.checkpoint(lease)
-      if (isTerminalAuthError(error)) {
-        return this.enterTerminalState(error, lease, 'unauthenticated')
+      this.latestCheckpoint(operation)
+      const terminalState = terminalPolicyState(error)
+      if (terminalState) {
+        return this.enterTerminalState(error, lease, terminalState)
       }
       this.lastPublicState = unauthenticatedState(error.message)
     }
@@ -495,36 +543,43 @@ class EnterpriseRuntime {
   }
 
   refreshPolicy() {
-    const lease = this.beginOperation()
     const session = this.authStore.readSession()
     const sessionKey = `${enterpriseUserId(session?.user) || ''}:${String(session?.desktopToken || '')}`
     const priorLeaseCurrent = !this.policyRefreshLease || this.lifecycle()?.isLeaseCurrent(this.policyRefreshLease)
-    if (this.policyRefreshPromise && priorLeaseCurrent && this.policyRefreshSessionKey === sessionKey) {
+    const priorOperationCurrent = this.policyRefreshOperation &&
+      this.latestOperations.get(this.policyRefreshOperation.scope) === this.policyRefreshOperation.generation
+    if (this.policyRefreshPromise && priorLeaseCurrent && priorOperationCurrent && this.policyRefreshSessionKey === sessionKey) {
       return this.policyRefreshPromise
     }
 
+    const operation = this.beginLatestOperation('runtimeState')
+    const lease = operation.lease
     let operationWithCleanup
-    operationWithCleanup = this.refreshPolicyOnce({ lease, session }).finally(() => {
+    operationWithCleanup = this.refreshPolicyOnce({ operation, session }).finally(() => {
       if (this.policyRefreshPromise === operationWithCleanup) {
         this.policyRefreshPromise = null
         this.policyRefreshLease = null
+        this.policyRefreshOperation = null
         this.policyRefreshSessionKey = null
       }
     })
     this.policyRefreshPromise = operationWithCleanup
     this.policyRefreshLease = lease
+    this.policyRefreshOperation = operation
     this.policyRefreshSessionKey = sessionKey
 
     return operationWithCleanup
   }
 
-  async refreshPolicyOnce({ lease = this.beginOperation(), session = this.authStore.readSession() } = {}) {
+  async refreshPolicyOnce({ operation = this.beginLatestOperation('runtimeState'), session = this.authStore.readSession() } = {}) {
     if (!this.enabled) {
       return disabledState()
     }
 
+    const lease = operation.lease
+    const checkpointOptions = { states: ['recovering', 'running'] }
     if (!session?.desktopToken) {
-      this.checkpoint(lease)
+      this.latestCheckpoint(operation)
       this.lastPublicState = unauthenticatedState('Enterprise sign-in is required before refreshing policy.')
       return this.lastPublicState
     }
@@ -533,13 +588,15 @@ class EnterpriseRuntime {
     const hermesHome = this.managedHomeFor({ session })
 
     try {
-      const bootstrap = await this.awaitCheckpoint(lease, this.client.bootstrap(session.desktopToken), {
-        states: ['recovering', 'running']
-      })
+      const bootstrap = await this.awaitLatestCheckpoint(
+        operation,
+        () => this.client.bootstrap(session.desktopToken),
+        checkpointOptions
+      )
       // Do not derive or bind a managed identity from an authenticated 200
       // until the complete bootstrap contract has passed validation.
       validateManagedBootstrap(bootstrap)
-      this.checkpoint(lease, { states: ['recovering', 'running'] })
+      this.latestCheckpoint(operation, checkpointOptions)
       const bootstrapUserId = enterpriseUserId(bootstrap?.user || bootstrap?.account)
       if (!bootstrapUserId || (expectedUserId && expectedUserId !== bootstrapUserId)) {
         const error = new Error('Enterprise policy bootstrap user does not match the authenticated desktop session.')
@@ -547,18 +604,18 @@ class EnterpriseRuntime {
         throw error
       }
       const bootstrapHome = this.managedHomeFor({ bootstrap, session })
-      this.checkpoint(lease, { states: ['recovering', 'running'] })
+      this.latestCheckpoint(operation, checkpointOptions)
       this.bindManagedIdentity({ bootstrap, hermesHome: bootstrapHome, session })
-      this.checkpoint(lease, { states: ['recovering', 'running'] })
+      this.latestCheckpoint(operation, checkpointOptions)
       const result = this.policyWriter({ bootstrap, hermesHome: bootstrapHome })
-      this.checkpoint(lease, { states: ['recovering', 'running'] })
+      this.latestCheckpoint(operation, checkpointOptions)
       this.lastPublicState = publicStateWithPolicy(this.lastPublicState, result.policy, {
         status: 'current',
         stale: false
       })
       this.rememberLog('[enterprise-policy] refresh succeeded')
     } catch (error) {
-      this.checkpoint(lease)
+      this.latestCheckpoint(operation)
       const message = policyRefreshFailureMessage(error)
       const category = policyRefreshFailureCategory(error)
       const status = numericStatus(error) ?? 'n/a'
@@ -573,6 +630,7 @@ class EnterpriseRuntime {
       const cached = mayUseLkg
         ? this.policyReader({ expectedUserId, hermesHome })
         : { policy: null, reason: 'fallback_not_allowed', valid: false }
+      this.latestCheckpoint(operation)
 
       this.rememberLog(`[enterprise-policy] refresh failed category=${category} status=${status} lastKnownGood=${cached.valid}`)
 
@@ -625,20 +683,25 @@ class EnterpriseRuntime {
       return { enabled: false }
     }
 
-    const lease = this.beginOperation()
+    const operation = this.beginLatestOperation('runtimeState')
+    const lease = operation.lease
     const checkpointOptions = { states: ['recovering', 'running'] }
     const session = this.authStore.readSession()
 
     if (!session?.desktopToken) {
-      this.checkpoint(lease)
+      this.latestCheckpoint(operation)
       this.lastPublicState = unauthenticatedState('Enterprise sign-in is required before starting Hermes.')
       throw new Error('Enterprise sign-in is required before starting Hermes.')
     }
 
     try {
-      const bootstrap = await this.awaitCheckpoint(lease, this.client.bootstrap(session.desktopToken), checkpointOptions)
+      const bootstrap = await this.awaitLatestCheckpoint(
+        operation,
+        () => this.client.bootstrap(session.desktopToken),
+        checkpointOptions
+      )
       validateManagedBootstrap(bootstrap)
-      this.checkpoint(lease, checkpointOptions)
+      this.latestCheckpoint(operation, checkpointOptions)
       const expectedUserId = enterpriseUserId(session.user)
       const bootstrapUserId = enterpriseUserId(bootstrap?.user || bootstrap?.account)
       if (!bootstrapUserId || (expectedUserId && expectedUserId !== bootstrapUserId)) {
@@ -646,37 +709,37 @@ class EnterpriseRuntime {
         error.code = 'enterprise_policy_user_mismatch'
         throw error
       }
-      const modelProfilesPayload = await this.awaitCheckpoint(
-        lease,
-        this.client.modelProfiles(session.desktopToken),
+      const modelProfilesPayload = await this.awaitLatestCheckpoint(
+        operation,
+        () => this.client.modelProfiles(session.desktopToken),
         checkpointOptions
       )
       const modelProfiles = extractModelProfilesResponse(modelProfilesPayload)
       const effectivePreferredModel = preferredModel || preferredModelFromPublicState(this.lastPublicState)
 
-      const manifest = await this.awaitCheckpoint(
-        lease,
-        this.client.runtimeManifest(
+      const manifest = await this.awaitLatestCheckpoint(
+        operation,
+        () => this.client.runtimeManifest(
           session.desktopToken,
           runtimeManifestRequestBody({ modelProfiles, preferredModel: effectivePreferredModel })
         ),
         checkpointOptions
       )
 
-      this.checkpoint(lease, checkpointOptions)
+      this.latestCheckpoint(operation, checkpointOptions)
       const hermesHome = this.bindManagedIdentity({
         bootstrap,
         hermesHome: this.managedHomeFor({ bootstrap, session }),
         session
       })
-      this.checkpoint(lease, checkpointOptions)
+      this.latestCheckpoint(operation, checkpointOptions)
       const launch = this.homeWriter({
         bootstrap,
         hermesHome,
         manifest,
         modelProfiles
       })
-      this.checkpoint(lease, checkpointOptions)
+      this.latestCheckpoint(operation, checkpointOptions)
 
       this.lastLaunch = launch
       this.lastPublicState = launch.publicState
@@ -688,7 +751,7 @@ class EnterpriseRuntime {
         publicState: launch.publicState
       }
     } catch (error) {
-      this.checkpoint(lease)
+      this.latestCheckpoint(operation)
       const terminalState = terminalPolicyState(error)
       if (terminalState) await this.enterTerminalState(error, lease, terminalState)
       throw error
@@ -705,11 +768,12 @@ class EnterpriseRuntime {
       throw new Error('Enterprise model selection requires a model.')
     }
 
-    const lease = this.beginOperation()
+    const operation = this.beginLatestOperation('runtimeState')
+    const lease = operation.lease
     const checkpointOptions = { states: ['recovering', 'running'] }
     const session = this.authStore.readSession()
     if (!session?.desktopToken) {
-      this.checkpoint(lease)
+      this.latestCheckpoint(operation)
       this.lastPublicState = unauthenticatedState('Enterprise sign-in is required before selecting a model.')
       throw new Error('Enterprise sign-in is required before selecting a model.')
     }
@@ -719,10 +783,14 @@ class EnterpriseRuntime {
     }
 
     try {
-      this.checkpoint(lease, checkpointOptions)
-      const bootstrap = await this.awaitCheckpoint(lease, this.client.bootstrap(session.desktopToken), checkpointOptions)
+      this.latestCheckpoint(operation, checkpointOptions)
+      const bootstrap = await this.awaitLatestCheckpoint(
+        operation,
+        () => this.client.bootstrap(session.desktopToken),
+        checkpointOptions
+      )
       validateManagedBootstrap(bootstrap)
-      this.checkpoint(lease, checkpointOptions)
+      this.latestCheckpoint(operation, checkpointOptions)
       const expectedUserId = enterpriseUserId(session.user)
       const bootstrapUserId = enterpriseUserId(bootstrap?.user || bootstrap?.account)
       if (!bootstrapUserId || (expectedUserId && expectedUserId !== bootstrapUserId)) {
@@ -730,42 +798,42 @@ class EnterpriseRuntime {
         error.code = 'enterprise_policy_user_mismatch'
         throw error
       }
-      const modelProfiles = await this.awaitCheckpoint(
-        lease,
-        this.client.modelProfiles(session.desktopToken),
+      const modelProfiles = await this.awaitLatestCheckpoint(
+        operation,
+        () => this.client.modelProfiles(session.desktopToken),
         checkpointOptions
       )
       const profiles = extractModelProfilesResponse(modelProfiles)
-      const manifest = await this.awaitCheckpoint(
-        lease,
-        this.client.runtimeManifest(
+      const manifest = await this.awaitLatestCheckpoint(
+        operation,
+        () => this.client.runtimeManifest(
           session.desktopToken,
           runtimeManifestRequestBody({ modelProfiles: profiles, preferredModel: model })
         ),
         checkpointOptions
       )
 
-      this.checkpoint(lease, checkpointOptions)
+      this.latestCheckpoint(operation, checkpointOptions)
       const hermesHome = this.bindManagedIdentity({
         bootstrap,
         hermesHome: this.managedHomeFor({ bootstrap, session }),
         session
       })
-      this.checkpoint(lease, checkpointOptions)
+      this.latestCheckpoint(operation, checkpointOptions)
       const launch = this.homeWriter({
         bootstrap,
         hermesHome,
         manifest,
         modelProfiles: profiles
       })
-      this.checkpoint(lease, checkpointOptions)
+      this.latestCheckpoint(operation, checkpointOptions)
 
       this.lastLaunch = launch
       this.lastPublicState = launch.publicState
 
       return this.lastPublicState
     } catch (error) {
-      this.checkpoint(lease)
+      this.latestCheckpoint(operation)
       const terminalState = terminalPolicyState(error)
       if (terminalState) await this.enterTerminalState(error, lease, terminalState)
       throw error

@@ -372,22 +372,6 @@ test('enterprise selectModel IPC refreshes manifest state without tearing down t
   assert.doesNotMatch(handler, /teardownPrimaryBackendAndWait\(/)
 })
 
-test('enterprise getConnection awaits policy preparation before runtime resolution and Python spawn', () => {
-  const source = fs.readFileSync(path.join(__dirname, 'main.cjs'), 'utf8').replace(/\r\n/g, '\n')
-  const start = source.indexOf('async function startHermes()')
-  assert.notEqual(start, -1, 'missing startHermes')
-  const end = source.indexOf('\nasync function ', start + 1)
-  assert.notEqual(end, -1, 'missing function after startHermes')
-  const startHermes = source.slice(start, end)
-  const prepare = startHermes.indexOf('enterpriseLaunch = await enterpriseRuntime.prepareLaunch()')
-  const resolveRuntime = startHermes.indexOf('await ensureRuntime(')
-  const spawnBackend = startHermes.indexOf('hermesProcess = spawn(')
-
-  assert.ok(prepare >= 0, 'startHermes must await enterprise prepareLaunch')
-  assert.ok(resolveRuntime > prepare, 'runtime resolution must occur only after prepareLaunch succeeds')
-  assert.ok(spawnBackend > resolveRuntime, 'Python backend spawn must occur only after runtime resolution')
-})
-
 test('enterprise policy refresh IPC is trusted and does not restart the backend', () => {
   const source = fs.readFileSync(path.join(__dirname, 'main.cjs'), 'utf8').replace(/\r\n/g, '\n')
   const start = source.indexOf("ipcMain.handle('hermes:enterprise:refreshPolicy'")
@@ -643,8 +627,8 @@ test('enterprise runtime scopes managed Hermes home by desktop user when userDat
   currentUser = { id: 'user-b', displayName: 'User B' }
   await runtime.prepareLaunch()
 
-  assert.equal(homes[0], path.join('/tmp/hermes-user-data', 'enterprise', 'users', 'user-a', 'hermes-home'))
-  assert.equal(homes[1], path.join('/tmp/hermes-user-data', 'enterprise', 'users', 'user-b', 'hermes-home'))
+  assert.match(homes[0], /enterprise[\\/]users[\\/]user-a-[a-f0-9]{16}[\\/]hermes-home$/)
+  assert.match(homes[1], /enterprise[\\/]users[\\/]user-b-[a-f0-9]{16}[\\/]hermes-home$/)
 })
 
 test('enterprise runtime selectModel validates policy and rewrites managed home without public secrets', async () => {
