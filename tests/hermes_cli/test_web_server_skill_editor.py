@@ -152,6 +152,83 @@ class TestSkillContent:
         assert "Do the thing" not in resp.text
         assert body_reads == []
 
+    def test_named_profile_available_enterprise_content_returns_200(
+        self, client, isolated_profiles, monkeypatch
+    ):
+        home = isolated_profiles["worker_alpha"]
+        enterprise_root = home / "skills" / "enterprise"
+        _write_skill(enterprise_root, "expense-review")
+        lock_dir = home / "skills" / ".hub"
+        lock_dir.mkdir()
+        (lock_dir / "lock.json").write_text(
+            json.dumps(
+                {
+                    "installed": {
+                        "expense-review": {
+                            "source": "enterprise",
+                            "key": "expense-review",
+                            "install_path": "enterprise/expense-review",
+                        }
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        policy = home / "enterprise-policy.json"
+        policy.write_text(
+            json.dumps(
+                {
+                    "toolPolicySnapshot": {
+                        "skills": [
+                            {"key": "expense-review", "status": "available"}
+                        ]
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_ENTERPRISE_MANAGED", "1")
+        monkeypatch.setenv("HERMES_ENTERPRISE_TOOL_POLICY_FILE", str(policy))
+
+        resp = client.get(
+            "/api/skills/content",
+            params={"name": "expense-review", "profile": "worker_alpha"},
+        )
+
+        assert resp.status_code == 200
+        assert "Do the thing." in resp.json()["content"]
+
+    def test_editor_can_read_user_disabled_skill_when_runtime_policy_allows(
+        self, client, isolated_profiles, monkeypatch
+    ):
+        home = isolated_profiles["default"]
+        (home / "config.yaml").write_text(
+            "skills:\n  disabled:\n    - dashboard-skill\n",
+            encoding="utf-8",
+        )
+        policy = home / "enterprise-policy.json"
+        policy.write_text(
+            json.dumps(
+                {
+                    "toolPolicySnapshot": {
+                        "skills": [
+                            {"key": "dashboard-skill", "status": "available"}
+                        ]
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_ENTERPRISE_MANAGED", "1")
+        monkeypatch.setenv("HERMES_ENTERPRISE_TOOL_POLICY_FILE", str(policy))
+
+        resp = client.get(
+            "/api/skills/content", params={"name": "dashboard-skill"}
+        )
+
+        assert resp.status_code == 200
+        assert "Do the thing." in resp.json()["content"]
+
 
 class TestSkillCreate:
     def test_create_writes_skill_md(self, client, isolated_profiles):

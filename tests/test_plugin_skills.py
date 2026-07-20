@@ -439,6 +439,55 @@ class TestBundleContextBanner:
         assert "myplugin:bar" not in missing["available_skills"]
         assert "myplugin:foo" in missing["available_skills"]
 
+    def test_managed_sibling_authorizer_error_hides_sibling_metadata(
+        self, tmp_path, monkeypatch
+    ):
+        from tools.skills_tool import skill_view
+
+        self._setup_bundle(tmp_path, skills=("foo", "bar"))
+        monkeypatch.setenv("HERMES_ENTERPRISE_MANAGED", "1")
+
+        def _decision(_namespace, bare):
+            if bare == "bar":
+                raise RuntimeError("SIBLING-PATH-SENTINEL")
+            return {"allowed": True}
+
+        monkeypatch.setattr(
+            "tools.skills_tool._plugin_skill_policy_decision",
+            _decision,
+        )
+
+        main = json.loads(skill_view("myplugin:foo", preprocess=False))
+        missing = json.loads(skill_view("myplugin:missing", preprocess=False))
+
+        assert "bar" not in main["content"]
+        assert "SIBLING-PATH-SENTINEL" not in main["content"]
+        assert "myplugin:bar" not in missing["available_skills"]
+
+    def test_unmanaged_sibling_authorizer_error_preserves_sibling_metadata(
+        self, tmp_path, monkeypatch
+    ):
+        from tools.skills_tool import skill_view
+
+        self._setup_bundle(tmp_path, skills=("foo", "bar"))
+        monkeypatch.delenv("HERMES_ENTERPRISE_MANAGED", raising=False)
+
+        def _decision(_namespace, bare):
+            if bare == "bar":
+                raise RuntimeError("auth down")
+            return {"allowed": True}
+
+        monkeypatch.setattr(
+            "tools.skills_tool._plugin_skill_policy_decision",
+            _decision,
+        )
+
+        main = json.loads(skill_view("myplugin:foo", preprocess=False))
+        missing = json.loads(skill_view("myplugin:missing", preprocess=False))
+
+        assert "bar" in main["content"]
+        assert "myplugin:bar" in missing["available_skills"]
+
     def test_original_content_preserved(self, tmp_path):
         from tools.skills_tool import skill_view
 

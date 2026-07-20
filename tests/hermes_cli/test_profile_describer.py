@@ -189,6 +189,55 @@ def test_named_profile_available_enterprise_skill_is_classified_in_its_own_home(
     ]
 
 
+def test_managed_authorizer_error_hides_name_and_count(
+    profile_env, monkeypatch
+):
+    skill_dir = profile_env / "skills" / "private-skill"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\nname: private-skill\ndescription: private\n---\nBODY\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_ENTERPRISE_MANAGED", "1")
+    monkeypatch.setattr(profiles_mod, "profile_exists", lambda n: n == "myprof")
+    monkeypatch.setattr(profiles_mod, "normalize_profile_name", lambda n: n)
+    monkeypatch.setattr(profiles_mod, "get_profile_dir", lambda n: profile_env)
+    monkeypatch.setattr(
+        "hermes_cli.enterprise_policy.skill_runtime_decision",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("auth down")),
+    )
+    client = MagicMock()
+    client.chat.completions.create.return_value = _fake_aux_response(
+        jsonlib.dumps({"description": "safe fallback"})
+    )
+
+    with patch(
+        "agent.auxiliary_client.get_text_auxiliary_client",
+        return_value=(client, "test-model"),
+    ), patch("agent.auxiliary_client.get_auxiliary_extra_body", return_value={}):
+        outcome = describer.describe_profile("myprof")
+
+    assert outcome.ok
+    user_prompt = client.chat.completions.create.call_args.kwargs["messages"][1]["content"]
+    assert "private-skill" not in user_prompt
+    assert "Installed skill count: 0" in user_prompt
+
+
+def test_unmanaged_authorizer_error_preserves_directory_name_compatibility(
+    profile_env, monkeypatch
+):
+    skill_dir = profile_env / "skills" / "legacy-skill"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text("not valid frontmatter\n", encoding="utf-8")
+    monkeypatch.delenv("HERMES_ENTERPRISE_MANAGED", raising=False)
+    monkeypatch.setattr(
+        "hermes_cli.enterprise_policy.skill_runtime_decision",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("auth down")),
+    )
+
+    assert describer._authorized_skill_names(profile_env) == ["legacy-skill"]
+
+
 def test_describer_refuses_to_overwrite_user_authored(profile_env, monkeypatch):
     profiles_mod.write_profile_meta(
         profile_env, description="curated", description_auto=False,

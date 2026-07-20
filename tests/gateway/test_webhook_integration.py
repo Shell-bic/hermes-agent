@@ -253,6 +253,125 @@ class TestSkillsInjection:
         mock_build.assert_not_called()
         adapter.handle_message.assert_not_called()
 
+    @pytest.mark.asyncio
+    async def test_managed_authorizer_error_returns_503_without_event(self, monkeypatch):
+        routes = {
+            "pr-review": {
+                "secret": _INSECURE_NO_AUTH,
+                "prompt": "Review: {pull_request.title}",
+                "skills": ["expense-review"],
+            }
+        }
+        adapter = _make_adapter(routes)
+        adapter.handle_message = AsyncMock()
+        monkeypatch.setenv("HERMES_ENTERPRISE_MANAGED", "1")
+
+        with patch(
+            "tools.skills_tool.skill_runtime_preflight",
+            side_effect=RuntimeError("AUTH-PATH-SENTINEL"),
+        ), patch(
+            "agent.skill_commands.get_skill_commands", return_value={}
+        ), patch(
+            "agent.skill_commands.build_skill_invocation_message"
+        ) as mock_build:
+            app = _create_app(adapter)
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.post(
+                    "/webhooks/pr-review",
+                    json=GITHUB_PR_PAYLOAD,
+                    headers={"X-GitHub-Delivery": "auth-error-001"},
+                )
+                payload = await resp.json()
+
+        assert resp.status == 503
+        assert payload["errorCode"] == "enterprise_skill_policy_unavailable"
+        assert "AUTH-PATH-SENTINEL" not in json.dumps(payload)
+        mock_build.assert_not_called()
+        adapter.handle_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_missing_then_allowed_preserves_first_available_fallback(self):
+        routes = {
+            "pr-review": {
+                "secret": _INSECURE_NO_AUTH,
+                "prompt": "Review: {pull_request.title}",
+                "skills": ["missing", "allowed"],
+            }
+        }
+        adapter = _make_adapter(routes)
+        captured_events = []
+
+        async def _capture(event):
+            captured_events.append(event)
+
+        adapter.handle_message = _capture
+        preflights = []
+
+        def _preflight(name):
+            preflights.append(name)
+            return json.dumps({"success": name == "allowed", "name": name})
+
+        with patch(
+            "tools.skills_tool.skill_runtime_preflight", side_effect=_preflight
+        ), patch(
+            "agent.skill_commands.get_skill_commands",
+            return_value={"/allowed": {"name": "allowed"}},
+        ), patch(
+            "agent.skill_commands.build_skill_invocation_message",
+            return_value="ALLOWED-SKILL-BODY",
+        ):
+            app = _create_app(adapter)
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.post(
+                    "/webhooks/pr-review",
+                    json=GITHUB_PR_PAYLOAD,
+                    headers={"X-GitHub-Delivery": "fallback-001"},
+                )
+
+        await asyncio.sleep(0.05)
+        assert resp.status == 202
+        assert preflights == ["missing", "allowed"]
+        assert captured_events[0].text == "ALLOWED-SKILL-BODY"
+
+    @pytest.mark.asyncio
+    async def test_first_allowed_does_not_authorize_blocked_later(self):
+        routes = {
+            "pr-review": {
+                "secret": _INSECURE_NO_AUTH,
+                "prompt": "Review: {pull_request.title}",
+                "skills": ["allowed", "blocked-later"],
+            }
+        }
+        adapter = _make_adapter(routes)
+        adapter.handle_message = AsyncMock()
+        preflights = []
+
+        def _preflight(name):
+            preflights.append(name)
+            if name == "blocked-later":
+                raise AssertionError("later fallback was authorized after first match")
+            return json.dumps({"success": True, "name": name})
+
+        with patch(
+            "tools.skills_tool.skill_runtime_preflight", side_effect=_preflight
+        ), patch(
+            "agent.skill_commands.get_skill_commands",
+            return_value={"/allowed": {"name": "allowed"}},
+        ), patch(
+            "agent.skill_commands.build_skill_invocation_message",
+            return_value="ALLOWED-SKILL-BODY",
+        ):
+            app = _create_app(adapter)
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.post(
+                    "/webhooks/pr-review",
+                    json=GITHUB_PR_PAYLOAD,
+                    headers={"X-GitHub-Delivery": "first-match-001"},
+                )
+
+        assert resp.status == 202
+        assert preflights == ["allowed"]
+
 
 # ===================================================================
 # Test 3: Cross-platform delivery (webhook → Telegram)
