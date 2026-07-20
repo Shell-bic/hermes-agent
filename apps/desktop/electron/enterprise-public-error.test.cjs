@@ -153,7 +153,12 @@ test('G4 bootstrap errors use the shared fail-closed public contract', () => {
         message: publicError.message,
         recoveryKind: publicError.recoveryKind
       },
-      { errorCode: code, lifecycleEpoch: 17, ...expected }
+      {
+        errorCode: code,
+        lifecycleEpoch: 17,
+        message: expected.message,
+        recoveryKind: expected.recoveryKind
+      }
     )
     assert.equal(JSON.stringify(publicError).includes('dsk_secret'), false)
     assert.equal(JSON.stringify(publicError).includes('999'), false)
@@ -166,6 +171,7 @@ test('D4 stop failure normalizes bootstrap errors to one deterministic retry-sto
     { lifecycle: { lifecycleEpoch: 18, state: 'stop_failed' }, useCurrentEpoch: true }
   )
   assert.equal(publicError.errorCode, 'enterprise_runtime_stop_failed')
+  assert.equal(publicError.httpStatus, null)
   assert.equal(publicError.recoveryKind, 'retry-stop')
   assert.equal(JSON.stringify(publicError).includes('Alice'), false)
   assert.throws(

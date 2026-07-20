@@ -4,12 +4,14 @@ import type { HermesConnection } from '@/global'
 import { HermesGateway } from '@/hermes'
 import { translateNow } from '@/i18n'
 import { desktopDefaultCwd } from '@/lib/desktop-fs'
+import { enterprisePublicErrorFromUnknown } from '@/lib/enterprise-bootstrap-error'
 import { isGatewayReauthRequired, resolveGatewayWsUrl } from '@/lib/gateway-ws-url'
 import {
   $desktopBoot,
   applyDesktopBootProgress,
   completeDesktopBoot,
   failDesktopBoot,
+  failDesktopBootWithEnterpriseError,
   setDesktopBootStep
 } from '@/store/boot'
 import {
@@ -450,8 +452,21 @@ export function useGatewayBoot({
       } catch (err) {
         if (!cancelled && !runtimeRevoked) {
           const message = err instanceof Error ? err.message : String(err)
-          failDesktopBoot(message)
-          notifyError(err, translateNow('boot.errors.desktopBootFailed'))
+          const enterpriseError = enterprisePublicErrorFromUnknown(err)
+          const managed = $desktopBoot.get().enterpriseManaged === true || desktop.enterprise.managed === true
+
+          if (enterpriseError) {
+            failDesktopBootWithEnterpriseError(enterpriseError.message, enterpriseError)
+          } else if (managed) {
+            failDesktopBoot(translateNow('boot.failure.managedFailure'))
+          } else {
+            failDesktopBoot(message)
+          }
+
+          notifyError(
+            managed && !enterpriseError ? new Error(translateNow('boot.failure.managedFailure')) : err,
+            translateNow('boot.errors.desktopBootFailed')
+          )
           setSessionsLoading(false)
         }
       }

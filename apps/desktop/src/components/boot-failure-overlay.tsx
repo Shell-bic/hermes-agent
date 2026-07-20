@@ -6,6 +6,7 @@ import { ErrorIcon } from '@/components/ui/error-state'
 import { LogView } from '@/components/ui/log-view'
 import type { DesktopConnectionConfig } from '@/global'
 import { useI18n } from '@/i18n'
+import { enterprisePublicErrorFromUnknown } from '@/lib/enterprise-bootstrap-error'
 import { FileText, Loader2, LogIn, RefreshCw, Wrench } from '@/lib/icons'
 import { $desktopBoot } from '@/store/boot'
 import { notify, notifyError } from '@/store/notifications'
@@ -14,7 +15,7 @@ import { $desktopOnboarding } from '@/store/onboarding'
 import type { RemoteReauth } from './boot-failure-reauth'
 import { deriveProviderShape, isRemoteReauthFailure, signInLabel } from './boot-failure-reauth'
 
-type BusyAction = 'local' | 'repair' | 'retry' | 'signin' | null
+type BusyAction = 'local' | 'refresh-policy' | 'repair' | 'retry' | 'retry-stop' | 'signin' | null
 
 // A remote gateway whose access cookie has lapsed (e.g. the dashboard
 // restarted on the remote box) boots into this overlay with a reauth-shaped
@@ -35,6 +36,12 @@ export function BootFailureOverlay() {
   const [logs, setLogs] = useState<string[]>([])
   const [showLogs, setShowLogs] = useState(false)
   const [remoteReauth, setRemoteReauth] = useState<RemoteReauth | null>(null)
+  const managed = boot.enterpriseManaged === true || window.hermesDesktop?.enterprise?.managed === true
+  const enterpriseError = enterprisePublicErrorFromUnknown(boot.enterpriseError)
+  const managedPrimaryMessage = enterpriseError?.recoveryKind === 'upgrade'
+    ? t.boot.failure.approvedDesktopRequired
+    : (enterpriseError?.message || t.boot.failure.managedFailure)
+  const unmanagedRemoteReauth = managed ? null : remoteReauth
 
   const visible = Boolean(boot.error) && !boot.running
   // While first-run onboarding owns the picker/flow we let it surface its own
@@ -57,7 +64,7 @@ export function BootFailureOverlay() {
   // offer the actionable "Sign in" path instead of the local-only recovery
   // buttons. Runs whenever the overlay becomes visible.
   useEffect(() => {
-    if (!visible) {
+    if (!visible || managed) {
       setRemoteReauth(null)
 
       return
@@ -104,7 +111,7 @@ export function BootFailureOverlay() {
     return () => {
       cancelled = true
     }
-  }, [visible])
+  }, [managed, visible])
 
   if (!visible || suppressed) {
     return null
@@ -164,9 +171,30 @@ export function BootFailureOverlay() {
   }
 
   const openLogs = () => void window.hermesDesktop?.revealLogs().catch(() => undefined)
+  const recoverPolicy = async () => {
+    setBusy('refresh-policy')
+    try {
+      await window.hermesDesktop?.enterprise.recoverPolicy()
+    } catch {
+      notify({ kind: 'error', title: copy.recoveryFailed, message: copy.recoveryFailedHint })
+    } finally {
+      setBusy(null)
+    }
+  }
+  const retryStop = async () => {
+    setBusy('retry-stop')
+    try {
+      await window.hermesDesktop?.enterprise.retryStop()
+    } catch {
+      notify({ kind: 'error', title: copy.recoveryFailed, message: copy.recoveryFailedHint })
+    } finally {
+      setBusy(null)
+    }
+  }
+
   const copy = t.boot.failure
 
-  const label = signInLabel(remoteReauth, {
+  const label = signInLabel(unmanagedRemoteReauth, {
     identityProvider: copy.identityProvider,
     remoteGateway: copy.signInToRemoteGateway,
     withProvider: copy.signInWithProvider
@@ -179,22 +207,45 @@ export function BootFailureOverlay() {
           <ErrorIcon className="mt-0.5" size="1.25rem" />
           <div>
             <h2 className="text-[0.9375rem] font-semibold tracking-tight">
-              {remoteReauth ? copy.remoteTitle : copy.title}
+              {unmanagedRemoteReauth ? copy.remoteTitle : copy.title}
             </h2>
             <p className="mt-1 text-[0.8125rem] leading-5 text-(--ui-text-tertiary)">
-              {remoteReauth ? copy.remoteDescription : copy.description}
+              {unmanagedRemoteReauth ? copy.remoteDescription : copy.description}
             </p>
           </div>
         </div>
 
         <div className="grid gap-4 p-5">
           <div className="rounded-2xl border border-destructive/30 bg-destructive/10 px-4 py-3 text-xs text-destructive">
-            {boot.error}
+            {managed ? managedPrimaryMessage : boot.error}
           </div>
 
           <div className="grid gap-2">
             <div className="flex flex-wrap gap-2">
-              {remoteReauth ? (
+              {managed ? (
+                enterpriseError ? (
+                  <>
+                    {enterpriseError.recoveryKind === 'refresh-policy' ? (
+                      <Button disabled={Boolean(busy)} onClick={() => void recoverPolicy()}>
+                        {busy === 'refresh-policy' ? <Loader2 className="animate-spin" /> : <RefreshCw />}
+                        {copy.refreshEnterprisePolicy}
+                      </Button>
+                    ) : null}
+                    {enterpriseError.recoveryKind === 'retry' ? (
+                      <Button disabled={Boolean(busy)} onClick={() => void retry()}>
+                        {busy === 'retry' ? <Loader2 className="animate-spin" /> : <RefreshCw />}
+                        {copy.retry}
+                      </Button>
+                    ) : null}
+                    {enterpriseError.recoveryKind === 'retry-stop' ? (
+                      <Button disabled={Boolean(busy)} onClick={() => void retryStop()}>
+                        {busy === 'retry-stop' ? <Loader2 className="animate-spin" /> : <RefreshCw />}
+                        {copy.retrySafeStop}
+                      </Button>
+                    ) : null}
+                  </>
+                ) : null
+              ) : unmanagedRemoteReauth ? (
                 <Button disabled={Boolean(busy)} onClick={() => void signInRemote()}>
                   {busy === 'signin' ? <Loader2 className="animate-spin" /> : <LogIn />}
                   {label}
@@ -205,23 +256,33 @@ export function BootFailureOverlay() {
                   {copy.retry}
                 </Button>
               )}
-              {!remoteReauth ? (
+              {!managed && !unmanagedRemoteReauth ? (
                 <Button disabled={Boolean(busy)} onClick={() => void repair()} variant="secondary">
                   {busy === 'repair' ? <Loader2 className="animate-spin" /> : <Wrench />}
                   {copy.repairInstall}
                 </Button>
               ) : null}
-              <Button disabled={Boolean(busy)} onClick={() => void switchToLocalGateway()} variant="secondary">
-                {busy === 'local' ? <Loader2 className="animate-spin" /> : null}
-                {copy.useLocalGateway}
-              </Button>
+              {!managed ? (
+                <Button disabled={Boolean(busy)} onClick={() => void switchToLocalGateway()} variant="secondary">
+                  {busy === 'local' ? <Loader2 className="animate-spin" /> : null}
+                  {copy.useLocalGateway}
+                </Button>
+              ) : null}
               <Button onClick={openLogs} variant="ghost">
                 <FileText />
                 {copy.openLogs}
               </Button>
             </div>
             <p className="text-xs text-muted-foreground">
-              {remoteReauth ? copy.remoteSignInHint : copy.repairHint}
+              {managed && enterpriseError
+                ? (enterpriseError.recoveryKind === 'upgrade'
+                    ? copy.approvedDesktopRequired
+                    : enterpriseError.recoveryKind === 'refresh-policy' || enterpriseError.recoveryKind === 'none'
+                      ? copy.contactAdministrator
+                      : enterpriseError.message)
+                : managed
+                  ? copy.contactAdministrator
+                : (unmanagedRemoteReauth ? copy.remoteSignInHint : copy.repairHint)}
             </p>
           </div>
 

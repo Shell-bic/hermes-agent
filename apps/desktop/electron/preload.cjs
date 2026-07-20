@@ -13,6 +13,7 @@ function unwrapEnterpriseSkillHub(result) {
 const invokeProfile = createManagedProfileInvoker(ipcRenderer)
 const invokeManagedProfile = (channel, ...args) => invokeProfile(channel, ...args)
 const invokeHermesApi = request => ipcRenderer.invoke('hermes:api', request).then(unwrapEnterprisePublicResult)
+const invokeEnterpriseRecovery = channel => ipcRenderer.invoke(channel).then(unwrapEnterprisePublicResult)
 
 contextBridge.exposeInMainWorld('hermesDesktop', {
   getConnection: profile => invokeManagedProfile('hermes:connection', profile),
@@ -43,9 +44,11 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
       return () => ipcRenderer.removeListener('hermes:enterprise:login-state', listener)
     },
     refresh: () => ipcRenderer.invoke('hermes:enterprise:refresh'),
+    recoverPolicy: () => invokeEnterpriseRecovery('hermes:enterprise:recover-policy'),
     refreshWeCom: () => ipcRenderer.invoke('hermes:enterprise:wecom-refresh'),
     selectLoginMethod: method => ipcRenderer.invoke('hermes:enterprise:login-method-select', method),
     refreshPolicy: () => ipcRenderer.invoke('hermes:enterprise:refreshPolicy'),
+    retryStop: () => invokeEnterpriseRecovery('hermes:enterprise:retry-stop'),
     selectModel: model => ipcRenderer.invoke('hermes:enterprise:selectModel', model),
     skillHub: {
       detail: key => ipcRenderer.invoke('hermes:enterprise:skill-hub:detail', key).then(unwrapEnterpriseSkillHub),

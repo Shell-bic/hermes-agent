@@ -68,6 +68,13 @@ export const ja = defineLocale({
       remoteDescription:
         'リモートゲートウェイのセッションが期限切れです。再接続するにはもう一度サインインしてください。チャットや設定は削除されません。',
       retry: '再試行',
+      approvedDesktopRequired: '承認済みの Hermes Desktop を展開するよう管理者に連絡してください。',
+      contactAdministrator: '管理者に連絡してから再試行してください。',
+      managedFailure: 'Hermes Desktop をエンタープライズ管理下で起動できませんでした。',
+      refreshEnterprisePolicy: 'エンタープライズポリシーを更新',
+      recoveryFailed: 'エンタープライズ回復に失敗しました',
+      recoveryFailedHint: '管理対象の回復処理が完了しませんでした。ログを開いて管理者に連絡してください。',
+      retrySafeStop: '安全な停止を再試行',
       repairInstall: 'インストールを修復',
       useLocalGateway: 'ローカルゲートウェイを使用',
       openLogs: 'ログを開く',

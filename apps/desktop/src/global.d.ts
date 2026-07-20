@@ -49,9 +49,11 @@ declare global {
         logout: () => Promise<EnterpriseDesktopState>
         onLoginState: (callback: (state: EnterpriseLoginState) => void) => () => void
         refresh: () => Promise<EnterpriseDesktopState>
+        recoverPolicy: () => Promise<EnterpriseLifecycleSnapshot>
         refreshWeCom: () => Promise<EnterpriseLoginState>
         selectLoginMethod: (method: EnterpriseLoginMethod) => Promise<EnterpriseLoginState>
         refreshPolicy: () => Promise<EnterpriseDesktopState>
+        retryStop: () => Promise<EnterpriseLifecycleSnapshot>
         selectModel: (model: string) => Promise<EnterpriseDesktopState>
         skillHub: {
           detail: (key: string) => Promise<EnterpriseSkillHubItem>
@@ -601,6 +603,8 @@ export interface EnterpriseDesktopState {
 }
 
 export interface DesktopBootProgress {
+  enterpriseError?: EnterprisePublicErrorEnvelope | null
+  enterpriseManaged?: boolean
   error: string | null
   fakeMode: boolean
   message: string
@@ -608,6 +612,32 @@ export interface DesktopBootProgress {
   progress: number
   running: boolean
   timestamp: number
+}
+
+export interface EnterpriseLifecycleSnapshot {
+  authEpoch: number
+  lifecycleEpoch: number
+  reasonCode: string
+  state: 'blocked' | 'recovering' | 'revoking' | 'running' | 'stop_failed' | 'unauthenticated'
+}
+
+export type EnterpriseRecoveryKind =
+  | 'none'
+  | 'refresh-policy'
+  | 'restart'
+  | 'retry'
+  | 'retry-stop'
+  | 'sign-in'
+  | 'upgrade'
+  | 'wait'
+
+export interface EnterprisePublicErrorEnvelope {
+  envelope: 'enterprise-public-error.v1'
+  errorCode: string
+  httpStatus: number | null
+  lifecycleEpoch: number
+  message: string
+  recoveryKind: EnterpriseRecoveryKind
 }
 
 // First-launch install ("bootstrap") event types -- emitted by

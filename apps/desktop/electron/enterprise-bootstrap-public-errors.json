@@ -1,29 +1,36 @@
 {
   "desktop_active_role_required": {
+    "httpStatuses": [403],
     "message": "Contact an administrator to assign an active enterprise role.",
     "recoveryKind": "refresh-policy"
   },
   "desktop_bootstrap_contract_header_invalid": {
+    "httpStatuses": [400],
     "message": "The enterprise Gateway rejected the Desktop compatibility request. Contact an administrator.",
     "recoveryKind": "none"
   },
   "desktop_bootstrap_contract_upgrade_required": {
-    "message": "Update Hermes Desktop before continuing.",
+    "httpStatuses": [426],
+    "message": "Contact your administrator to deploy an approved Hermes Desktop version.",
     "recoveryKind": "upgrade"
   },
   "enterprise_desktop_contract_too_old": {
-    "message": "Update Hermes Desktop before continuing.",
+    "httpStatuses": [null],
+    "message": "Contact your administrator to deploy an approved Hermes Desktop version.",
     "recoveryKind": "upgrade"
   },
   "enterprise_gateway_contract_invalid": {
+    "httpStatuses": [null],
     "message": "The enterprise Gateway returned an invalid compatibility response. Contact an administrator.",
     "recoveryKind": "none"
   },
   "enterprise_gateway_contract_too_old": {
+    "httpStatuses": [null],
     "message": "The enterprise Gateway must be upgraded before this Desktop can continue. Contact an administrator.",
     "recoveryKind": "none"
   },
   "enterprise_policy_payload_invalid": {
+    "httpStatuses": [null],
     "message": "The enterprise Gateway returned an invalid policy response. Contact an administrator.",
     "recoveryKind": "none"
   }

@@ -68,6 +68,13 @@ export const en: Translations = {
       remoteDescription:
         'Your remote gateway session has expired. Sign in again to reconnect. Nothing here deletes your chats or settings.',
       retry: 'Retry',
+      approvedDesktopRequired: 'Contact your administrator to deploy an approved Hermes Desktop version.',
+      contactAdministrator: 'Contact your administrator before trying again.',
+      managedFailure: 'Hermes Desktop could not start under enterprise management.',
+      refreshEnterprisePolicy: 'Refresh enterprise policy',
+      recoveryFailed: 'Enterprise recovery failed',
+      recoveryFailedHint: 'The managed recovery action did not complete. Open the logs and contact your administrator.',
+      retrySafeStop: 'Retry safe stop',
       repairInstall: 'Repair install',
       useLocalGateway: 'Use local gateway',
       openLogs: 'Open logs',

@@ -9,6 +9,8 @@ export interface DesktopBootState extends DesktopBootProgress {
 }
 
 const INITIAL_BOOT_STATE: DesktopBootState = {
+  enterpriseError: null,
+  enterpriseManaged: false,
   error: null,
   fakeMode: false,
   message: translateNow('boot.steps.startingHermesDesktop'),
@@ -37,6 +39,7 @@ export function applyDesktopBootProgress(progress: DesktopBootProgress) {
   $desktopBoot.set({
     ...current,
     ...progress,
+    enterpriseError: progress.enterpriseError ?? null,
     error: progress.error === null || progress.error === undefined ? null : redactManagedText(progress.error),
     message: redactManagedText(progress.message),
     progress: mergedProgress,
@@ -68,6 +71,7 @@ export function completeDesktopBoot(message = translateNow('boot.ready')) {
   const current = $desktopBoot.get()
   $desktopBoot.set({
     ...current,
+    enterpriseError: null,
     error: null,
     message,
     phase: 'renderer.ready',
@@ -83,6 +87,7 @@ export function failDesktopBoot(message: string) {
   const safeMessage = redactManagedText(message)
   $desktopBoot.set({
     ...current,
+    enterpriseError: null,
     error: safeMessage,
     message: translateNow('boot.desktopBootFailedWithMessage', safeMessage),
     phase: 'renderer.error',
@@ -91,4 +96,9 @@ export function failDesktopBoot(message: string) {
     timestamp: Date.now(),
     visible: true
   })
+}
+
+export function failDesktopBootWithEnterpriseError(message: string, enterpriseError: DesktopBootProgress['enterpriseError']) {
+  failDesktopBoot(message)
+  $desktopBoot.set({ ...$desktopBoot.get(), enterpriseError: enterpriseError ?? null })
 }

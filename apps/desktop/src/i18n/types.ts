@@ -91,6 +91,13 @@ export interface Translations {
       remoteTitle: string
       remoteDescription: string
       retry: string
+      approvedDesktopRequired: string
+      contactAdministrator: string
+      managedFailure: string
+      refreshEnterprisePolicy: string
+      recoveryFailed: string
+      recoveryFailedHint: string
+      retrySafeStop: string
       repairInstall: string
       useLocalGateway: string
       openLogs: string

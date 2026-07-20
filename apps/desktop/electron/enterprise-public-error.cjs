@@ -217,7 +217,7 @@ function createEnterprisePublicError(error, options = {}) {
   const lifecycleState = String(lifecycle?.state || options.lifecycleState || '')
   const originalCode = normalizedCode(error)
   const code = lifecycleState === 'stop_failed' ? 'enterprise_runtime_stop_failed' : originalCode
-  const status = normalizedStatus(error)
+  const status = code === 'enterprise_runtime_stop_failed' ? null : normalizedStatus(error)
   const maintenancePhase = String(options.maintenancePhase || '')
   const recoveryKind = recoveryKindFor({ code, lifecycleState, maintenancePhase, status })
   const lifecycleEpoch = resolveLifecycleEpoch(error, options, lifecycle)

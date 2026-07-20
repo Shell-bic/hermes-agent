@@ -118,6 +118,12 @@ const {
 } = require('./enterprise-skill-install-operation-store.cjs')
 const { registerEnterpriseSkillHubIpc } = require('./enterprise-skill-hub-ipc.cjs')
 const { createEnterpriseManagedLifecycle } = require('./enterprise-managed-lifecycle.cjs')
+const { createEnterpriseManagedRecoveryActions } = require('./enterprise-managed-recovery-actions.cjs')
+const {
+  createEnterprisePublicError,
+  enterprisePublicFailure,
+  enterprisePublicResult
+} = require('./enterprise-public-error.cjs')
 const { createEnterpriseRuntimeAccess } = require('./enterprise-runtime-access.cjs')
 const { createEnterpriseWindowConnections } = require('./enterprise-window-connections.cjs')
 const { isTrustedRendererUrl } = require('./renderer-trust.cjs')
@@ -1077,6 +1083,8 @@ let desktopLogFlushTimer = null
 let desktopLogFlushPromise = Promise.resolve()
 let nativeThemeListenerInstalled = false
 let bootProgressState = {
+  enterpriseError: null,
+  enterpriseManaged: ENTERPRISE_RUNTIME_OPTIONS.enabled,
   error: null,
   fakeMode: BOOT_FAKE_MODE,
   message: 'Waiting to start Hermes backend',
@@ -1418,6 +1426,7 @@ function updateBootProgress(update, options = {}) {
     ...bootProgressState,
     ...update,
     error: update.error === undefined ? bootProgressState.error : update.error,
+    enterpriseError: update.enterpriseError ?? null,
     fakeMode: BOOT_FAKE_MODE || Boolean(update.fakeMode),
     progress: nextProgress,
     timestamp: Date.now()
@@ -4882,6 +4891,7 @@ function resetBootProgressForReconnect() {
   updateBootProgress(
     {
       error: null,
+      enterpriseError: null,
       message: 'Restarting desktop connection',
       phase: 'backend.resolve',
       progress: 4,
@@ -5382,6 +5392,7 @@ async function startHermes() {
         message: 'Remote Hermes backend is ready',
         progress: 94,
         running: true,
+        enterpriseError: null,
         error: null
       })
       return {
@@ -5539,6 +5550,7 @@ async function startHermes() {
       message: 'Hermes backend is ready. Finalizing desktop startup',
       progress: 94,
       running: true,
+      enterpriseError: null,
       error: null
     })
 
@@ -5560,9 +5572,16 @@ async function startHermes() {
       throw error
     }
 
-    const message = error instanceof Error ? error.message : String(error)
+    const enterpriseError = enterpriseManaged
+      ? createEnterprisePublicError(error, {
+          lifecycle: enterpriseLifecycle.getSnapshot(),
+          useCurrentEpoch: true
+        })
+      : null
+    const message = enterpriseError?.message || (error instanceof Error ? error.message : String(error))
     updateBootProgress(
       {
+        enterpriseError,
         error: message,
         message: `Desktop boot failed: ${message}`,
         phase: 'backend.error',
@@ -5846,6 +5865,24 @@ function assertTrustedEnterpriseSender(event, { mainWindowOnly = false } = {}) {
   }
 }
 
+const enterpriseManagedRecoveryActions = createEnterpriseManagedRecoveryActions({
+  beforeStart: async () => resetBootProgressForReconnect(),
+  getLifecycle: () => enterpriseLifecycle,
+  hasSession: () => enterpriseRuntime.hasStoredSession(),
+  startBackend: () => startHermes()
+})
+
+async function runEnterpriseManagedRecoveryAction(action) {
+  try {
+    return enterprisePublicResult(await action())
+  } catch (error) {
+    return enterprisePublicFailure(createEnterprisePublicError(error, {
+      lifecycle: enterpriseLifecycle.getSnapshot(),
+      useCurrentEpoch: true
+    }))
+  }
+}
+
 ipcMain.handle('hermes:enterprise:status', async event => {
   assertTrustedEnterpriseSender(event)
   return enterpriseRuntime.getPublicState()
@@ -5861,6 +5898,14 @@ ipcMain.handle('hermes:enterprise:refresh', async event => {
 ipcMain.handle('hermes:enterprise:refreshPolicy', async event => {
   assertTrustedEnterpriseSender(event)
   return enterpriseRuntime.refreshPolicy()
+})
+ipcMain.handle('hermes:enterprise:recover-policy', async event => {
+  assertTrustedEnterpriseSender(event, { mainWindowOnly: true })
+  return runEnterpriseManagedRecoveryAction(() => enterpriseManagedRecoveryActions.refreshPolicy())
+})
+ipcMain.handle('hermes:enterprise:retry-stop', async event => {
+  assertTrustedEnterpriseSender(event, { mainWindowOnly: true })
+  return runEnterpriseManagedRecoveryAction(() => enterpriseManagedRecoveryActions.retryStop())
 })
 ipcMain.handle('hermes:enterprise:login-methods', async event => {
   assertTrustedEnterpriseSender(event, { mainWindowOnly: true })
