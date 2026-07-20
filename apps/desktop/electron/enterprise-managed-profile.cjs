@@ -175,19 +175,32 @@ function createEnterpriseManagedProfileGuard({ enabled = false, identity = {} } 
     let url
     try {
       url = new URL(String(request?.path || ''), 'http://enterprise-managed-profile.local')
-      // WHATWG URL preserves encoded path separators. Decode once before
-      // classification so `/api/profiles%2Ffinance` cannot bypass the profile
-      // boundary and be decoded later by the HTTP server/router.
-      try {
-        url.pathname = decodeURIComponent(url.pathname)
-      } catch {
-        // Keep the raw pathname. It still classifies as a profile route and
-        // the segment decoder below will reject the malformed profile name.
+      // Repeatedly normalize only the classification copy. Downstream HTTP
+      // stacks may decode more than once, so stopping after one pass would let
+      // `%252F` become a route separator after this boundary. Four transforms
+      // cover ordinary nested encodings; deeper or malformed input fails closed.
+      let canonicalPath = url.pathname
+      let stable = false
+      for (let pass = 0; pass < 4; pass += 1) {
+        const decoded = decodeURIComponent(canonicalPath)
+        if (decoded === canonicalPath) {
+          stable = true
+          break
+        }
+        canonicalPath = decoded
       }
+      if (!stable && decodeURIComponent(canonicalPath) !== canonicalPath) {
+        throw new Error('API pathname exceeds managed normalization depth.')
+      }
+      // A decoded query/fragment/backslash delimiter inside pathname is not a
+      // canonical HTTP route and could be interpreted differently downstream.
+      if (/[\\?#\0]/.test(canonicalPath)) {
+        throw new Error('API pathname contains a decoded route delimiter.')
+      }
+      return { canonicalPath, method, url }
     } catch {
-      url = null
+      return { canonicalPath: null, method, url: null }
     }
-    return { method, url }
   }
 
   function rewrittenRequest(request, url) {
@@ -207,8 +220,10 @@ function createEnterpriseManagedProfileGuard({ enabled = false, identity = {} } 
 
   function normalizeApiRequest(request, url) {
     const normalized = { ...request }
+    let changed = false
     if (Object.prototype.hasOwnProperty.call(request || {}, 'profile')) {
       normalized.profile = normalizedApiProfile(request.profile)
+      changed = true
     }
 
     const queryProfiles = url.searchParams.getAll('profile')
@@ -218,14 +233,16 @@ function createEnterpriseManagedProfileGuard({ enabled = false, identity = {} } 
       queryProfiles.forEach(normalizedApiProfile)
       url.searchParams.delete('profile')
       url.searchParams.append('profile', publicKey())
+      changed = true
     }
 
     const body = request?.body
     if (body && typeof body === 'object' && !Array.isArray(body) && Object.prototype.hasOwnProperty.call(body, 'profile')) {
       normalized.body = { ...body, profile: normalizedApiProfile(body.profile) }
+      changed = true
     }
 
-    return rewrittenRequest(normalized, url)
+    return changed ? rewrittenRequest(normalized, url) : request
   }
 
   function projectProfiles(response) {
@@ -276,34 +293,36 @@ function createEnterpriseManagedProfileGuard({ enabled = false, identity = {} } 
     if (typeof next !== 'function') throw new TypeError('Enterprise managed profile API boundary requires a next handler.')
     if (!active()) return next(request)
 
-    const { method, url } = parseApiRequest(request)
-    if (!url) {
+    const { canonicalPath, method, url } = parseApiRequest(request)
+    if (!url || !canonicalPath) {
       throw profileNotManagedError('profile:api', request?.path, 'Enterprise managed runtime rejected an invalid API path.')
     }
     const normalizedRequest = normalizeApiRequest(request, url)
-    if (!/^\/api\/profiles(?:[/?#]|$)/.test(url.pathname)) {
+    if (!/^\/api\/profiles(?:\/|$)/.test(canonicalPath)) {
       return next(normalizedRequest)
     }
 
-    if (url.pathname === '/api/profiles/active') {
+    if (canonicalPath === '/api/profiles/active') {
       if (method !== 'GET') assertProfileMutation(`profile:${method.toLowerCase()}`, request?.path)
       return { active: publicKey(), current: publicKey() }
     }
 
-    if (url.pathname === '/api/profiles/sessions') {
+    if (canonicalPath === '/api/profiles/sessions') {
       if (method !== 'GET') assertProfileMutation(`profile:${method.toLowerCase()}`, request?.path)
       // The backend aggregate can scan every nested Hermes profile. Pin it to
       // the managed root profile and relabel only the resulting primary rows.
+      url.pathname = canonicalPath
       url.searchParams.set('profile', publicKey())
       return projectProfileSessions(await next(rewrittenRequest(normalizedRequest, url)))
     }
 
-    if (url.pathname === '/api/profiles') {
+    if (canonicalPath === '/api/profiles') {
       if (method !== 'GET') assertProfileMutation(`profile:${method.toLowerCase()}`, request?.path)
-      return projectProfiles(await next(normalizedRequest))
+      url.pathname = canonicalPath
+      return projectProfiles(await next(rewrittenRequest(normalizedRequest, url)))
     }
 
-    const match = url.pathname.match(/^\/api\/profiles\/([^/]+)(.*)$/)
+    const match = canonicalPath.match(/^\/api\/profiles\/([^/]+)(.*)$/)
     if (!match) {
       throw profileNotManagedError('profile:read', request?.path)
     }

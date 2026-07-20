@@ -137,8 +137,9 @@ test('managed API boundary prevents named profile reads and rewrites the managed
   )
   await assert.rejects(
     () => guard.handleApiRequest({ path: '/api/profiles/%E0%A4%A/soul' }, next),
-    error => error.code === ENTERPRISE_PROFILE_NOT_MANAGED && error.operation === 'profile:read'
+    error => error.code === ENTERPRISE_PROFILE_NOT_MANAGED && error.operation === 'profile:api'
   )
+  assert.equal(forwarded.length, 0)
   const result = await guard.handleApiRequest({ path: '/api/profiles/enterprise-managed/soul?raw=1' }, next)
   assert.deepEqual(result, { content: 'managed soul', exists: true })
   assert.equal(forwarded.length, 1)
@@ -148,6 +149,53 @@ test('managed API boundary prevents named profile reads and rewrites the managed
     error => error.code === ENTERPRISE_PROFILE_NOT_MANAGED && error.operation === 'profile:setup-command'
   )
   assert.equal(forwarded.length, 1)
+})
+
+test('managed API boundary rejects nested encoded profile routes before forwarding', async () => {
+  const guard = createEnterpriseManagedProfileGuard({ enabled: true })
+  let forwards = 0
+  const next = async request => {
+    forwards += 1
+    return { path: request.path }
+  }
+  const blocked = [
+    { path: '/api/profiles%252Ffinance%252Fsoul' },
+    { path: '/api/profiles%25252Ffinance%25252Fsoul' },
+    { path: '/api/profiles%252Fdefault%252Fsetup-command' },
+    { path: '/api/profiles%25252Fenterprise-managed%25252Fsetup-command' },
+    { method: 'PUT', path: '/api/profiles%252Fdefault%252Fsoul', body: { content: 'changed' } },
+    { method: 'DELETE', path: '/api/profiles%25252Fdefault' },
+    { path: '/api/profiles%25252525252Ffinance%25252525252Fsoul' }
+  ]
+
+  for (const request of blocked) {
+    await assert.rejects(
+      () => guard.handleApiRequest(request, next),
+      error => error.code === ENTERPRISE_PROFILE_NOT_MANAGED
+    )
+  }
+  assert.equal(forwards, 0)
+
+  const managed = await guard.handleApiRequest(
+    { path: '/api/profiles%25252Fenterprise-managed%25252Fsoul?raw=1' },
+    next
+  )
+  assert.deepEqual(managed, { path: '/api/profiles/default/soul?raw=1' })
+  assert.equal(forwards, 1)
+})
+
+test('managed API boundary leaves unrelated ordinary API paths byte-for-byte unchanged', async () => {
+  const guard = createEnterpriseManagedProfileGuard({ enabled: true })
+  const request = { path: '/api/files%252Freport?keep=a%2Fb', timeoutMs: 1000 }
+  let forwarded = null
+
+  await guard.handleApiRequest(request, async value => {
+    forwarded = value
+    return { ok: true }
+  })
+
+  assert.equal(forwarded, request)
+  assert.equal(forwarded.path, '/api/files%252Freport?keep=a%2Fb')
 })
 
 test('managed API boundary projects profile list, active profile, and aggregate sessions to one primary', async () => {
