@@ -1030,12 +1030,56 @@ def _parse_wake_gate(script_output: str) -> bool:
     return gate.get("wakeAgent", True) is not False
 
 
-def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
+def _build_job_prompt(
+    job: dict,
+    prerun_script: Optional[tuple] = None,
+    *,
+    policy: Optional[dict] = None,
+) -> str:
     """Assemble one Cron prompt under a frozen enterprise Skill policy."""
     from hermes_cli.enterprise_policy import skill_policy_operation
 
-    with skill_policy_operation():
+    with skill_policy_operation(policy):
         return _build_job_prompt_with_policy(job, prerun_script=prerun_script)
+
+
+def _job_skill_names(job: dict) -> list[str]:
+    """Normalize the current and legacy Cron Skill fields."""
+    skills = job.get("skills")
+    if skills is None:
+        legacy = job.get("skill")
+        skills = [legacy] if legacy else []
+    elif isinstance(skills, str):
+        skills = [skills]
+    return [str(name).strip() for name in skills if str(name).strip()]
+
+
+def _preflight_job_skill_names(skill_names: list[str]) -> None:
+    """Authorize a complete Cron Skill set before any job side effect."""
+    from agent.skill_bundles import preflight_bundle_skills, resolve_bundle_command_key
+    from hermes_cli.enterprise_policy import EnterpriseSkillPolicyDenied
+    from tools.skills_tool import skill_runtime_preflight
+
+    for skill_name in skill_names:
+        bundle_key = resolve_bundle_command_key(skill_name.lstrip("/"))
+        if bundle_key:
+            preflight_bundle_skills(bundle_key)
+            continue
+        preflight = json.loads(skill_runtime_preflight(skill_name))
+        if (
+            not preflight.get("success")
+            and preflight.get("errorCode") == "enterprise_skill_policy_denied"
+        ):
+            raise EnterpriseSkillPolicyDenied(preflight)
+
+
+def _preflight_job_skills(job: dict, *, policy: Optional[dict] = None) -> dict:
+    """Run the side-effect-free Cron authorization under one policy snapshot."""
+    from hermes_cli.enterprise_policy import skill_policy_operation
+
+    with skill_policy_operation(policy) as snapshot:
+        _preflight_job_skill_names(_job_skill_names(job))
+        return dict(snapshot)
 
 
 def _build_job_prompt_with_policy(
@@ -1054,7 +1098,6 @@ def _build_job_prompt_with_policy(
     """
     user_prompt = str(job.get("prompt") or "")
     prompt = user_prompt
-    skills = job.get("skills")
     # True when runtime-collected DATA (script stdout, upstream-job output)
     # has been injected into the prompt. Data content legitimately quotes
     # command-shape strings (a triage feed ingesting a bug report that
@@ -1153,13 +1196,7 @@ def _build_job_prompt_with_policy(
         "findings normally, or say [SILENT] and nothing more.]\n\n"
     )
     prompt = cron_hint + prompt
-    if skills is None:
-        legacy = job.get("skill")
-        skills = [legacy] if legacy else []
-    elif isinstance(skills, str):
-        skills = [skills]
-
-    skill_names = [str(name).strip() for name in skills if str(name).strip()]
+    skill_names = _job_skill_names(job)
     if not skill_names:
         return _scan_assembled_cron_prompt(
             prompt,
@@ -1169,29 +1206,16 @@ def _build_job_prompt_with_policy(
             user_prompt=user_prompt,
         )
 
-    from tools.skills_tool import skill_runtime_preflight, skill_view
+    from tools.skills_tool import skill_view
     from tools.skill_usage import bump_use
     from agent.skill_bundles import (
         build_bundle_invocation_message,
-        preflight_bundle_skills,
         resolve_bundle_command_key,
     )
 
     # Authorize the complete Cron Skill set before loading the first body or
     # triggering preprocessing, environment, credential, or usage side effects.
-    for skill_name in skill_names:
-        bundle_key = resolve_bundle_command_key(skill_name.lstrip("/"))
-        if bundle_key:
-            preflight_bundle_skills(bundle_key)
-            continue
-        preflight = json.loads(skill_runtime_preflight(skill_name))
-        if (
-            not preflight.get("success")
-            and preflight.get("errorCode") == "enterprise_skill_policy_denied"
-        ):
-            from hermes_cli.enterprise_policy import EnterpriseSkillPolicyDenied
-
-            raise EnterpriseSkillPolicyDenied(preflight)
+    _preflight_job_skill_names(skill_names)
 
     parts = []
     resolved_parts: list[list[str] | str] = []
@@ -1467,6 +1491,37 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
     # at module top keeps no_agent ticks from paying for AIAgent / SessionDB
     # construction costs.
     # ---------------------------------------------------------------
+    try:
+        _job_skill_policy = _preflight_job_skills(job)
+    except Exception as exc:
+        from hermes_cli.enterprise_policy import (
+            EnterpriseSkillPolicyDenied,
+            is_enterprise_managed,
+            skill_policy_error_payload,
+        )
+
+        if isinstance(exc, EnterpriseSkillPolicyDenied):
+            payload = skill_policy_error_payload(exc.decision)
+        elif is_enterprise_managed():
+            payload = {
+                "errorCode": "enterprise_skill_policy_unavailable",
+                "policyKey": "skill",
+                "status": "unavailable",
+            }
+        else:
+            raise
+        error_code = str(payload["errorCode"])
+        blocked_doc = (
+            f"# Cron Job: {job_name}\n\n"
+            f"**Job ID:** {job_id}\n"
+            f"**Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+            "**Status:** BLOCKED\n\n"
+            f"Skill authorization stopped this run [{error_code}].\n"
+        )
+        logger.warning("Job '%s' blocked before startup: %s", job_id, error_code)
+        return False, blocked_doc, "", error_code
+
+    prompt = ""
     from run_agent import AIAgent
 
     # Initialize SQLite session store so cron job messages are persisted
@@ -1500,8 +1555,28 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             )
             return True, silent_doc, SILENT_MARKER, None
 
+    from hermes_cli.enterprise_policy import (
+        EnterpriseSkillPolicyDenied,
+        skill_policy_error_payload,
+    )
+
     try:
-        prompt = _build_job_prompt(job, prerun_script=prerun_script)
+        prompt = _build_job_prompt(
+            job,
+            prerun_script=prerun_script,
+            policy=_job_skill_policy,
+        )
+    except EnterpriseSkillPolicyDenied as exc:
+        payload = skill_policy_error_payload(exc.decision)
+        error_code = str(payload["errorCode"])
+        blocked_doc = (
+            f"# Cron Job: {job_name}\n\n"
+            f"**Job ID:** {job_id}\n"
+            f"**Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+            "**Status:** BLOCKED\n\n"
+            f"Skill authorization stopped this run [{error_code}].\n"
+        )
+        return False, blocked_doc, "", error_code
     except CronPromptInjectionBlocked as block_exc:
         # Assembled prompt (user prompt + loaded skill content) tripped the
         # injection scanner. Refuse to run the agent this tick and surface
