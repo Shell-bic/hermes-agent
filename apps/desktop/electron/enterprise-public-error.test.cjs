@@ -139,6 +139,48 @@ test('Gateway D4 stable codes keep fixed public messages and recovery actions', 
   }
 })
 
+test('G4 bootstrap errors use the shared fail-closed public contract', () => {
+  const contract = require('./enterprise-bootstrap-public-errors.json')
+  for (const [code, expected] of Object.entries(contract)) {
+    const publicError = createEnterprisePublicError(
+      Object.assign(new Error('dsk_secret raw payload and header value 999'), { code }),
+      { lifecycle: { lifecycleEpoch: 17, state: 'blocked' }, useCurrentEpoch: true }
+    )
+    assert.deepEqual(
+      {
+        errorCode: publicError.errorCode,
+        lifecycleEpoch: publicError.lifecycleEpoch,
+        message: publicError.message,
+        recoveryKind: publicError.recoveryKind
+      },
+      { errorCode: code, lifecycleEpoch: 17, ...expected }
+    )
+    assert.equal(JSON.stringify(publicError).includes('dsk_secret'), false)
+    assert.equal(JSON.stringify(publicError).includes('999'), false)
+  }
+})
+
+test('D4 stop failure normalizes bootstrap errors to one deterministic retry-stop envelope', () => {
+  const publicError = createEnterprisePublicError(
+    Object.assign(new Error('private cleanup path C:\\Users\\Alice'), { code: 'enterprise_gateway_contract_too_old' }),
+    { lifecycle: { lifecycleEpoch: 18, state: 'stop_failed' }, useCurrentEpoch: true }
+  )
+  assert.equal(publicError.errorCode, 'enterprise_runtime_stop_failed')
+  assert.equal(publicError.recoveryKind, 'retry-stop')
+  assert.equal(JSON.stringify(publicError).includes('Alice'), false)
+  assert.throws(
+    () => unwrapEnterprisePublicResult(enterprisePublicFailure(publicError)),
+    error => error.errorCode === 'enterprise_runtime_stop_failed' && error.recoveryKind === 'retry-stop'
+  )
+
+  for (const recoveryKind of ['none', 'sign-in', 'refresh-policy', 'retry', 'upgrade']) {
+    assert.throws(
+      () => unwrapEnterprisePublicResult(enterprisePublicFailure({ ...publicError, recoveryKind })),
+      error => error.errorCode === 'enterprise_operation_failed' && error.recoveryKind === 'none'
+    )
+  }
+})
+
 test('public envelope redacts raw response bodies, tokens, URLs, and local paths and preserves reject semantics', () => {
   const raw = Object.assign(
     new Error(

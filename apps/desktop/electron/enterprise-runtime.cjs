@@ -1,4 +1,5 @@
 const { createEnterpriseGatewayClient } = require('./enterprise-gateway-client.cjs')
+const { createEnterprisePublicError } = require('./enterprise-public-error.cjs')
 const {
   findEnterpriseDesktopConfig,
   normalizeEnterpriseDesktopGatewayUrl
@@ -14,7 +15,17 @@ const {
 } = require('./enterprise-runtime-home.cjs')
 
 const ENTERPRISE_PROFILE_PREFIX = 'enterprise-profile:'
-const TERMINAL_AUTH_STATUSES = new Set([401, 403])
+const TERMINAL_AUTH_STATUSES = new Set([401])
+const TERMINAL_POLICY_CODES = new Set([
+  'desktop_active_role_required',
+  'desktop_bootstrap_contract_header_invalid',
+  'desktop_bootstrap_contract_upgrade_required',
+  'enterprise_desktop_contract_too_old',
+  'enterprise_gateway_contract_invalid',
+  'enterprise_gateway_contract_too_old',
+  'enterprise_policy_payload_invalid',
+  'enterprise_policy_user_mismatch'
+])
 const LKG_TRANSPORT_ERROR_CODES = new Set([
   'eai_again',
   'econnaborted',
@@ -59,7 +70,7 @@ function terminalPolicyState(error) {
   const status = numericStatus(error)
   if (TERMINAL_AUTH_STATUSES.has(status)) return 'unauthenticated'
   if (status !== null && status >= 400 && status < 500 && status !== 408 && status !== 429) return 'blocked'
-  if (['enterprise_policy_payload_invalid', 'enterprise_policy_user_mismatch'].includes(error?.code)) return 'blocked'
+  if (TERMINAL_POLICY_CODES.has(error?.code)) return 'blocked'
   return null
 }
 
@@ -120,6 +131,19 @@ function unauthenticatedState(error = null) {
     error,
     status: error ? 'error' : 'unauthenticated',
     uiPolicy: ENTERPRISE_UI_POLICY_DEFAULT
+  }
+}
+
+function blockedState({ error, session, terminalError } = {}) {
+  return {
+    ...disabledState(),
+    authenticated: Boolean(session?.desktopToken),
+    enabled: true,
+    error: error || terminalError?.message || 'Enterprise policy blocked Desktop startup.',
+    status: 'error',
+    terminalError: terminalError || null,
+    uiPolicy: ENTERPRISE_UI_POLICY_DEFAULT,
+    user: session?.user || null
   }
 }
 
@@ -376,12 +400,12 @@ class EnterpriseRuntime {
       reasonCode: 'enterprise_auth_rejected'
     })
     this.checkpoint(terminalLease)
+    const session = this.authStore.readSession()
     if (terminalState === 'unauthenticated') {
       this.authStore.clear()
     }
     this.checkpoint(terminalLease)
     this.lastLaunch = null
-    this.lastPublicState = unauthenticatedState(error?.message || 'Enterprise sign-in is required.')
     if (this.onTerminalAuth) {
       await this.onTerminalAuth({
         reasonCode: 'enterprise_auth_rejected',
@@ -389,6 +413,13 @@ class EnterpriseRuntime {
         terminalState
       })
     }
+    const terminalError = createEnterprisePublicError(error, {
+      lifecycle: this.lifecycle(),
+      useCurrentEpoch: true
+    })
+    this.lastPublicState = terminalState === 'unauthenticated'
+      ? { ...unauthenticatedState(terminalError.message), terminalError }
+      : blockedState({ session, terminalError })
     return this.lastPublicState
   }
 
@@ -846,6 +877,7 @@ function createEnterpriseRuntime(options) {
 }
 
 module.exports = {
+  blockedState,
   canUseLastKnownGoodPolicy,
   EnterpriseRuntime,
   EnterpriseRuntimeOperationError,

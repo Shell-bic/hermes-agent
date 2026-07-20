@@ -342,6 +342,73 @@ test('enterprise runtime rejects an invalid initial bootstrap before profiles, m
   assert.deepEqual(calls, ['bootstrap'])
 })
 
+test('contract and policy failures block before profiles manifest or managed-home writes', async t => {
+  const cases = [
+    ['missing', validBootstrap({ bootstrapContractVersion: undefined }), 'enterprise_gateway_contract_too_old'],
+    ['old', validBootstrap({ bootstrapContractVersion: 1 }), 'enterprise_gateway_contract_too_old'],
+    ['future', validBootstrap({ bootstrapContractVersion: 3 }), 'enterprise_desktop_contract_too_old'],
+    ['malformed', validBootstrap({ bootstrapContractVersion: '2' }), 'enterprise_gateway_contract_invalid'],
+    ['policy', validBootstrap({ capabilities: null }), 'enterprise_policy_payload_invalid']
+  ]
+
+  for (const [label, response, expectedCode] of cases) {
+    await t.test(label, async () => {
+      if (label === 'missing') delete response.bootstrapContractVersion
+      const calls = []
+      let session = { desktopToken: 'dsk_secret', user: { id: 'user-a' } }
+      const runtime = createEnterpriseRuntime({
+        authStore: { clear: () => { session = null }, readSession: () => session },
+        client: {
+          bootstrap: async () => response,
+          modelProfiles: async () => { calls.push('profiles'); return [] },
+          runtimeManifest: async () => { calls.push('manifest'); return {} }
+        },
+        enabled: true,
+        homeWriter: () => { calls.push('homeWriter'); return {} },
+        managedHermesHome: 'managed-home',
+        onTerminalAuth: async event => calls.push(`terminal:${event.terminalState}`)
+      })
+
+      await assert.rejects(() => runtime.prepareLaunch(), error => error.code === expectedCode)
+      assert.deepEqual(calls, ['terminal:blocked'])
+      assert.equal(session.desktopToken, 'dsk_secret')
+      assert.equal(runtime.getPublicState().terminalError.errorCode, expectedCode)
+      assert.equal(JSON.stringify(runtime.getPublicState()).includes('dsk_secret'), false)
+    })
+  }
+})
+
+test('403 stays blocked with its session while 401 becomes unauthenticated and clears it', async t => {
+  for (const [status, terminalState, keepsSession] of [[403, 'blocked', true], [401, 'unauthenticated', false]]) {
+    await t.test(String(status), async () => {
+      let session = { desktopToken: 'dsk_secret', user: { id: 'user-a' } }
+      const terminalStates = []
+      const runtime = createEnterpriseRuntime({
+        authStore: { clear: () => { session = null }, readSession: () => session },
+        client: { bootstrap: async () => { throw Object.assign(new Error('remote detail dsk_secret'), { status }) } },
+        enabled: true,
+        managedHermesHome: 'managed-home',
+        onTerminalAuth: async event => terminalStates.push(event.terminalState)
+      })
+
+      await assert.rejects(() => runtime.prepareLaunch(), error => error.status === status)
+      assert.deepEqual(terminalStates, [terminalState])
+      assert.equal(Boolean(session), keepsSession)
+      assert.equal(runtime.getPublicState().authenticated, keepsSession)
+      assert.equal(JSON.stringify(runtime.getPublicState()).includes('dsk_secret'), false)
+    })
+  }
+})
+
+test('managed start does not automatically recover a blocked saved session', () => {
+  const source = fs.readFileSync(path.join(__dirname, 'main.cjs'), 'utf8').replace(/\r\n/g, '\n')
+  const start = source.indexOf('async function startHermes()')
+  const end = source.indexOf('\nfunction wireCommonWindowHandlers', start)
+  const body = source.slice(start, end)
+  assert.equal(body.includes('enterpriseRuntime.hasStoredSession()'), false)
+  assert.equal(body.includes('beginEnterpriseRecovery()'), false)
+})
+
 test('enterprise runtime manifest body sends preferredModel only when selected', () => {
   assert.deepEqual(runtimeManifestRequestBody({ preferredModel: '  claude-sonnet  ' }), {
     preferredModel: 'claude-sonnet'

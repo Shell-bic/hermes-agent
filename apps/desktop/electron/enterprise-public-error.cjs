@@ -1,4 +1,5 @@
 const { redactManagedText } = require('./managed-redaction.cjs')
+const BOOTSTRAP_PUBLIC_ERRORS = require('./enterprise-bootstrap-public-errors.json')
 
 const PUBLIC_ERROR_ENVELOPE = 'enterprise-public-error.v1'
 const PUBLIC_RESULT_ENVELOPE = 'enterprise-public-result.v1'
@@ -13,6 +14,7 @@ const RECOVERY_KINDS = new Set([
   'wait'
 ])
 const PUBLIC_ERROR_CODES = new Set([
+  ...Object.keys(BOOTSTRAP_PUBLIC_ERRORS),
   'artifact_body_missing',
   'artifact_hash_mismatch',
   'artifact_length_mismatch',
@@ -27,6 +29,7 @@ const PUBLIC_ERROR_CODES = new Set([
   'enterprise_operation_superseded',
   'enterprise_profile_not_managed',
   'enterprise_runtime_access_unavailable',
+  'enterprise_runtime_stop_failed',
   'enterprise_skill_download_failed',
   'enterprise_skill_hub_disabled',
   'enterprise_skill_hub_untrusted_renderer',
@@ -72,9 +75,11 @@ const PUBLIC_ERROR_CODES = new Set([
 ])
 
 const SAFE_MESSAGES = Object.freeze({
+  ...Object.fromEntries(Object.entries(BOOTSTRAP_PUBLIC_ERRORS).map(([code, value]) => [code, value.message])),
   enterprise_lifecycle_effect_denied: 'Enterprise access changed while the operation was running.',
   enterprise_lifecycle_ipc_denied: 'Enterprise policy does not allow this operation right now.',
   enterprise_operation_superseded: 'Enterprise access changed while the operation was running.',
+  enterprise_runtime_stop_failed: 'Hermes could not stop safely. Retry the stop before continuing.',
   desktop_active_role_required: 'Contact an administrator to assign an active enterprise role.',
   desktop_session_required: 'Sign in to your enterprise account and try again.',
   request_canceled: 'The operation was canceled because enterprise access changed.',
@@ -128,6 +133,8 @@ function validHttpStatus(value) {
 }
 
 function deterministicRecoveryKind(code, status) {
+  if (code === 'enterprise_runtime_stop_failed') return 'retry-stop'
+  if (BOOTSTRAP_PUBLIC_ERRORS[code]) return BOOTSTRAP_PUBLIC_ERRORS[code].recoveryKind
   if (
     code === 'enterprise_skill_hub_untrusted_renderer' ||
     code === 'enterprise_skill_hub_disabled' ||
@@ -158,6 +165,8 @@ function deterministicRecoveryKind(code, status) {
 }
 
 function recoveryKindFor({ code, lifecycleState, maintenancePhase, status }) {
+  if (code === 'enterprise_runtime_stop_failed' || lifecycleState === 'stop_failed') return 'retry-stop'
+  if (BOOTSTRAP_PUBLIC_ERRORS[code]) return BOOTSTRAP_PUBLIC_ERRORS[code].recoveryKind
   if (
     code === 'enterprise_skill_hub_untrusted_renderer' ||
     code === 'enterprise_skill_hub_disabled' ||
@@ -169,7 +178,6 @@ function recoveryKindFor({ code, lifecycleState, maintenancePhase, status }) {
     code === 'local_backend_request_failed'
   )
     return 'none'
-  if (lifecycleState === 'stop_failed') return 'retry-stop'
   if (maintenancePhase === 'active' || maintenancePhase === 'held') return 'wait'
   if (lifecycleState === 'unauthenticated' || status === 401 || code === 'desktop_session_required') return 'sign-in'
   if (status === 426) return 'upgrade'
@@ -207,7 +215,8 @@ function safeMessage({ code, lifecycleState, recoveryKind, status }) {
 function createEnterprisePublicError(error, options = {}) {
   const lifecycle = options.lifecycle || null
   const lifecycleState = String(lifecycle?.state || options.lifecycleState || '')
-  const code = normalizedCode(error)
+  const originalCode = normalizedCode(error)
+  const code = lifecycleState === 'stop_failed' ? 'enterprise_runtime_stop_failed' : originalCode
   const status = normalizedStatus(error)
   const maintenancePhase = String(options.maintenancePhase || '')
   const recoveryKind = recoveryKindFor({ code, lifecycleState, maintenancePhase, status })

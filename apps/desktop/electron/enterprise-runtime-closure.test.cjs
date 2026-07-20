@@ -460,8 +460,8 @@ test('a mismatched account response fails closed and never publishes the returne
 
   const state = await runtime.refreshPublicState()
 
-  assert.equal(state.authenticated, false)
-  assert.equal(state.user, null)
+  assert.equal(state.authenticated, true)
+  assert.equal(state.user.id, 'user-a')
   assert.equal(session.user.id, 'user-a')
   assert.deepEqual(terminalStates, ['blocked'])
 })
@@ -541,7 +541,7 @@ test('policy LKG is used only for same-user transport, timeout, 408, 429, and 5x
     { label: '503', error: Object.assign(new Error('503'), { status: 503 }), stale: true },
     { label: '400', error: Object.assign(new Error('400'), { status: 400 }), stale: false, terminal: 'blocked' },
     { label: '401', error: Object.assign(new Error('401'), { status: 401 }), stale: false, terminal: 'unauthenticated' },
-    { label: '403', error: Object.assign(new Error('403'), { status: 403 }), stale: false, terminal: 'unauthenticated' },
+    { label: '403', error: Object.assign(new Error('403'), { status: 403 }), stale: false, terminal: 'blocked' },
     { label: '426', error: Object.assign(new Error('426'), { status: 426 }), stale: false, terminal: 'blocked' },
     {
       label: 'invalid-200',
@@ -585,7 +585,7 @@ test('policy LKG is used only for same-user transport, timeout, 408, 429, and 5x
 
       assert.equal(state.policyRefreshStatus, entry.stale ? 'stale' : entry.terminal ? 'idle' : 'failed')
       assert.equal(state.policyStale, entry.stale)
-      if (entry.terminal) assert.equal(state.authenticated, false)
+      if (entry.terminal) assert.equal(state.authenticated, entry.terminal === 'blocked')
       assert.equal(readerCalls.length, entry.stale ? 1 : 0)
       if (readerCalls.length) assert.equal(readerCalls[0].expectedUserId, 'user-a')
       assert.deepEqual(terminalStates, entry.terminal ? [entry.terminal] : [])

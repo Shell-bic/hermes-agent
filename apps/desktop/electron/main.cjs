@@ -5351,9 +5351,6 @@ async function startHermes() {
   if (connectionPromise) return connectionPromise
 
   const enterpriseManaged = enterpriseRuntime.isEnabled()
-  if (enterpriseManaged && enterpriseRuntime.hasStoredSession()) {
-    beginEnterpriseRecovery()
-  }
   const ticket = enterpriseBackendOwnership.beginStart({
     key: 'primary',
     recovery: enterpriseManaged && enterpriseLifecycle.getSnapshot().state === 'recovering'
