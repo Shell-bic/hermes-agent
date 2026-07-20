@@ -396,6 +396,9 @@ class EnterpriseRuntime {
 
     try {
       const bootstrap = await this.client.bootstrap(session.desktopToken)
+      // Do not derive or bind a managed identity from an authenticated 200
+      // until the complete bootstrap contract has passed validation.
+      validateManagedBootstrap(bootstrap)
       hermesHome = this.managedHomeFor({ bootstrap, session })
       this.bindManagedIdentity({ bootstrap, hermesHome, session })
       const result = this.policyWriter({ bootstrap, hermesHome })

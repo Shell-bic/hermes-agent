@@ -10,6 +10,8 @@ const {
   runtimeManifestRequestBody,
   unauthenticatedState
 } = require('./enterprise-runtime.cjs')
+const { createEnterpriseManagedProfileGuard } = require('./enterprise-managed-profile.cjs')
+const { resolveManagedHermesHome } = require('./enterprise-runtime-home.cjs')
 
 // Mirrors the U5 P2 Gateway DesktopBootstrapResponse contract. It deliberately
 // is not a compatibility fixture for the older P1 bootstrap shape, which did
@@ -421,7 +423,16 @@ test('enterprise policy refresh uses authenticated bootstrap and exposes current
     client: {
       bootstrap: async token => {
         calls.push(['bootstrap', token])
-        return { policyVersion: 'pv-2', toolPolicySnapshot: policy.toolPolicySnapshot }
+        return validBootstrap({
+          capabilities: policy.capabilities,
+          generatedAt: policy.generatedAt,
+          lockedSurfaces: policy.lockedSurfaces,
+          policyHash: policy.policyHash,
+          policyVersion: policy.policyVersion,
+          toolPolicySnapshot: policy.toolPolicySnapshot,
+          uiPolicy: policy.uiPolicy,
+          user: policy.user
+        })
       }
     },
     enabled: true,
@@ -442,6 +453,51 @@ test('enterprise policy refresh uses authenticated bootstrap and exposes current
   assert.equal(state.policyHash, 'hash-2')
   assert.equal(state.generatedAt, '2026-07-14T08:00:00Z')
   assert.equal(JSON.stringify(state).includes('desktop-token'), false)
+})
+
+test('invalid policy refresh bootstrap cannot rebind managed identity or select a foreign LKG home', async () => {
+  const userDataPath = 'C:/enterprise-user-data'
+  const safeUser = { id: 'user-a' }
+  const safeHome = resolveManagedHermesHome(userDataPath, safeUser)
+  const guard = createEnterpriseManagedProfileGuard({ enabled: true })
+  guard.bindIdentity({ userId: safeUser.id, hermesHome: safeHome })
+  const originalIdentity = guard.identity()
+  const calls = []
+  let lkgHome = null
+  const runtime = createEnterpriseRuntime({
+    authStore: { readSession: () => ({ desktopToken: 'desktop-token', user: safeUser }) },
+    client: {
+      bootstrap: async () => {
+        calls.push('bootstrap')
+        return validBootstrap({ capabilities: ['../invalid'], user: { id: 'evil-user' } })
+      }
+    },
+    enabled: true,
+    homeWriter: () => {
+      calls.push('homeWriter')
+      return {}
+    },
+    managedIdentityBinder: identity => {
+      calls.push('binder')
+      guard.bindIdentity({ hermesHome: identity.hermesHome, userId: identity.user?.id })
+    },
+    policyReader: ({ hermesHome }) => {
+      lkgHome = hermesHome
+      return { policy: null, valid: false }
+    },
+    policyWriter: () => {
+      calls.push('policyWriter')
+      return {}
+    },
+    userDataPath
+  })
+
+  const state = await runtime.refreshPolicy()
+
+  assert.equal(state.policyRefreshStatus, 'failed')
+  assert.deepEqual(calls, ['bootstrap'])
+  assert.equal(lkgHome, safeHome)
+  assert.deepEqual(guard.identity(), originalIdentity)
 })
 
 test('enterprise policy refresh retains last-known-good on failure and fails closed without one', async () => {
@@ -527,7 +583,12 @@ test('enterprise policy refresh is single-flight across concurrent renderer requ
   assert.equal(first, second)
   assert.equal(bootstrapCalls, 1)
 
-  releaseBootstrap({ policyHash: 'hash-concurrent' })
+  releaseBootstrap(validBootstrap({
+    generatedAt: policy.generatedAt,
+    policyHash: policy.policyHash,
+    policyVersion: policy.policyVersion,
+    toolPolicySnapshot: policy.toolPolicySnapshot
+  }))
   const [firstState, secondState] = await Promise.all([first, second])
   assert.equal(writes, 1)
   assert.equal(firstState.policyHash, 'hash-concurrent')

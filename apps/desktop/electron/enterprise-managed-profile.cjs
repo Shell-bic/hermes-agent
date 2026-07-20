@@ -64,6 +64,13 @@ function unwrapProfileIpcResult(result) {
   throw error
 }
 
+function createManagedProfileInvoker(ipcRenderer) {
+  if (!ipcRenderer || typeof ipcRenderer.invoke !== 'function') {
+    throw new TypeError('Managed profile preload adapter requires ipcRenderer.invoke.')
+  }
+  return (channel, ...args) => ipcRenderer.invoke(channel, ...args).then(unwrapProfileIpcResult)
+}
+
 /**
  * Centralizes the enterprise profile boundary. Enterprise runtime is a single
  * managed primary: secondary windows reuse that connection; no local pool or
@@ -158,8 +165,9 @@ function createEnterpriseManagedProfileGuard({ enabled = false, identity = {} } 
 
   function runProfileOperation(profile, operation) {
     if (typeof operation !== 'function') throw new TypeError('Managed profile operation requires a callback.')
-    const resolved = resolve(profile)
-    return operation(active() ? publicKey() : resolved)
+    if (!active()) return operation(profile)
+    resolve(profile)
+    return operation(publicKey())
   }
 
   function parseApiRequest(request) {
@@ -189,9 +197,40 @@ function createEnterpriseManagedProfileGuard({ enabled = false, identity = {} } 
     }
   }
 
+  function normalizedApiProfile(value) {
+    const profile = String(value ?? '').trim()
+    if (!profile || profile === 'all' || profile === publicKey() || profile === managedKey()) {
+      return publicKey()
+    }
+    throw profileNotManagedError('profile:resolve', value)
+  }
+
+  function normalizeApiRequest(request, url) {
+    const normalized = { ...request }
+    if (Object.prototype.hasOwnProperty.call(request || {}, 'profile')) {
+      normalized.profile = normalizedApiProfile(request.profile)
+    }
+
+    const queryProfiles = url.searchParams.getAll('profile')
+    if (queryProfiles.length > 0) {
+      // Validate every duplicate before replacing the set. A later safe value
+      // must never hide an earlier named profile from the boundary.
+      queryProfiles.forEach(normalizedApiProfile)
+      url.searchParams.delete('profile')
+      url.searchParams.append('profile', publicKey())
+    }
+
+    const body = request?.body
+    if (body && typeof body === 'object' && !Array.isArray(body) && Object.prototype.hasOwnProperty.call(body, 'profile')) {
+      normalized.body = { ...body, profile: normalizedApiProfile(body.profile) }
+    }
+
+    return rewrittenRequest(normalized, url)
+  }
+
   function projectProfiles(response) {
     const profiles = Array.isArray(response?.profiles) ? response.profiles : []
-    const primary = profiles.find(profile => profile?.is_default || String(profile?.name || '').trim() === 'default')
+    const primary = profiles.find(profile => String(profile?.name || '').trim() === publicKey())
     if (!primary) return { ...response, profiles: [] }
 
     return {
@@ -237,14 +276,13 @@ function createEnterpriseManagedProfileGuard({ enabled = false, identity = {} } 
     if (typeof next !== 'function') throw new TypeError('Enterprise managed profile API boundary requires a next handler.')
     if (!active()) return next(request)
 
-    // A profile supplied out-of-band must still identify the one managed
-    // primary. This closes non-profile API routes that use request.profile to
-    // select a pool or remote descriptor.
-    resolve(request?.profile)
-
     const { method, url } = parseApiRequest(request)
-    if (!url || !/^\/api\/profiles(?:[/?#]|$)/.test(url.pathname)) {
-      return next(request)
+    if (!url) {
+      throw profileNotManagedError('profile:api', request?.path, 'Enterprise managed runtime rejected an invalid API path.')
+    }
+    const normalizedRequest = normalizeApiRequest(request, url)
+    if (!/^\/api\/profiles(?:[/?#]|$)/.test(url.pathname)) {
+      return next(normalizedRequest)
     }
 
     if (url.pathname === '/api/profiles/active') {
@@ -257,12 +295,12 @@ function createEnterpriseManagedProfileGuard({ enabled = false, identity = {} } 
       // The backend aggregate can scan every nested Hermes profile. Pin it to
       // the managed root profile and relabel only the resulting primary rows.
       url.searchParams.set('profile', publicKey())
-      return projectProfileSessions(await next(rewrittenRequest(request, url)))
+      return projectProfileSessions(await next(rewrittenRequest(normalizedRequest, url)))
     }
 
     if (url.pathname === '/api/profiles') {
       if (method !== 'GET') assertProfileMutation(`profile:${method.toLowerCase()}`, request?.path)
-      return projectProfiles(await next(request))
+      return projectProfiles(await next(normalizedRequest))
     }
 
     const match = url.pathname.match(/^\/api\/profiles\/([^/]+)(.*)$/)
@@ -292,7 +330,7 @@ function createEnterpriseManagedProfileGuard({ enabled = false, identity = {} } 
     // Hermes sees this isolated HERMES_HOME as its native default profile. The
     // synthetic enterprise key is deliberately never passed to the backend.
     url.pathname = `/api/profiles/${publicKey()}${match[2]}`
-    return next(rewrittenRequest(request, url))
+    return next(rewrittenRequest(normalizedRequest, url))
   }
 
   return Object.freeze({
@@ -311,14 +349,55 @@ function createEnterpriseManagedProfileGuard({ enabled = false, identity = {} } 
   })
 }
 
+function registerEnterpriseManagedProfileIpc({ ipcMain, guard, actions = {} } = {}) {
+  if (!ipcMain || typeof ipcMain.handle !== 'function') {
+    throw new TypeError('Managed profile IPC registrar requires ipcMain.handle.')
+  }
+  if (!guard || typeof guard.handleApiRequest !== 'function') {
+    throw new TypeError('Managed profile IPC registrar requires a profile guard.')
+  }
+
+  const action = name => {
+    if (typeof actions[name] !== 'function') throw new TypeError(`Managed profile IPC action is missing: ${name}`)
+    return actions[name]
+  }
+  const register = (channel, operation) => {
+    ipcMain.handle(channel, async (_event, ...args) => profileIpcResult(() => operation(...args)))
+  }
+  const remote = (operation, requested, callback) => {
+    guard.assertRemoteAllowed(operation, requested)
+    return callback()
+  }
+
+  register('hermes:connection', profile => guard.runProfileOperation(profile, action('connection')))
+  register('hermes:backend:touch', profile => guard.runProfileOperation(profile, action('touchBackend')))
+  register('hermes:gateway:ws-url', profile => guard.runProfileOperation(profile, action('gatewayWsUrl')))
+  register('hermes:connection-config:get', profile => guard.isEnabled()
+    ? guard.managedConnectionConfig(profile)
+    : action('getConnectionConfig')(profile))
+  register('hermes:connection-config:test', payload => remote('connection-config:test', payload?.profile, () => action('testConnectionConfig')(payload)))
+  register('hermes:connection-config:probe', rawUrl => remote('connection-config:probe', rawUrl, () => action('probeConnectionConfig')(rawUrl)))
+  register('hermes:connection-config:oauth-login', rawUrl => remote('connection-config:oauth-login', rawUrl, () => action('oauthLoginConnectionConfig')(rawUrl)))
+  register('hermes:connection-config:oauth-logout', rawUrl => remote('connection-config:oauth-logout', rawUrl, () => action('oauthLogoutConnectionConfig')(rawUrl)))
+  register('hermes:connection-config:save', payload => remote('connection-config:save', payload?.profile, () => action('saveConnectionConfig')(payload)))
+  register('hermes:connection-config:apply', payload => remote('connection-config:apply', payload?.profile, () => action('applyConnectionConfig')(payload)))
+  register('hermes:profile:set', name => {
+    guard.assertProfileMutation('profile:set', name)
+    return action('setProfile')(name)
+  })
+  register('hermes:api', request => guard.handleApiRequest(request, action('api')))
+}
+
 module.exports = {
   DEFAULT_MANAGED_PROFILE_KEY,
   ENTERPRISE_PROFILE_NOT_MANAGED,
   MANAGED_PROFILE_ERROR_ENVELOPE,
+  createManagedProfileInvoker,
   createEnterpriseManagedProfileGuard,
   managedUserId,
   profileIpcResult,
   profileNotManagedError,
   publicError,
+  registerEnterpriseManagedProfileIpc,
   unwrapProfileIpcResult
 }

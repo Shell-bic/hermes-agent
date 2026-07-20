@@ -1,13 +1,13 @@
 const test = require('node:test')
 const assert = require('node:assert/strict')
-const fs = require('node:fs')
-const path = require('node:path')
 
 const {
   ENTERPRISE_PROFILE_NOT_MANAGED,
+  createManagedProfileInvoker,
   createEnterpriseManagedProfileGuard,
   managedUserId,
   profileIpcResult,
+  registerEnterpriseManagedProfileIpc,
   unwrapProfileIpcResult
 } = require('./enterprise-managed-profile.cjs')
 
@@ -29,6 +29,19 @@ test('non-enterprise guard preserves ordinary profile pool and remote behavior',
   assert.equal(guard.resolve(null), null)
   assert.doesNotThrow(() => guard.assertRemoteAllowed('settings', 'finance'))
   assert.doesNotThrow(() => guard.assertProfileMutation('profile:set'))
+})
+
+test('non-enterprise API boundary delegates the original request object unchanged', async () => {
+  const guard = createEnterpriseManagedProfileGuard({ enabled: false })
+  const request = { body: { profile: 'finance' }, path: '/api/config?profile=finance', profile: 'finance' }
+  let forwarded = null
+
+  await guard.handleApiRequest(request, async value => {
+    forwarded = value
+    return { ok: true }
+  })
+
+  assert.equal(forwarded, request)
 })
 
 test('enterprise profile mutations and remote resolution fail before side effects', () => {
@@ -185,13 +198,20 @@ test('managed API boundary projects profile list, active profile, and aggregate 
     { path: '/api/profiles/sessions?profile=all&limit=20' },
     next
   )
-  assert.equal(forwarded[1].path, '/api/profiles/sessions?profile=default&limit=20')
+  const sessionsUrl = new URL(forwarded[1].path, 'http://local')
+  assert.equal(sessionsUrl.searchParams.get('profile'), 'default')
+  assert.equal(sessionsUrl.searchParams.get('limit'), '20')
   assert.deepEqual(sessions.sessions, [{ id: 's1', profile: 'default', is_default_profile: true }])
   assert.deepEqual(sessions.profile_totals, { default: 1 })
   assert.equal(sessions.total, 1)
   assert.deepEqual(sessions.errors, [{ error: 'default warning', profile: 'default' }])
   assert.equal(JSON.stringify(sessions).includes('secret-finance'), false)
   assert.equal(JSON.stringify(sessions).includes('must stay hidden'), false)
+
+  const foreignDefault = await guard.handleApiRequest({ path: '/api/profiles' }, async () => ({
+    profiles: [{ is_default: true, name: 'finance', path: 'C:/finance' }]
+  }))
+  assert.deepEqual(foreignDefault.profiles, [])
 })
 
 test('managed API boundary blocks out-of-band pool identities on ordinary APIs', async () => {
@@ -205,6 +225,44 @@ test('managed API boundary blocks out-of-band pool identities on ordinary APIs',
     error => error.code === ENTERPRISE_PROFILE_NOT_MANAGED && error.profile === 'finance'
   )
   assert.equal(forwarded, false)
+})
+
+test('managed API boundary validates and normalizes every top-level profile selector before forwarding', async () => {
+  const guard = createEnterpriseManagedProfileGuard({ enabled: true })
+  const forwarded = []
+  const next = async request => {
+    forwarded.push(request)
+    return { ok: true }
+  }
+  const rejected = [
+    { path: '/api/sessions/s1/messages?profile=finance' },
+    { path: '/api/config?profile=remote%3Afinance' },
+    { path: '/api/config?pr%6Ffile=finance' },
+    { path: '/api/config?profile=default&profile=finance' },
+    { path: '/api/config?profile=finance&profile=default' },
+    { path: '/api/config', body: { profile: 'finance', value: 1 } },
+    { path: '/api/config', profile: 'finance' }
+  ]
+
+  for (const request of rejected) {
+    await assert.rejects(
+      () => guard.handleApiRequest(request, next),
+      error => error.code === ENTERPRISE_PROFILE_NOT_MANAGED
+    )
+  }
+  assert.equal(forwarded.length, 0)
+
+  await guard.handleApiRequest({
+    body: { profile: '', value: 1 },
+    path: '/api/config?profile=all&profile=enterprise%2Dmanaged&keep=1',
+    profile: 'enterprise-managed'
+  }, next)
+  assert.equal(forwarded.length, 1)
+  assert.equal(forwarded[0].profile, 'default')
+  assert.deepEqual(forwarded[0].body, { profile: 'default', value: 1 })
+  const forwardedUrl = new URL(forwarded[0].path, 'http://local')
+  assert.deepEqual(forwardedUrl.searchParams.getAll('profile'), ['default'])
+  assert.equal(forwardedUrl.searchParams.get('keep'), '1')
 })
 
 test('managed connection config never exposes or selects legacy remote descriptors', () => {
@@ -263,24 +321,66 @@ test('managed profile IPC envelope preserves structured error fields across seri
   })
 })
 
-test('desktop main binds launch identity and routes IPC through the managed API boundary', () => {
-  const main = fs.readFileSync(path.join(__dirname, 'main.cjs'), 'utf8').replace(/\r\n/g, '\n')
-  const preload = fs.readFileSync(path.join(__dirname, 'preload.cjs'), 'utf8').replace(/\r\n/g, '\n')
-  const guard = main.indexOf('const enterpriseManagedProfileGuard = createEnterpriseManagedProfileGuard({')
-  const runtime = main.indexOf('const enterpriseRuntime = createEnterpriseRuntime({', guard)
-  const binder = main.indexOf('managedIdentityBinder:', runtime)
-  assert.ok(guard >= 0 && runtime > guard && binder > runtime)
-  assert.match(main.slice(binder, binder + 260), /enterpriseManagedProfileGuard\.bindIdentity/)
+test('managed profile IPC registrar rejects guarded operations before action side effects', async () => {
+  const handlers = new Map()
+  const calls = []
+  const action = name => async value => {
+    calls.push([name, value])
+    return { name, value }
+  }
+  const guard = createEnterpriseManagedProfileGuard({ enabled: true })
+  registerEnterpriseManagedProfileIpc({
+    ipcMain: { handle: (channel, handler) => handlers.set(channel, handler) },
+    guard,
+    actions: {
+      api: action('api'),
+      applyConnectionConfig: action('apply'),
+      connection: action('connection'),
+      gatewayWsUrl: action('ws'),
+      getConnectionConfig: action('get-config'),
+      oauthLoginConnectionConfig: action('oauth-login'),
+      oauthLogoutConnectionConfig: action('oauth-logout'),
+      probeConnectionConfig: action('probe'),
+      saveConnectionConfig: action('save'),
+      setProfile: action('set-profile'),
+      testConnectionConfig: action('test-config'),
+      touchBackend: action('touch')
+    }
+  })
+  const invoke = (channel, ...args) => handlers.get(channel)(null, ...args)
+  const blocked = [
+    ['hermes:connection', 'finance'],
+    ['hermes:api', { path: '/api/config?profile=finance' }],
+    ['hermes:backend:touch', 'finance'],
+    ['hermes:connection-config:save', { mode: 'remote', profile: 'default' }],
+    ['hermes:profile:set', 'finance']
+  ]
 
-  const handler = main.indexOf("ipcMain.handle('hermes:api'")
-  assert.ok(handler >= 0)
-  assert.match(
-    main.slice(handler, handler + 260),
-    /profileIpcResult\(\(\) => enterpriseManagedProfileGuard\.handleApiRequest\(request, handleHermesApiRequest\)\)/
+  for (const [channel, payload] of blocked) {
+    const result = await invoke(channel, payload)
+    assert.equal(result.ok, false)
+    assert.equal(result.error.code, ENTERPRISE_PROFILE_NOT_MANAGED)
+  }
+  assert.deepEqual(calls, [])
+
+  assert.deepEqual(await invoke('hermes:connection', 'default'), { name: 'connection', value: 'default' })
+  assert.deepEqual(calls, [['connection', 'default']])
+})
+
+test('managed profile preload invoker unwraps the serialized IPC error envelope', async () => {
+  const guard = createEnterpriseManagedProfileGuard({ enabled: true })
+  const wireValue = JSON.parse(JSON.stringify(await profileIpcResult(() => guard.resolve('finance'))))
+  const calls = []
+  const invoke = createManagedProfileInvoker({
+    invoke: async (channel, ...args) => {
+      calls.push([channel, ...args])
+      return wireValue
+    }
+  })
+
+  await assert.rejects(
+    () => invoke('hermes:connection', 'finance'),
+    error => error.code === ENTERPRISE_PROFILE_NOT_MANAGED && error.status === 403
   )
-  assert.match(preload, /api: request => invokeManagedProfile\('hermes:api', request\)/)
-  assert.match(preload, /getConnection: profile => invokeManagedProfile\('hermes:connection', profile\)/)
-  assert.match(preload, /touchBackend: profile => invokeManagedProfile\('hermes:backend:touch', profile\)/)
-  const touchHandler = main.indexOf("ipcMain.handle('hermes:backend:touch'")
-  assert.match(main.slice(touchHandler, touchHandler + 360), /enterpriseManagedProfileGuard\.runProfileOperation/)
+  assert.deepEqual(calls, [['hermes:connection', 'finance']])
 })

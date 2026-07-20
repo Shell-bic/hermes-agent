@@ -97,7 +97,7 @@ const { createEnterpriseRuntime, resolveEnterpriseRuntimeOptions } = require('./
 const {
   createEnterpriseManagedProfileGuard,
   managedUserId,
-  profileIpcResult
+  registerEnterpriseManagedProfileIpc
 } = require('./enterprise-managed-profile.cjs')
 const { createEnterpriseSkillHub, publicError: publicEnterpriseSkillHubError } = require('./enterprise-skill-hub.cjs')
 const { createEnterpriseManagedLifecycle } = require('./enterprise-managed-lifecycle.cjs')
@@ -4798,7 +4798,6 @@ async function probeRemoteAuthMode(rawUrl) {
 }
 
 async function testDesktopConnectionConfig(input = {}) {
-  enterpriseManagedProfileGuard.assertRemoteAllowed('connection-config:test', input?.profile)
   const config = coerceDesktopConnectionConfig(input, readDesktopConnectionConfig(), { persistToken: false })
   const key = connectionScopeKey(input.profile)
   // The block under test: a per-profile entry or the global remote. Coerce has
@@ -5845,9 +5844,6 @@ ipcMain.handle('hermes:enterprise:skill-hub:install', async (event, payload) =>
   enterpriseSkillHubIpc(event, () => enterpriseSkillHub.install(payload || {}))
 )
 
-ipcMain.handle('hermes:connection', async (_event, profile) =>
-  profileIpcResult(() => ensureBackend(profile))
-)
 // Reconnect-after-wake recovery. A REMOTE primary backend has no child process,
 // so the 'exit'/'error' handlers that would clear a dead connectionPromise never
 // fire — once the remote becomes unreachable across a sleep/wake the renderer
@@ -5887,15 +5883,6 @@ ipcMain.handle('hermes:connection:revalidate', async () => {
     return { ok: true, rebuilt: true }
   }
 })
-ipcMain.handle('hermes:backend:touch', async (_event, profile) => profileIpcResult(() =>
-  enterpriseManagedProfileGuard.runProfileOperation(profile, resolvedProfile => {
-    touchPoolBackend(resolvedProfile)
-    return { ok: true }
-  })
-))
-ipcMain.handle('hermes:gateway:ws-url', async (_event, profile) =>
-  profileIpcResult(() => freshGatewayWsUrl(profile))
-)
 ipcMain.handle('hermes:window:openSession', async (_event, sessionId, opts) => {
   if (typeof sessionId !== 'string' || !sessionId.trim()) {
     return { ok: false, error: 'invalid-session-id' }
@@ -5962,86 +5949,8 @@ ipcMain.handle('hermes:bootstrap:cancel', async () => {
 })
 ipcMain.handle('hermes:boot-progress:get', async () => bootProgressState)
 ipcMain.handle('hermes:bootstrap:get', async () => getBootstrapState())
-ipcMain.handle('hermes:connection-config:get', async (_event, profile) =>
-  profileIpcResult(() => enterpriseRuntime.isEnabled()
-    ? enterpriseManagedProfileGuard.managedConnectionConfig(profile)
-    : sanitizeDesktopConnectionConfig(readDesktopConnectionConfig(), profile))
-)
-ipcMain.handle('hermes:connection-config:test', async (_event, payload) =>
-  profileIpcResult(() => testDesktopConnectionConfig(payload))
-)
-ipcMain.handle('hermes:connection-config:probe', async (_event, rawUrl) => profileIpcResult(async () => {
-  enterpriseManagedProfileGuard.assertRemoteAllowed('connection-config:probe')
-  return probeRemoteAuthMode(rawUrl)
-}))
-ipcMain.handle('hermes:connection-config:oauth-login', async (_event, rawUrl) => profileIpcResult(async () => {
-  enterpriseManagedProfileGuard.assertRemoteAllowed('connection-config:oauth-login')
-  // Open the gateway's OAuth login window and wait for the session cookie to
-  // land in the OAuth partition. The caller (settings UI) typically saves the
-  // remote config with authMode='oauth' first, then calls this. We normalize
-  // the URL defensively so a login can be driven from a raw URL too.
-  const baseUrl = normalizeRemoteBaseUrl(rawUrl)
-  await openOauthLoginWindow(baseUrl)
-  return { ok: true, baseUrl, connected: await hasOauthSessionCookie(baseUrl) }
-}))
-ipcMain.handle('hermes:connection-config:oauth-logout', async (_event, rawUrl) => profileIpcResult(async () => {
-  enterpriseManagedProfileGuard.assertRemoteAllowed('connection-config:oauth-logout')
-  const baseUrl = rawUrl ? normalizeRemoteBaseUrl(rawUrl) : ''
-  await clearOauthSession(baseUrl || undefined)
-  // Report against the SAME liveness notion the Settings indicator uses
-  // (AT-or-RT) so a logout that left any session cookie behind is reflected
-  // as still-connected rather than silently signed-out.
-  return { ok: true, connected: baseUrl ? await hasLiveOauthSession(baseUrl) : false }
-}))
-ipcMain.handle('hermes:connection-config:save', async (_event, payload) => profileIpcResult(async () => {
-  if (enterpriseRuntime.isEnabled()) {
-    enterpriseManagedProfileGuard.assertRemoteAllowed('connection-config:save', payload?.profile)
-  }
-
-  const config = coerceDesktopConnectionConfig(payload)
-  writeDesktopConnectionConfig(config)
-
-  return sanitizeDesktopConnectionConfig(config, payload?.profile)
-}))
-ipcMain.handle('hermes:connection-config:apply', async (_event, payload) => profileIpcResult(async () => {
-  if (enterpriseRuntime.isEnabled()) {
-    enterpriseManagedProfileGuard.assertRemoteAllowed('connection-config:apply', payload?.profile)
-  }
-
-  const config = coerceDesktopConnectionConfig(payload)
-  writeDesktopConnectionConfig(config)
-
-  const key = connectionScopeKey(payload?.profile)
-
-  if (key && key !== primaryProfileKey()) {
-    // Editing a NON-primary profile's connection: don't disturb the window's
-    // primary backend. Drop the profile's pooled backend so the next switch
-    // re-resolves against the new remote/local target.
-    await stopPoolBackend(key)
-  } else {
-    // Global connection, or the primary profile's connection: re-home the
-    // window backend by tearing it down and reloading the renderer.
-    await teardownPrimaryBackendAndWait()
-    mainWindow?.reload()
-  }
-
-  return sanitizeDesktopConnectionConfig(config, payload?.profile)
-}))
-
 ipcMain.handle('hermes:profile:get', async () => ({
   profile: enterpriseRuntime.isEnabled() ? enterpriseManagedProfileGuard.publicKey() : readActiveDesktopProfile()
-}))
-ipcMain.handle('hermes:profile:set', async (_event, name) => profileIpcResult(async () => {
-  enterpriseManagedProfileGuard.assertProfileMutation('profile:set', name)
-  const next = writeActiveDesktopProfile(name)
-
-  // Switching profiles is a backend re-home: relaunch the dashboard under the
-  // new HERMES_HOME. Pool backends keep their own homes, so only the primary
-  // is torn down.
-  await teardownPrimaryBackendAndWait()
-  mainWindow?.reload()
-
-  return { profile: next }
 }))
 
 ipcMain.on('hermes:previewShortcutActive', (_event, active) => {
@@ -6230,9 +6139,57 @@ async function handleHermesApiRequest(request) {
   })
 }
 
-ipcMain.handle('hermes:api', async (_event, request) =>
-  profileIpcResult(() => enterpriseManagedProfileGuard.handleApiRequest(request, handleHermesApiRequest))
-)
+registerEnterpriseManagedProfileIpc({
+  ipcMain,
+  guard: enterpriseManagedProfileGuard,
+  actions: {
+    connection: ensureBackend,
+    touchBackend: profile => {
+      touchPoolBackend(profile)
+      return { ok: true }
+    },
+    gatewayWsUrl: freshGatewayWsUrl,
+    getConnectionConfig: profile => sanitizeDesktopConnectionConfig(readDesktopConnectionConfig(), profile),
+    testConnectionConfig: testDesktopConnectionConfig,
+    probeConnectionConfig: probeRemoteAuthMode,
+    oauthLoginConnectionConfig: async rawUrl => {
+      // Open the gateway's OAuth login window and wait for the session cookie
+      // to land in the OAuth partition.
+      const baseUrl = normalizeRemoteBaseUrl(rawUrl)
+      await openOauthLoginWindow(baseUrl)
+      return { ok: true, baseUrl, connected: await hasOauthSessionCookie(baseUrl) }
+    },
+    oauthLogoutConnectionConfig: async rawUrl => {
+      const baseUrl = rawUrl ? normalizeRemoteBaseUrl(rawUrl) : ''
+      await clearOauthSession(baseUrl || undefined)
+      return { ok: true, connected: baseUrl ? await hasLiveOauthSession(baseUrl) : false }
+    },
+    saveConnectionConfig: payload => {
+      const config = coerceDesktopConnectionConfig(payload)
+      writeDesktopConnectionConfig(config)
+      return sanitizeDesktopConnectionConfig(config, payload?.profile)
+    },
+    applyConnectionConfig: async payload => {
+      const config = coerceDesktopConnectionConfig(payload)
+      writeDesktopConnectionConfig(config)
+      const key = connectionScopeKey(payload?.profile)
+      if (key && key !== primaryProfileKey()) {
+        await stopPoolBackend(key)
+      } else {
+        await teardownPrimaryBackendAndWait()
+        mainWindow?.reload()
+      }
+      return sanitizeDesktopConnectionConfig(config, payload?.profile)
+    },
+    setProfile: async name => {
+      const next = writeActiveDesktopProfile(name)
+      await teardownPrimaryBackendAndWait()
+      mainWindow?.reload()
+      return { profile: next }
+    },
+    api: handleHermesApiRequest
+  }
+})
 
 ipcMain.handle('hermes:notify', (_event, payload) => {
   if (!Notification.isSupported()) return false

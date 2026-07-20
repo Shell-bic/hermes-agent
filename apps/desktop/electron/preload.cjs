@@ -1,6 +1,6 @@
 const { contextBridge, ipcRenderer, webUtils } = require('electron')
 const { isEnterpriseManagedEnv, redactManagedText } = require('./managed-redaction.cjs')
-const { unwrapProfileIpcResult } = require('./enterprise-managed-profile.cjs')
+const { createManagedProfileInvoker } = require('./enterprise-managed-profile.cjs')
 
 const ENTERPRISE_MANAGED_OUTPUTS = isEnterpriseManagedEnv(process.env)
 
@@ -12,9 +12,7 @@ function unwrapEnterpriseSkillHub(result) {
   throw error
 }
 
-function invokeManagedProfile(channel, ...args) {
-  return ipcRenderer.invoke(channel, ...args).then(unwrapProfileIpcResult)
-}
+const invokeManagedProfile = createManagedProfileInvoker(ipcRenderer)
 
 contextBridge.exposeInMainWorld('hermesDesktop', {
   getConnection: profile => invokeManagedProfile('hermes:connection', profile),
