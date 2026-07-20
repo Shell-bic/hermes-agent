@@ -11,9 +11,14 @@
 
 const test = require('node:test')
 const assert = require('node:assert/strict')
+const { spawnSync } = require('node:child_process')
+const fs = require('node:fs')
+const os = require('node:os')
+const path = require('node:path')
 
 const {
   UNINSTALL_MODES,
+  buildPosixAppSwapScript,
   buildPosixCleanupScript,
   buildWindowsCleanupScript,
   modeRemovesAgent,
@@ -140,9 +145,77 @@ test('buildPosixCleanupScript waits for the PID, runs the uninstall module, remo
   assert.match(script, /kill -0 "\$pid"/)
   // bounded wait (~30s), not unbounded
   assert.match(script, /seq 1 60/)
+  assert.match(script, /did not exit before uninstall timeout[\s\S]*exit 1/)
   assert.match(script, /'-m' 'hermes_cli\.uninstall' '--mode' 'gui'/)
   assert.match(script, /rm -rf '\/opt\/hermes\/linux-unpacked'/)
   assert.match(script, /export HERMES_HOME='\/home\/x\/\.hermes'/)
+})
+
+test('buildPosixAppSwapScript gates bundle replacement on desktop exit', () => {
+  const script = buildPosixAppSwapScript({
+    desktopPid: 4321,
+    sourceApp: '/tmp/new/Hermes.app',
+    targetApp: '/Applications/Hermes.app'
+  })
+  const timeoutGate = script.indexOf('did not exit before update timeout')
+  const destructiveSwap = script.indexOf('/usr/bin/ditto')
+  assert.ok(timeoutGate > 0)
+  assert.ok(destructiveSwap > timeoutGate)
+  assert.match(script, /did not exit before update timeout[\s\S]*exit 1/)
+})
+
+test('POSIX cleanup timeout exits nonzero without uninstalling or removing the bundle', {
+  skip: process.platform === 'win32'
+}, t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'hermes-uninstall-timeout-'))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const appPath = path.join(root, 'Hermes.app')
+  const uninstallMarker = path.join(root, 'uninstalled')
+  fs.mkdirSync(appPath)
+  const scriptPath = path.join(root, 'cleanup.sh')
+  fs.writeFileSync(scriptPath, buildPosixCleanupScript({
+    desktopPid: process.pid,
+    pythonExe: '/bin/sh',
+    pythonPath: null,
+    agentRoot: root,
+    uninstallArgs: ['-c', `touch ${uninstallMarker}`],
+    appPath,
+    hermesHome: root,
+    waitAttempts: 1,
+    waitSeconds: 0
+  }), { mode: 0o755 })
+
+  const result = spawnSync('/bin/bash', [scriptPath])
+  assert.notEqual(result.status, 0)
+  assert.equal(fs.existsSync(uninstallMarker), false)
+  assert.equal(fs.existsSync(appPath), true)
+})
+
+test('POSIX app swap timeout exits nonzero without replacing the target bundle', {
+  skip: process.platform === 'win32'
+}, t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'hermes-update-timeout-'))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const sourceApp = path.join(root, 'new', 'Hermes.app')
+  const targetApp = path.join(root, 'current', 'Hermes.app')
+  fs.mkdirSync(sourceApp, { recursive: true })
+  fs.mkdirSync(targetApp, { recursive: true })
+  fs.writeFileSync(path.join(sourceApp, 'version'), 'new')
+  fs.writeFileSync(path.join(targetApp, 'version'), 'old')
+  const scriptPath = path.join(root, 'swap.sh')
+  fs.writeFileSync(scriptPath, buildPosixAppSwapScript({
+    desktopPid: process.pid,
+    sourceApp,
+    targetApp,
+    waitAttempts: 1,
+    waitSeconds: 0
+  }), { mode: 0o755 })
+
+  const result = spawnSync('/bin/bash', [scriptPath])
+  assert.notEqual(result.status, 0)
+  assert.equal(fs.readFileSync(path.join(targetApp, 'version'), 'utf8'), 'old')
+  assert.equal(fs.existsSync(`${targetApp}.hermes-update-new`), false)
+  assert.equal(fs.existsSync(`${targetApp}.hermes-update-old`), false)
 })
 
 test('buildPosixCleanupScript exports PYTHONPATH when pythonPath is set (lite/full)', () => {

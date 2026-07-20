@@ -78,6 +78,22 @@ async function runBackendMaintenanceHandoff({ continueHandoff, stopBackends, ver
   return continueHandoff()
 }
 
+async function runPlatformBackendMaintenanceHandoff({
+  platform,
+  continueHandoff,
+  stopBackends,
+  verifyWindowsReady
+} = {}) {
+  if (platform === 'win32' && typeof verifyWindowsReady !== 'function') {
+    throw new TypeError('Windows maintenance readiness verification must be deferred.')
+  }
+  return runBackendMaintenanceHandoff({
+    continueHandoff,
+    stopBackends,
+    verifyReady: platform === 'win32' ? verifyWindowsReady : null
+  })
+}
+
 function createEnterpriseBackendOwnership(options = {}) {
   const getLifecycle = options.getLifecycle
   const isManaged = typeof options.isManaged === 'function' ? options.isManaged : () => true
@@ -325,5 +341,6 @@ module.exports = {
   EnterpriseBackendOwnershipError,
   runBackendStartSequence,
   runBackendMaintenanceHandoff,
+  runPlatformBackendMaintenanceHandoff,
   stopOwnedBackendsForMaintenance
 }

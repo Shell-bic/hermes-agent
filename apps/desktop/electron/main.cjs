@@ -56,6 +56,7 @@ const { isEnterpriseManagedEnv, redactManagedText } = require('./managed-redacti
 const { OFFICIAL_REPO_HTTPS_URL, isOfficialSshRemote } = require('./update-remote.cjs')
 const { runRebuildWithRetry } = require('./update-rebuild.cjs')
 const {
+  buildPosixAppSwapScript,
   buildPosixCleanupScript,
   buildWindowsCleanupScript,
   modeRemovesAgent,
@@ -94,6 +95,7 @@ const {
   createEnterpriseBackendOwnership,
   runBackendStartSequence,
   runBackendMaintenanceHandoff,
+  runPlatformBackendMaintenanceHandoff,
   stopOwnedBackendsForMaintenance
 } = require('./enterprise-backend-ownership.cjs')
 const { resolveEnterpriseDesktopConfigPaths } = require('./enterprise-desktop-config.cjs')
@@ -2063,11 +2065,6 @@ function forceKillProcessTree(pid) {
 // pool backends and poll the shim until it's writable (or a bounded timeout),
 // so by the time we spawn the updater the lock is genuinely gone.
 //
-// Windows-only: the venv-shim mandatory lock is a Windows phenomenon. On
-// macOS/Linux there's no REPLACE-on-running-exe block, the existing before-quit
-// SIGTERM + app.quit() teardown already works (the macOS path is flawless), and
-// aggressively SIGKILL-ing the backend here would be an untested behavior change
-// for no benefit. So we no-op off Windows and leave that path exactly as it was.
 async function releaseBackendLockForUpdate(updateRoot) {
   return releaseBackendLock(updateRoot, 'updates')
 }
@@ -2080,15 +2077,15 @@ async function releaseBackendLockForUpdate(updateRoot) {
 // races a live handle and half-fails (#37532). We tree-kill every backend PID
 // the desktop owns, then poll the shim until it's genuinely writable.
 //
-// `tag` only flavors the log lines. No-op off Windows (POSIX has no mandatory
-// locks — the before-quit SIGTERM + the cleanup script's own PID-wait suffice).
+// `tag` only flavors the log lines. Every platform closes owned runtime
+// resources before handoff; Windows additionally verifies its mandatory venv
+// shim lock has cleared.
 async function releaseBackendLock(updateRoot, tag) {
-  if (!IS_WINDOWS) return { unlocked: true }
-
-  const shim = venvHermesShimPath(updateRoot)
-  return runBackendMaintenanceHandoff({
+  const shim = IS_WINDOWS ? venvHermesShimPath(updateRoot) : null
+  return runPlatformBackendMaintenanceHandoff({
+    platform: process.platform,
     continueHandoff: () => {
-      rememberLog(`[${tag}] venv shim unlocked; safe to proceed`)
+      rememberLog(`[${tag}] owned backends stopped${IS_WINDOWS ? ' and venv shim unlocked' : ''}; safe to proceed`)
       return { unlocked: true }
     },
     stopBackends: () => stopOwnedBackendsForMaintenance({
@@ -2097,7 +2094,7 @@ async function releaseBackendLock(updateRoot, tag) {
       ownership: enterpriseBackendOwnership,
       reasonCode: `enterprise_${tag}_maintenance`
     }),
-    verifyReady: async () => {
+    verifyWindowsReady: async () => {
       const deadlineMs = Date.now() + 15000
       while (Date.now() < deadlineMs) {
         if (!isShimLocked(shim)) return true
@@ -2296,10 +2293,6 @@ function runningAppBundle() {
   return dir.endsWith('.app') ? dir : null
 }
 
-function shellQuote(value) {
-  return `'${String(value).replace(/'/g, `'\\''`)}'`
-}
-
 // macOS/Linux in-app update: backend (`hermes update`) + OS-aware GUI rebuild
 // (`hermes desktop --build-only`), then atomically swap the running .app bundle
 // with the freshly built one and relaunch. Degrades to "backend updated,
@@ -2322,30 +2315,6 @@ async function applyUpdatesPosixInApp() {
     PATH: [extraPath, process.env.PATH].filter(Boolean).join(path.delimiter)
   }
 
-  // `hermes update` reaps stale `hermes dashboard` backends (a code update
-  // leaves the running process serving old Python against the freshly-updated
-  // JS bundle). But OUR backend is one of those processes, and killing it
-  // mid-update produces the boot→kill→crash loop in #37532 — the desktop
-  // already restarts its own backend via the rebuild+relaunch below, so the
-  // reap must spare it. Hand the live backend's PID to the update process;
-  // _kill_stale_dashboard_processes reads HERMES_DESKTOP_CHILD_PID and excludes
-  // it while still reaping any genuinely-orphaned dashboards. (#37532)
-  // Exclude every desktop-managed backend (primary + all pool profiles) from
-  // the update reaper. _kill_stale_dashboard_processes accepts a comma-separated
-  // list (a single int still parses for back-compat).
-  const desktopChildPids = []
-  if (hermesProcess && Number.isInteger(hermesProcess.pid)) {
-    desktopChildPids.push(hermesProcess.pid)
-  }
-  for (const entry of backendPool.values()) {
-    if (entry.process && Number.isInteger(entry.process.pid)) {
-      desktopChildPids.push(entry.process.pid)
-    }
-  }
-  if (desktopChildPids.length) {
-    env.HERMES_DESKTOP_CHILD_PID = desktopChildPids.join(',')
-  }
-
   // Branch-pin so a non-main checkout doesn't get switched to main (and self-heal
   // to main when the pinned branch no longer exists on origin).
   let branchArgs = []
@@ -2358,6 +2327,11 @@ async function applyUpdatesPosixInApp() {
   } catch {
     // best effort
   }
+
+  // Updating mutates the managed runtime itself. Close every owned process and
+  // resource before the first update command; a stop failure aborts update,
+  // rebuild, and any later app-bundle swap.
+  await releaseBackendLockForUpdate(updateRoot)
 
   emitUpdateProgress({ stage: 'update', message: 'Updating Hermes (git + dependencies)…', percent: 10 })
   const updated = await runStreamedUpdate(hermes, ['update', '--yes', ...branchArgs], {
@@ -2410,26 +2384,11 @@ async function applyUpdatesPosixInApp() {
 
   // Detached swapper: wait for THIS process to exit (so the bundle is free),
   // ditto the rebuilt app over the running one, clear quarantine, relaunch.
-  const swapScript = `#!/bin/bash
-set -u
-APP_PID=${process.pid}
-SRC=${shellQuote(rebuiltApp)}
-DST=${shellQuote(targetApp)}
-for _ in $(seq 1 240); do
-  kill -0 "$APP_PID" 2>/dev/null || break
-  sleep 0.5
-done
-if [ "$SRC" != "$DST" ]; then
-  if /usr/bin/ditto "$SRC" "$DST.hermes-update-new"; then
-    rm -rf "$DST.hermes-update-old" 2>/dev/null || true
-    mv "$DST" "$DST.hermes-update-old" 2>/dev/null || rm -rf "$DST"
-    mv "$DST.hermes-update-new" "$DST"
-    rm -rf "$DST.hermes-update-old" 2>/dev/null || true
-  fi
-fi
-/usr/bin/xattr -dr com.apple.quarantine "$DST" 2>/dev/null || true
-/usr/bin/open "$DST"
-`
+  const swapScript = buildPosixAppSwapScript({
+    desktopPid: process.pid,
+    sourceApp: rebuiltApp,
+    targetApp
+  })
   const scriptPath = path.join(app.getPath('temp'), `hermes-desktop-update-${Date.now()}.sh`)
   try {
     fs.writeFileSync(scriptPath, swapScript, { mode: 0o755 })

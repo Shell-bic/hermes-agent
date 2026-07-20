@@ -119,8 +119,20 @@ function shouldRemoveAppBundle(isPackaged, appPath) {
  * resolves from the agent source. `q()` single-quote-escapes for the shell
  * (closes-escapes-reopens any embedded apostrophe), defending against spaces.
  */
-function buildPosixCleanupScript({ desktopPid, pythonExe, pythonPath, agentRoot, uninstallArgs, appPath, hermesHome }) {
+function buildPosixCleanupScript({
+  desktopPid,
+  pythonExe,
+  pythonPath,
+  agentRoot,
+  uninstallArgs,
+  appPath,
+  hermesHome,
+  waitAttempts = 60,
+  waitSeconds = 0.5
+}) {
   const q = s => `'${String(s).replace(/'/g, `'\\''`)}'`
+  const attempts = Math.max(1, Number(waitAttempts) || 60)
+  const seconds = Math.max(0, Number(waitSeconds) || 0)
   const lines = [
     '#!/bin/bash',
     'set -u',
@@ -128,10 +140,14 @@ function buildPosixCleanupScript({ desktopPid, pythonExe, pythonPath, agentRoot,
     '# and the app bundle are no longer in use.',
     `pid=${Number(desktopPid) || 0}`,
     'if [ "$pid" -gt 0 ]; then',
-    '  for _ in $(seq 1 60); do',
+    `  for _ in $(seq 1 ${attempts}); do`,
     '    kill -0 "$pid" 2>/dev/null || break',
-    '    sleep 0.5',
+    `    sleep ${seconds}`,
     '  done',
+    '  if kill -0 "$pid" 2>/dev/null; then',
+    '    echo "Hermes desktop did not exit before uninstall timeout." >&2',
+    '    exit 1',
+    '  fi',
     'fi',
     `export HERMES_HOME=${q(hermesHome)}`
   ]
@@ -149,6 +165,42 @@ function buildPosixCleanupScript({ desktopPid, pythonExe, pythonPath, agentRoot,
   lines.push('rm -f "$0" 2>/dev/null || true')
   lines.push('')
   return lines.join('\n')
+}
+
+function buildPosixAppSwapScript({
+  desktopPid,
+  sourceApp,
+  targetApp,
+  waitAttempts = 240,
+  waitSeconds = 0.5
+}) {
+  const q = s => `'${String(s).replace(/'/g, `'\\''`)}'`
+  const attempts = Math.max(1, Number(waitAttempts) || 240)
+  const seconds = Math.max(0, Number(waitSeconds) || 0)
+  return `#!/bin/bash
+set -u
+APP_PID=${Number(desktopPid) || 0}
+SRC=${q(sourceApp)}
+DST=${q(targetApp)}
+for _ in $(seq 1 ${attempts}); do
+  kill -0 "$APP_PID" 2>/dev/null || break
+  sleep ${seconds}
+done
+if kill -0 "$APP_PID" 2>/dev/null; then
+  echo "Hermes desktop did not exit before update timeout." >&2
+  exit 1
+fi
+if [ "$SRC" != "$DST" ]; then
+  if /usr/bin/ditto "$SRC" "$DST.hermes-update-new"; then
+    rm -rf "$DST.hermes-update-old" 2>/dev/null || true
+    mv "$DST" "$DST.hermes-update-old" 2>/dev/null || rm -rf "$DST"
+    mv "$DST.hermes-update-new" "$DST"
+    rm -rf "$DST.hermes-update-old" 2>/dev/null || true
+  fi
+fi
+/usr/bin/xattr -dr com.apple.quarantine "$DST" 2>/dev/null || true
+/usr/bin/open "$DST"
+`
 }
 
 /**
@@ -222,6 +274,7 @@ function buildWindowsCleanupScript({ desktopPid, pythonExe, pythonPath, agentRoo
 
 module.exports = {
   UNINSTALL_MODES,
+  buildPosixAppSwapScript,
   buildPosixCleanupScript,
   buildWindowsCleanupScript,
   modeRemovesAgent,

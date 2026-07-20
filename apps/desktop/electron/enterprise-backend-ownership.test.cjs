@@ -7,6 +7,7 @@ const {
   createEnterpriseBackendOwnership,
   runBackendStartSequence,
   runBackendMaintenanceHandoff,
+  runPlatformBackendMaintenanceHandoff,
   stopOwnedBackendsForMaintenance
 } = require('./enterprise-backend-ownership.cjs')
 
@@ -140,6 +141,39 @@ test('maintenance handoff never continues after stop or unlock verification fail
       continueHandoff: async () => calls.push('continue'),
       stopBackends: async () => calls.push('stop'),
       verifyReady: async () => {
+        calls.push('verify')
+        return false
+      }
+    }), error => error.code === 'enterprise_backend_stop_failed')
+    assert.deepEqual(calls, ['stop', 'verify'])
+  })
+})
+
+test('platform maintenance closes POSIX ownership and preserves the Windows readiness gate', async t => {
+  await t.test('POSIX stop failure blocks destructive continuation', async () => {
+    const calls = []
+    await assert.rejects(runPlatformBackendMaintenanceHandoff({
+      platform: 'linux',
+      continueHandoff: async () => {
+        calls.push('update')
+        calls.push('rebuild')
+        calls.push('swap')
+      },
+      stopBackends: async () => {
+        calls.push('stop')
+        throw new Error('posix stop failed')
+      }
+    }), /posix stop failed/)
+    assert.deepEqual(calls, ['stop'])
+  })
+
+  await t.test('Windows still requires successful lock readiness verification', async () => {
+    const calls = []
+    await assert.rejects(runPlatformBackendMaintenanceHandoff({
+      platform: 'win32',
+      continueHandoff: async () => calls.push('continue'),
+      stopBackends: async () => calls.push('stop'),
+      verifyWindowsReady: async () => {
         calls.push('verify')
         return false
       }
