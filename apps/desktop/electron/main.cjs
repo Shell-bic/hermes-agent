@@ -92,6 +92,7 @@ const {
 } = require('./hardening.cjs')
 const { createEnterpriseAuthStore } = require('./enterprise-auth-store.cjs')
 const {
+  createTerminalOperationGate,
   createEnterpriseBackendOwnership,
   runBackendStartSequence,
   runBackendMaintenanceHandoff,
@@ -1962,7 +1963,8 @@ async function readCommitLog(cwd, branch) {
     })
 }
 
-let updateInFlight = false
+const updateOperationGate = createTerminalOperationGate({ label: 'Desktop update' })
+const uninstallOperationGate = createTerminalOperationGate({ label: 'Desktop uninstall' })
 
 // Resolve the staged updater binary. The Tauri installer copies itself to
 // HERMES_HOME/hermes-setup.exe on a successful install (see
@@ -2083,38 +2085,49 @@ async function releaseBackendLockForUpdate(updateRoot) {
 // shim lock has cleared.
 async function releaseBackendLock(updateRoot, tag) {
   const reasonCode = `enterprise_${tag}_maintenance`
-  const maintenanceBarrier = enterpriseBackendOwnership.beginMaintenance({ reasonCode })
+  const maintenanceBarrier = enterpriseBackendOwnership.beginMaintenance({ reasonCode, retry: true })
   const shim = IS_WINDOWS ? venvHermesShimPath(updateRoot) : null
-  const result = await runPlatformBackendMaintenanceHandoff({
-    platform: process.platform,
-    continueHandoff: () => {
-      rememberLog(`[${tag}] owned backends stopped${IS_WINDOWS ? ' and venv shim unlocked' : ''}; safe to proceed`)
-      return { unlocked: true }
-    },
-    stopBackends: () => stopOwnedBackendsForMaintenance({
-      lifecycle: enterpriseLifecycle,
-      managed: enterpriseRuntime.isEnabled(),
-      ownership: enterpriseBackendOwnership,
-      reasonCode
-    }),
-    verifyWindowsReady: async () => {
-      const deadlineMs = Date.now() + 15000
-      while (Date.now() < deadlineMs) {
-        if (!isShimLocked(shim)) return true
-        await new Promise(r => setTimeout(r, 300))
+  let result
+  try {
+    result = await runPlatformBackendMaintenanceHandoff({
+      platform: process.platform,
+      continueHandoff: () => ({ unlocked: true }),
+      stopBackends: () => stopOwnedBackendsForMaintenance({
+        lifecycle: enterpriseLifecycle,
+        managed: enterpriseRuntime.isEnabled(),
+        ownership: enterpriseBackendOwnership,
+        reasonCode
+      }),
+      verifyWindowsReady: async () => {
+        const deadlineMs = Date.now() + 15000
+        while (Date.now() < deadlineMs) {
+          if (!isShimLocked(shim)) return true
+          await new Promise(r => setTimeout(r, 300))
+        }
+        return false
       }
-      return false
-    }
-  })
+    })
+  } catch (error) {
+    enterpriseBackendOwnership.markMaintenanceRetryable(maintenanceBarrier)
+    throw error
+  }
+  if (!enterpriseBackendOwnership.markMaintenanceHeld(maintenanceBarrier)) {
+    throw new Error(`Backend maintenance lease could not be held (${reasonCode}).`)
+  }
+  rememberLog(`[${tag}] owned backends stopped${IS_WINDOWS ? ' and venv shim unlocked' : ''}; safe to proceed`)
   return { ...result, maintenanceBarrier }
 }
 
 async function recoverBackendAfterMaintenance(result, reasonCode) {
   const barrier = result?.maintenanceBarrier
+  const managed = enterpriseRuntime.isEnabled()
+  const hasSession = !managed || enterpriseRuntime.hasStoredSession()
   return resumeBackendAfterMaintenance({
     beginRecovery: () => beginEnterpriseRecovery(reasonCode),
+    hasSession,
     maintenance: barrier,
-    managed: enterpriseRuntime.isEnabled(),
+    managed,
+    markUnauthenticated: () => enterpriseLifecycle.markUnauthenticated({ reasonCode }),
     onError: error => rememberLog(`[maintenance] backend recovery failed (${reasonCode}): ${error.message}`),
     ownership: enterpriseBackendOwnership,
     startBackend: () => startHermes()
@@ -2153,12 +2166,7 @@ function spawnDetachedForMaintenance(command, args, options) {
 // Detection (checkUpdates / commit changelog / "N behind") stays in the UI;
 // only this apply action changed.
 async function applyUpdates(opts = {}) {
-  if (updateInFlight) {
-    throw new Error('An update is already in progress.')
-  }
-  updateInFlight = true
-
-  try {
+  return updateOperationGate.run(async ({ markTerminal }) => {
     const updater = resolveUpdaterBinary()
     if (!updater && !IS_WINDOWS) {
       // macOS/Linux drag-install: no staged Tauri hermes-setup. Unlike Windows
@@ -2167,7 +2175,9 @@ async function applyUpdates(opts = {}) {
       // whole update itself: `hermes update` (backend) + `hermes desktop
       // --build-only` (OS-aware GUI rebuild), then swap the running .app bundle
       // with the freshly built one and relaunch.
-      return await applyUpdatesPosixInApp(opts)
+      const result = await applyUpdatesPosixInApp(opts)
+      if (result?.handedOff) markTerminal()
+      return result
     }
     if (!updater) {
       // No staged updater binary — this is a CLI-installed user (they ran
@@ -2242,10 +2252,9 @@ async function applyUpdates(opts = {}) {
       app.quit()
     }, 600)
 
+    markTerminal()
     return { ok: true, handedOff: true, updater }
-  } finally {
-    updateInFlight = false
-  }
+  })
 }
 
 async function handOffWindowsBootstrapRecovery(reason) {
@@ -5996,6 +6005,13 @@ ipcMain.handle('hermes:enterprise:logout', async event => {
     })
   }
   const state = await enterpriseRuntime.logout()
+  const postLogoutLifecycleState = enterpriseLifecycle.getSnapshot().state
+  if (
+    !enterpriseRuntime.hasStoredSession() &&
+    (postLogoutLifecycleState === 'blocked' || postLogoutLifecycleState === 'unauthenticated')
+  ) {
+    enterpriseLifecycle.markUnauthenticated({ reasonCode: 'enterprise_logout' })
+  }
   return state
 })
 ipcMain.handle('hermes:enterprise:skill-hub:list', async (event, query) =>
@@ -6091,29 +6107,46 @@ ipcMain.handle('hermes:bootstrap:repair', async () => {
   // reloads afterwards to re-drive the boot flow from scratch.
   rememberLog('[bootstrap] repair requested by renderer; clearing marker + latched failure')
   const maintenance = enterpriseBackendOwnership.beginMaintenance({
-    reasonCode: 'enterprise_bootstrap_repair'
+    reasonCode: 'enterprise_bootstrap_repair',
+    retry: true
   })
-  const result = await runBackendMaintenanceHandoff({
-    continueHandoff: () => {
-      try {
-        if (fileExists(BOOTSTRAP_COMPLETE_MARKER)) {
-          fs.rmSync(BOOTSTRAP_COMPLETE_MARKER, { force: true })
+  let result
+  try {
+    result = await runBackendMaintenanceHandoff({
+      continueHandoff: () => {
+        if (!enterpriseBackendOwnership.markMaintenanceHeld(maintenance)) {
+          throw new Error('Bootstrap repair maintenance lease could not be held.')
         }
-      } catch (error) {
-        rememberLog(`[bootstrap] failed to remove marker during repair: ${error.message}`)
-      }
-      bootstrapFailure = null
-      resetBootProgressForReconnect()
-      return { ok: true }
-    },
-    stopBackends: () => stopOwnedBackendsForMaintenance({
-      lifecycle: enterpriseLifecycle,
-      managed: enterpriseRuntime.isEnabled(),
-      ownership: enterpriseBackendOwnership,
-      reasonCode: 'enterprise_bootstrap_repair'
+        try {
+          if (fileExists(BOOTSTRAP_COMPLETE_MARKER)) {
+            fs.rmSync(BOOTSTRAP_COMPLETE_MARKER, { force: true })
+          }
+        } catch (error) {
+          rememberLog(`[bootstrap] failed to remove marker during repair: ${error.message}`)
+          throw error
+        }
+        bootstrapFailure = null
+        resetBootProgressForReconnect()
+        return { ok: true }
+      },
+      stopBackends: () => stopOwnedBackendsForMaintenance({
+        lifecycle: enterpriseLifecycle,
+        managed: enterpriseRuntime.isEnabled(),
+        ownership: enterpriseBackendOwnership,
+        reasonCode: 'enterprise_bootstrap_repair'
+      })
     })
-  })
-  enterpriseBackendOwnership.endMaintenance(maintenance)
+  } catch (error) {
+    if (enterpriseBackendOwnership.isMaintenanceLeaseCurrent(maintenance, 'active')) {
+      enterpriseBackendOwnership.markMaintenanceRetryable(maintenance)
+    } else if (enterpriseBackendOwnership.isMaintenanceLeaseCurrent(maintenance, 'held')) {
+      enterpriseBackendOwnership.endMaintenance(maintenance)
+    }
+    throw error
+  }
+  if (!enterpriseBackendOwnership.endMaintenance(maintenance)) {
+    throw new Error('Bootstrap repair maintenance lease could not be released.')
+  }
   return result
 })
 ipcMain.handle('hermes:bootstrap:cancel', async () => {
@@ -7026,7 +7059,7 @@ async function getUninstallSummary() {
   })
 }
 
-async function runDesktopUninstall(mode) {
+async function runDesktopUninstallOnce(mode) {
   let uninstallArgs
   try {
     uninstallArgs = uninstallArgsForMode(mode)
@@ -7134,6 +7167,14 @@ async function runDesktopUninstall(mode) {
   // the venv python shim + app bundle unlock and the cleanup script can run.
   setTimeout(() => app.quit(), 800)
   return { ok: true, mode, willRemoveAppBundle: Boolean(removeBundle), scriptPath }
+}
+
+async function runDesktopUninstall(mode) {
+  return uninstallOperationGate.run(async ({ markTerminal }) => {
+    const result = await runDesktopUninstallOnce(mode)
+    if (result?.ok) markTerminal()
+    return result
+  })
 }
 
 ipcMain.handle('hermes:uninstall:summary', async () => getUninstallSummary())

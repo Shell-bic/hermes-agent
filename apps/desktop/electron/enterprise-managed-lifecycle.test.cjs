@@ -39,7 +39,7 @@ test('initial state and transition table cover the complete legal recovery lifec
     recovering: ['running', 'revoking'],
     running: ['revoking'],
     revoking: ['blocked', 'unauthenticated', 'stop_failed'],
-    blocked: ['recovering'],
+    blocked: ['recovering', 'unauthenticated'],
     stop_failed: []
   }
   for (const fromState of Object.keys(expected)) {
@@ -190,6 +190,30 @@ test('cleanup failure enters stop_failed and retryStop requires verified absence
   assert.throws(
     () => lifecycle.guardIpc('hermes:api', lifecycle.acquireLease()),
     error => error.code === LIFECYCLE_ERROR_CODES.IPC_DENIED
+  )
+})
+
+test('blocked lifecycle can explicitly normalize to unauthenticated but stop_failed cannot', async () => {
+  const { lifecycle } = createHarness()
+  lifecycle.markRunning()
+  assert.throws(
+    () => lifecycle.markUnauthenticated(),
+    error => error.code === LIFECYCLE_ERROR_CODES.INVALID_TRANSITION
+  )
+  await lifecycle.revoke({ terminalState: 'blocked', reasonCode: 'policy_denied' })
+  const before = lifecycle.getSnapshot()
+  const normalized = lifecycle.markUnauthenticated({ reasonCode: 'enterprise_session_missing' })
+  assert.equal(normalized.state, 'unauthenticated')
+  assert.equal(normalized.authEpoch, before.authEpoch + 1)
+  assert.deepEqual(lifecycle.markUnauthenticated(), normalized)
+
+  const failed = createHarness({ verifyResourcesGone: async () => false }).lifecycle
+  failed.markRunning()
+  await failed.revoke({ terminalState: 'blocked' })
+  assert.equal(failed.getSnapshot().state, 'stop_failed')
+  assert.throws(
+    () => failed.markUnauthenticated(),
+    error => error.code === LIFECYCLE_ERROR_CODES.INVALID_TRANSITION
   )
 })
 

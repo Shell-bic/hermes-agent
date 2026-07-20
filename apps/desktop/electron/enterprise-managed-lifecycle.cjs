@@ -22,7 +22,7 @@ const LEGAL_TRANSITIONS = Object.freeze({
   recovering: new Set(['running', 'revoking']),
   running: new Set(['revoking']),
   revoking: new Set(['blocked', 'unauthenticated', 'stop_failed']),
-  blocked: new Set(['recovering']),
+  blocked: new Set(['recovering', 'unauthenticated']),
   stop_failed: new Set()
 })
 
@@ -103,6 +103,15 @@ function createEnterpriseManagedLifecycle(options = {}) {
 
   function markRunning(transitionOptions = {}) {
     return transition('running', transitionOptions)
+  }
+
+  function markUnauthenticated(transitionOptions = {}) {
+    if (state === 'unauthenticated') return getSnapshot()
+    if (state !== 'blocked') {
+      throw new EnterpriseLifecycleError(LIFECYCLE_ERROR_CODES.INVALID_TRANSITION, state)
+    }
+    authEpoch += 1
+    return transition('unauthenticated', transitionOptions)
   }
 
   function acquireLease() {
@@ -233,6 +242,7 @@ function createEnterpriseManagedLifecycle(options = {}) {
     guardIpc,
     isLeaseCurrent,
     markRunning,
+    markUnauthenticated,
     retryStop,
     revoke
   })

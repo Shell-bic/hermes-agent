@@ -4,6 +4,7 @@ const { EventEmitter } = require('node:events')
 
 const { createEnterpriseManagedLifecycle } = require('./enterprise-managed-lifecycle.cjs')
 const {
+  createTerminalOperationGate,
   createEnterpriseBackendOwnership,
   runBackendStartSequence,
   runBackendMaintenanceHandoff,
@@ -189,9 +190,9 @@ test('maintenance barrier blocks cached and fresh backend starts until its ownin
   const maintenance = ownership.beginMaintenance({ reasonCode: 'enterprise_updates_maintenance' })
 
   assert.equal(pending.signal.aborted, true)
-  assert.equal(
-    ownership.beginMaintenance({ reasonCode: 'enterprise_updates_maintenance' }),
-    maintenance
+  assert.throws(
+    () => ownership.beginMaintenance({ reasonCode: 'enterprise_updates_maintenance' }),
+    error => error.code === 'enterprise_backend_maintenance_active'
   )
   assert.throws(
     () => ownership.beginMaintenance({ reasonCode: 'enterprise_uninstall_maintenance' }),
@@ -236,7 +237,7 @@ test('terminal maintenance handoff keeps every backend spawn side effect blocked
   assert.deepEqual(calls, [])
 })
 
-test('stop failure keeps the reusable maintenance barrier active', async () => {
+test('maintenance retry is explicit, same-reason, and single-consumption', async () => {
   const { ownership } = createHarness()
   const maintenance = ownership.beginMaintenance({ reasonCode: 'enterprise_updates_maintenance' })
   await assert.rejects(runPlatformBackendMaintenanceHandoff({
@@ -250,9 +251,65 @@ test('stop failure keeps the reusable maintenance barrier active', async () => {
     () => ownership.beginStart({ key: 'primary', recovery: true }),
     error => error.code === 'enterprise_backend_maintenance_active'
   )
+  assert.equal(ownership.markMaintenanceRetryable(maintenance), true)
+  assert.throws(
+    () => ownership.beginMaintenance({ reasonCode: 'enterprise_updates_maintenance' }),
+    error => error.code === 'enterprise_backend_maintenance_active'
+  )
+  assert.throws(
+    () => ownership.beginMaintenance({ reasonCode: 'enterprise_uninstall_maintenance', retry: true }),
+    error => error.code === 'enterprise_backend_maintenance_active'
+  )
   assert.equal(
-    ownership.beginMaintenance({ reasonCode: 'enterprise_updates_maintenance' }),
+    ownership.beginMaintenance({ reasonCode: 'enterprise_updates_maintenance', retry: true }),
     maintenance
+  )
+  assert.throws(
+    () => ownership.beginMaintenance({ reasonCode: 'enterprise_updates_maintenance', retry: true }),
+    error => error.code === 'enterprise_backend_maintenance_active'
+  )
+})
+
+test('held maintenance rejects every reentry including the same reason', () => {
+  const { ownership } = createHarness()
+  const maintenance = ownership.beginMaintenance({ reasonCode: 'enterprise_updates_maintenance' })
+  assert.equal(ownership.markMaintenanceHeld(maintenance), true)
+  assert.throws(
+    () => ownership.beginMaintenance({ reasonCode: 'enterprise_updates_maintenance', retry: true }),
+    error => error.code === 'enterprise_backend_maintenance_active'
+  )
+  assert.throws(
+    () => ownership.beginMaintenance({ reasonCode: 'enterprise_uninstall_maintenance', retry: true }),
+    error => error.code === 'enterprise_backend_maintenance_active'
+  )
+})
+
+test('terminal operation gate rejects overlap, releases nonterminal failures, and latches handoff', async () => {
+  const gate = createTerminalOperationGate({ label: 'Desktop update' })
+  const pending = deferred()
+  const first = gate.run(async () => pending.promise)
+  assert.equal(gate.getState(), 'active')
+  await assert.rejects(
+    gate.run(async () => undefined),
+    error => error.code === 'enterprise_backend_maintenance_active'
+  )
+  pending.resolve('failed-before-handoff')
+  assert.equal(await first, 'failed-before-handoff')
+  assert.equal(gate.getState(), 'idle')
+
+  const failure = new Error('spawn failed')
+  await assert.rejects(gate.run(async () => { throw failure }), failure)
+  assert.equal(gate.getState(), 'idle')
+
+  const result = await gate.run(async ({ markTerminal }) => {
+    markTerminal()
+    return 'handed-off'
+  })
+  assert.equal(result, 'handed-off')
+  assert.equal(gate.getState(), 'terminal')
+  await assert.rejects(
+    gate.run(async () => undefined),
+    error => error.code === 'enterprise_backend_maintenance_active'
   )
 })
 
@@ -260,6 +317,7 @@ test('maintenance recovery releases then prepares managed lifecycle before expli
   await t.test('managed recovery order', async () => {
     const { ownership } = createHarness()
     const maintenance = ownership.beginMaintenance({ reasonCode: 'enterprise_updates_maintenance' })
+    ownership.markMaintenanceHeld(maintenance)
     const calls = []
     const recovered = await resumeBackendAfterMaintenance({
       beginRecovery: async () => {
@@ -281,6 +339,7 @@ test('maintenance recovery releases then prepares managed lifecycle before expli
   await t.test('unmanaged recovery skips lifecycle preparation', async () => {
     const ownership = createEnterpriseBackendOwnership({ isManaged: () => false })
     const maintenance = ownership.beginMaintenance({ reasonCode: 'enterprise_updates_maintenance' })
+    ownership.markMaintenanceHeld(maintenance)
     const calls = []
     const recovered = await resumeBackendAfterMaintenance({
       beginRecovery: async () => calls.push('recover'),
@@ -296,6 +355,7 @@ test('maintenance recovery releases then prepares managed lifecycle before expli
   await t.test('start failure reports false after the barrier is released', async () => {
     const ownership = createEnterpriseBackendOwnership({ isManaged: () => false })
     const maintenance = ownership.beginMaintenance({ reasonCode: 'enterprise_updates_maintenance' })
+    ownership.markMaintenanceHeld(maintenance)
     const errors = []
     const recovered = await resumeBackendAfterMaintenance({
       maintenance,
@@ -334,6 +394,94 @@ test('maintenance recovery releases then prepares managed lifecycle before expli
       ownership,
       startBackend: async () => undefined
     }), /recovery preparation must be deferred/)
+    assert.throws(
+      () => ownership.assertMaintenanceStartAllowed(),
+      error => error.code === 'enterprise_backend_maintenance_active'
+    )
+  })
+
+  await t.test('managed no-session recovery normalizes while held and never starts a backend', async () => {
+    const { lifecycle, ownership } = createHarness()
+    lifecycle.markRunning()
+    await lifecycle.revoke({ reasonCode: 'policy_denied', terminalState: 'blocked' })
+    const maintenance = ownership.beginMaintenance({ reasonCode: 'enterprise_updates_maintenance' })
+    ownership.markMaintenanceHeld(maintenance)
+    const calls = []
+    const recovered = await resumeBackendAfterMaintenance({
+      beginRecovery: async () => calls.push('recover'),
+      hasSession: false,
+      maintenance,
+      managed: true,
+      markUnauthenticated: async () => {
+        assert.throws(
+          () => ownership.assertMaintenanceStartAllowed(),
+          error => error.code === 'enterprise_backend_maintenance_active'
+        )
+        lifecycle.markUnauthenticated({ reasonCode: 'enterprise_session_missing' })
+        calls.push('unauthenticated')
+      },
+      ownership,
+      startBackend: async () => calls.push('start')
+    })
+    assert.equal(recovered, false)
+    assert.deepEqual(calls, ['unauthenticated'])
+    assert.equal(lifecycle.getSnapshot().state, 'unauthenticated')
+    ownership.assertMaintenanceStartAllowed()
+  })
+
+  await t.test('failed no-session normalization leaves the barrier held', async () => {
+    const { ownership } = createHarness()
+    const maintenance = ownership.beginMaintenance({ reasonCode: 'enterprise_updates_maintenance' })
+    ownership.markMaintenanceHeld(maintenance)
+    const errors = []
+    const recovered = await resumeBackendAfterMaintenance({
+      hasSession: false,
+      maintenance,
+      managed: true,
+      markUnauthenticated: async () => { throw new Error('normalize failed') },
+      onError: error => errors.push(error.message),
+      ownership
+    })
+    assert.equal(recovered, false)
+    assert.deepEqual(errors, ['normalize failed'])
+    assert.throws(
+      () => ownership.assertMaintenanceStartAllowed(),
+      error => error.code === 'enterprise_backend_maintenance_active'
+    )
+  })
+
+  await t.test('missing no-session normalization callback keeps the barrier held', async () => {
+    const { ownership } = createHarness()
+    const maintenance = ownership.beginMaintenance({ reasonCode: 'enterprise_updates_maintenance' })
+    ownership.markMaintenanceHeld(maintenance)
+    await assert.rejects(resumeBackendAfterMaintenance({
+      hasSession: false,
+      maintenance,
+      managed: true,
+      ownership
+    }), /unauthenticated normalization must be deferred/)
+    assert.throws(
+      () => ownership.assertMaintenanceStartAllowed(),
+      error => error.code === 'enterprise_backend_maintenance_active'
+    )
+  })
+
+  await t.test('foreign no-session lease has zero lifecycle or start side effects', async () => {
+    const { ownership } = createHarness()
+    const maintenance = ownership.beginMaintenance({ reasonCode: 'enterprise_updates_maintenance' })
+    ownership.markMaintenanceHeld(maintenance)
+    const calls = []
+    const recovered = await resumeBackendAfterMaintenance({
+      beginRecovery: async () => calls.push('recover'),
+      hasSession: false,
+      maintenance: { id: maintenance.id },
+      managed: true,
+      markUnauthenticated: async () => calls.push('unauthenticated'),
+      ownership,
+      startBackend: async () => calls.push('start')
+    })
+    assert.equal(recovered, false)
+    assert.deepEqual(calls, [])
     assert.throws(
       () => ownership.assertMaintenanceStartAllowed(),
       error => error.code === 'enterprise_backend_maintenance_active'

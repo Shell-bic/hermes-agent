@@ -12,6 +12,36 @@ class EnterpriseBackendOwnershipError extends Error {
   }
 }
 
+function createTerminalOperationGate(options = {}) {
+  const errorCode = options.errorCode || BACKEND_OWNERSHIP_ERROR_CODES.MAINTENANCE_ACTIVE
+  const label = options.label || 'Maintenance operation'
+  let state = 'idle'
+
+  async function run(operation) {
+    if (typeof operation !== 'function') throw new TypeError(`${label} must be deferred.`)
+    if (state !== 'idle') {
+      throw new EnterpriseBackendOwnershipError(errorCode, `${label} is already in progress.`)
+    }
+    state = 'active'
+    let terminal = false
+    try {
+      return await operation({
+        markTerminal() {
+          terminal = true
+          state = 'terminal'
+        }
+      })
+    } finally {
+      if (!terminal) state = 'idle'
+    }
+  }
+
+  return Object.freeze({
+    getState: () => state,
+    run
+  })
+}
+
 async function runBackendStartSequence({ managed = false, prepareLaunch, resolveRuntime, spawnBackend } = {}) {
   if (typeof resolveRuntime !== 'function') {
     throw new TypeError('Backend runtime resolution must be deferred.')
@@ -99,19 +129,41 @@ async function resumeBackendAfterMaintenance({
   ownership,
   maintenance,
   managed = false,
+  hasSession = true,
   beginRecovery,
+  markUnauthenticated,
   startBackend,
   onError
 } = {}) {
   if (!ownership || typeof ownership.endMaintenance !== 'function') {
     throw new TypeError('Backend ownership is required for maintenance recovery.')
   }
-  if (typeof startBackend !== 'function') {
-    throw new TypeError('Backend recovery start must be deferred.')
-  }
-  if (managed && typeof beginRecovery !== 'function') {
+  if (managed && hasSession && typeof beginRecovery !== 'function') {
     throw new TypeError('Managed backend recovery preparation must be deferred.')
   }
+  if (managed && !hasSession && typeof markUnauthenticated !== 'function') {
+    throw new TypeError('Managed unauthenticated normalization must be deferred.')
+  }
+  if ((!managed || hasSession) && typeof startBackend !== 'function') {
+    throw new TypeError('Backend recovery start must be deferred.')
+  }
+
+  if (managed && !hasSession) {
+    if (
+      typeof ownership.isMaintenanceLeaseCurrent !== 'function' ||
+      ownership.isMaintenanceLeaseCurrent(maintenance, 'held') !== true
+    ) return false
+    try {
+      await markUnauthenticated()
+    } catch (error) {
+      if (typeof onError === 'function') onError(error)
+      return false
+    }
+    if (ownership.endMaintenance(maintenance) !== true) return false
+    // Session absence is a safe terminal normalization, not a backend recovery.
+    return false
+  }
+
   if (ownership.endMaintenance(maintenance) !== true) return false
   try {
     if (managed) {
@@ -157,7 +209,7 @@ function createEnterpriseBackendOwnership(options = {}) {
     if (maintenance) {
       throw new EnterpriseBackendOwnershipError(
         BACKEND_OWNERSHIP_ERROR_CODES.MAINTENANCE_ACTIVE,
-        `Backend maintenance is active (${maintenance.reasonCode}).`
+        `Backend maintenance is ${maintenance.phase} (${maintenance.lease.reasonCode}).`
       )
     }
     return true
@@ -166,19 +218,48 @@ function createEnterpriseBackendOwnership(options = {}) {
   function beginMaintenance(options = {}) {
     const reasonCode = String(options.reasonCode || 'backend_maintenance')
     if (maintenance) {
-      if (maintenance.reasonCode === reasonCode) return maintenance
+      if (
+        options.retry === true &&
+        maintenance.phase === 'retryable' &&
+        maintenance.lease.reasonCode === reasonCode
+      ) {
+        maintenance.phase = 'active'
+        for (const ticket of pendingStarts.values()) ticket.controller.abort()
+        return maintenance.lease
+      }
       throw new EnterpriseBackendOwnershipError(
         BACKEND_OWNERSHIP_ERROR_CODES.MAINTENANCE_ACTIVE,
-        `Backend maintenance is already active (${maintenance.reasonCode}).`
+        `Backend maintenance is already ${maintenance.phase} (${maintenance.lease.reasonCode}).`
       )
     }
-    maintenance = Object.freeze({ id: nextMaintenanceId++, reasonCode })
+    const lease = Object.freeze({ id: nextMaintenanceId++, reasonCode })
+    maintenance = { lease, phase: 'active' }
     for (const ticket of pendingStarts.values()) ticket.controller.abort()
-    return maintenance
+    return lease
+  }
+
+  function markMaintenanceHeld(lease) {
+    if (!maintenance || maintenance.lease !== lease || maintenance.phase !== 'active') return false
+    maintenance.phase = 'held'
+    return true
+  }
+
+  function markMaintenanceRetryable(lease) {
+    if (!maintenance || maintenance.lease !== lease || maintenance.phase !== 'active') return false
+    maintenance.phase = 'retryable'
+    return true
+  }
+
+  function isMaintenanceLeaseCurrent(lease, phase = null) {
+    return Boolean(
+      lease &&
+      maintenance?.lease === lease &&
+      (phase === null || maintenance.phase === phase)
+    )
   }
 
   function endMaintenance(lease) {
-    if (!lease || maintenance !== lease) return false
+    if (!lease || maintenance?.lease !== lease) return false
     maintenance = null
     return true
   }
@@ -396,6 +477,9 @@ function createEnterpriseBackendOwnership(options = {}) {
       stopOwnedProcesses,
       verifyResourcesGone
     }),
+    isMaintenanceLeaseCurrent,
+    markMaintenanceHeld,
+    markMaintenanceRetryable,
     stopOwnedProcesses,
     stopOwners,
     trackStart,
@@ -405,6 +489,7 @@ function createEnterpriseBackendOwnership(options = {}) {
 
 module.exports = {
   BACKEND_OWNERSHIP_ERROR_CODES,
+  createTerminalOperationGate,
   createEnterpriseBackendOwnership,
   EnterpriseBackendOwnershipError,
   runBackendStartSequence,

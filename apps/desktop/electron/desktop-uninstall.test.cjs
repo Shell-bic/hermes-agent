@@ -297,6 +297,12 @@ test('buildWindowsCleanupScript waits (bounded) for PID, runs uninstall, rmdir b
   assert.match(script, /if %waited% geq 60 goto wait_timeout/)
   assert.match(script, /:wait_timeout[\s\S]*exit \/b 1[\s\S]*:waited_done/)
   assert.match(script, /findstr \/r \/c:" %PID% "/)
+  assert.match(script, /tasklist[^\r\n]+>"%PROBE_FILE%" 2>nul[\s\S]*if %ERRORLEVEL% neq 0 goto wait_retry/)
+  assert.match(script, /findstr[^\r\n]+\r\nif %ERRORLEVEL% equ 0 goto wait_retry\r\nif %ERRORLEVEL% equ 1 goto waited_done\r\ngoto wait_retry/)
+  assert.match(script, /:wait_retry\r\ndel "%PROBE_FILE%"[\s\S]*if %waited% geq 60 goto wait_timeout/)
+  assert.match(script, /:wait_timeout\r\ndel "%PROBE_FILE%"[\s\S]*exit \/b 1/)
+  assert.match(script, /:waited_done\r\ndel "%PROBE_FILE%"/)
+  assert.doesNotMatch(script, /tasklist[^\r\n]+\|/)
   assert.doesNotMatch(script, /find "%PID%"/) // the old substring-prone form is gone
   // Removal is a retry loop (Windows releases dir handles lazily).
   assert.match(script, /:rmloop/)
