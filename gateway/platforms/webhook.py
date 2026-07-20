@@ -513,26 +513,56 @@ class WebhookAdapter(BasePlatformAdapter):
         skills = route_config.get("skills", [])
         if skills:
             try:
+                from hermes_cli.enterprise_policy import (
+                    EnterpriseSkillPolicyDenied,
+                    is_enterprise_managed,
+                    skill_policy_operation,
+                )
+                from tools.skills_tool import skill_runtime_preflight
                 from agent.skill_commands import (
                     build_skill_invocation_message,
                     get_skill_commands,
                 )
 
-                skill_cmds = get_skill_commands()
-                for skill_name in skills:
-                    cmd_key = f"/{skill_name}"
-                    if cmd_key in skill_cmds:
-                        skill_content = build_skill_invocation_message(
-                            cmd_key, user_instruction=prompt
-                        )
-                        if skill_content:
-                            prompt = skill_content
-                            break  # Load the first matching skill
-                    else:
-                        logger.warning(
-                            "[webhook] Skill '%s' not found", skill_name
-                        )
+                with skill_policy_operation():
+                    skill_cmds = get_skill_commands()
+                    for skill_name in skills:
+                        preflight = json.loads(skill_runtime_preflight(skill_name))
+                        if (
+                            not preflight.get("success")
+                            and preflight.get("errorCode")
+                            == "enterprise_skill_policy_denied"
+                        ):
+                            return web.json_response(preflight, status=403)
+                        cmd_key = f"/{skill_name}"
+                        if cmd_key in skill_cmds:
+                            skill_content = build_skill_invocation_message(
+                                cmd_key, user_instruction=prompt
+                            )
+                            if skill_content:
+                                prompt = skill_content
+                                break  # Load the first matching skill
+                        else:
+                            logger.warning(
+                                "[webhook] Skill '%s' not found", skill_name
+                            )
+            except EnterpriseSkillPolicyDenied as exc:
+                from hermes_cli.enterprise_policy import skill_policy_error_payload
+
+                return web.json_response(
+                    skill_policy_error_payload(exc.decision),
+                    status=403,
+                )
             except Exception as e:
+                if "is_enterprise_managed" in locals() and is_enterprise_managed():
+                    return web.json_response(
+                        {
+                            "success": False,
+                            "errorCode": "enterprise_skill_policy_unavailable",
+                            "error": "Enterprise Skill authorization is unavailable.",
+                        },
+                        status=503,
+                    )
                 logger.warning("[webhook] Skill loading failed: %s", e)
 
         # Build a unique delivery ID

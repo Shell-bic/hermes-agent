@@ -1767,24 +1767,12 @@ def _skill_slug_from_frontmatter(skill_md: Path) -> tuple[str | None, str | None
     can't be read or lacks a ``name:`` in its frontmatter.
     """
     try:
-        content = skill_md.read_text(encoding="utf-8", errors="replace")
+        from agent.skill_utils import read_skill_frontmatter
+
+        frontmatter = read_skill_frontmatter(skill_md)
+        declared_name = str(frontmatter.get("name") or "").strip()
     except Exception:
         return None, None
-    if not content.startswith("---"):
-        return None, None
-    end = content.find("\n---", 3)
-    if end < 0:
-        return None, None
-    declared_name: str | None = None
-    for line in content[3:end].splitlines():
-        line = line.strip()
-        if line.startswith("name:"):
-            raw = line.split(":", 1)[1].strip()
-            # Strip YAML quote wrappers if present
-            if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in {'"', "'"}:
-                raw = raw[1:-1]
-            declared_name = raw.strip()
-            break
     if not declared_name:
         return None, None
     slug = declared_name.lower().replace(" ", "-").replace("_", "-")
@@ -1795,6 +1783,25 @@ def _skill_slug_from_frontmatter(skill_md: Path) -> tuple[str | None, str | None
     if not slug:
         return None, declared_name
     return slug, declared_name
+
+
+def _skill_policy_denial_message(decision: dict) -> str:
+    """Render one stable, redacted denial for gateway user-facing surfaces."""
+    from hermes_cli.enterprise_policy import skill_policy_error_payload
+
+    payload = skill_policy_error_payload(decision)
+    return (
+        f"Skill unavailable [{payload['errorCode']}]: "
+        f"{payload['policyKey']} ({payload['status']})."
+    )
+
+
+def _skill_policy_unavailable_message() -> str:
+    """Return a stable fail-closed result when authorization cannot decide."""
+    return (
+        "Skill unavailable [enterprise_skill_policy_unavailable]: "
+        "enterprise authorization could not be completed."
+    )
 
 
 def _check_unavailable_skill(command_name: str) -> str | None:
@@ -1828,6 +1835,17 @@ def _check_unavailable_skill(command_name: str) -> str | None:
                 slug, declared_name = _skill_slug_from_frontmatter(skill_md)
                 if not slug or not declared_name:
                     continue
+                if slug == normalized:
+                    from hermes_cli.enterprise_policy import (
+                        skill_runtime_decision,
+                        skill_runtime_identity,
+                    )
+
+                    decision = skill_runtime_decision(
+                        skill_runtime_identity(declared_name, skill_path=skill_md)
+                    )
+                    if not decision["allowed"]:
+                        return _skill_policy_denial_message(decision)
                 # disabled is keyed by the declared frontmatter name (what
                 # skills.disabled / skills.platform_disabled store).
                 if slug == normalized and declared_name in disabled:
@@ -1857,7 +1875,10 @@ def _check_unavailable_skill(command_name: str) -> str | None:
                         f"Install it with: `hermes skills install {install_path}`"
                     )
     except Exception:
-        pass
+        from hermes_cli.enterprise_policy import is_enterprise_managed
+
+        if is_enterprise_managed():
+            return _skill_policy_unavailable_message()
     return None
 
 
@@ -7852,6 +7873,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             )
                         # Fall through to normal message processing with bundle content
             except Exception as exc:
+                from hermes_cli.enterprise_policy import EnterpriseSkillPolicyDenied
+
+                if isinstance(exc, EnterpriseSkillPolicyDenied):
+                    return _skill_policy_denial_message(exc.decision)
+                from hermes_cli.enterprise_policy import is_enterprise_managed
+
+                if is_enterprise_managed():
+                    return _skill_policy_unavailable_message()
                 logger.warning("Bundle dispatch failed: %s", exc)
 
         if command and not locals().get("_bundle_handled", False):
@@ -7912,6 +7941,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             f"as a regular message."
                         )
             except Exception as e:
+                from hermes_cli.enterprise_policy import EnterpriseSkillPolicyDenied
+
+                if isinstance(e, EnterpriseSkillPolicyDenied):
+                    return _skill_policy_denial_message(e.decision)
+                from hermes_cli.enterprise_policy import is_enterprise_managed
+
+                if is_enterprise_managed():
+                    return _skill_policy_unavailable_message()
                 logger.debug("Skill command check failed (non-fatal): %s", e)
         
         # Pending exec approvals are handled by /approve and /deny commands above.
@@ -8332,6 +8369,30 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception:
                 pass
 
+        _auto = getattr(event, "auto_skill", None)
+        _auto_skill_policy = None
+        if _auto and self.session_store.would_start_fresh_session(source):
+            _skill_names = [_auto] if isinstance(_auto, str) else list(_auto)
+            try:
+                from agent.skill_commands import preflight_skill_identifiers
+
+                _auto_skill_policy = preflight_skill_identifiers(_skill_names)
+            except Exception as exc:
+                from hermes_cli.enterprise_policy import (
+                    EnterpriseSkillPolicyDenied,
+                    is_enterprise_managed,
+                )
+
+                if isinstance(exc, EnterpriseSkillPolicyDenied):
+                    return _skill_policy_denial_message(exc.decision)
+                if is_enterprise_managed():
+                    return _skill_policy_unavailable_message()
+                logger.warning(
+                    "[Gateway] Failed to authorize auto-skill(s) %s: %s",
+                    _skill_names,
+                    exc,
+                )
+
         session_entry = self.session_store.get_or_create_session(source)
         session_key = session_entry.session_key
         self._cache_session_source(session_key, source)
@@ -8506,36 +8567,35 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Discord channel_skill_bindings).  Supports a single name or ordered list.
         # Only inject on NEW sessions — ongoing conversations already have the
         # skill content in their conversation history from the first message.
-        _auto = getattr(event, "auto_skill", None)
         if _is_new_session and _auto:
             _skill_names = [_auto] if isinstance(_auto, str) else list(_auto)
             try:
-                from agent.skill_commands import _load_skill_payload, _build_skill_message
-                _combined_parts: list[str] = []
-                _loaded_names: list[str] = []
-                for _sname in _skill_names:
-                    _loaded = _load_skill_payload(_sname, task_id=_quick_key)
-                    if _loaded:
-                        _loaded_skill, _skill_dir, _display_name = _loaded
-                        _note = (
-                            f'[IMPORTANT: The "{_display_name}" skill is auto-loaded. '
-                            f"Follow its instructions for this session.]"
-                        )
-                        _part = _build_skill_message(_loaded_skill, _skill_dir, _note)
-                        if _part:
-                            _combined_parts.append(_part)
-                            _loaded_names.append(_sname)
-                    else:
-                        logger.warning("[Gateway] Auto-skill '%s' not found", _sname)
-                if _combined_parts:
-                    # Append the user's original text after all skill payloads
-                    _combined_parts.append(event.text)
-                    event.text = "\n\n".join(_combined_parts)
+                from agent.skill_commands import build_auto_loaded_skills_message
+
+                event.text, _loaded_names, _missing_names = (
+                    build_auto_loaded_skills_message(
+                        _skill_names,
+                        event.text,
+                        task_id=_quick_key,
+                        policy=_auto_skill_policy,
+                    )
+                )
+                for _sname in _missing_names:
+                    logger.warning("[Gateway] Auto-skill '%s' not found", _sname)
+                if _loaded_names:
                     logger.info(
                         "[Gateway] Auto-loaded skill(s) %s for session %s",
                         _loaded_names, session_key,
                     )
             except Exception as e:
+                from hermes_cli.enterprise_policy import EnterpriseSkillPolicyDenied
+
+                if isinstance(e, EnterpriseSkillPolicyDenied):
+                    return _skill_policy_denial_message(e.decision)
+                from hermes_cli.enterprise_policy import is_enterprise_managed
+
+                if is_enterprise_managed():
+                    return _skill_policy_unavailable_message()
                 logger.warning("[Gateway] Failed to auto-load skill(s) %s: %s", _skill_names, e)
 
         # Load conversation history from transcript

@@ -220,7 +220,19 @@ def create_blueprint_job(
     optional ``prompt`` becomes the task instruction. Delivery, model, and
     toolsets carry through. Returns the created job dict.
     """
+    import json
+
     from cron.jobs import create_job
+    from hermes_cli.enterprise_policy import EnterpriseSkillPolicyDenied
+    from tools.skills_tool import skill_runtime_preflight
+
+    if spec.skill_name:
+        preflight = json.loads(skill_runtime_preflight(spec.skill_name))
+        if (
+            not preflight.get("success")
+            and preflight.get("errorCode") == "enterprise_skill_policy_denied"
+        ):
+            raise EnterpriseSkillPolicyDenied(preflight)
 
     job_spec = blueprint_to_job_spec(spec, name=name)
     if origin is not None:

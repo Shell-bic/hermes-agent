@@ -887,6 +887,26 @@ class SessionStore:
             self._ensure_loaded_locked()
             return len(self._entries) > 1
 
+    def would_start_fresh_session(self, source: SessionSource) -> bool:
+        """Predict a fresh/reset boundary without updating or persisting state."""
+        session_key = self._generate_session_key(source)
+        with self._lock:
+            self._ensure_loaded_locked()
+            entry = self._entries.get(session_key)
+            if entry is None:
+                return True
+            if entry.resume_pending:
+                return False
+            if entry.suspended:
+                return True
+            if (
+                entry.created_at == entry.updated_at
+                or getattr(entry, "was_auto_reset", False)
+                or getattr(entry, "is_fresh_reset", False)
+            ):
+                return True
+            return self._should_reset(entry, source) is not None
+
     def get_or_create_session(
         self,
         source: SessionSource,

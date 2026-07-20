@@ -235,6 +235,28 @@ def accept_suggestion(ref: str, *, origin: Optional[Dict[str, Any]] = None) -> O
     if origin is not None and "origin" not in spec:
         spec["origin"] = origin
 
+    if s.get("source") == "blueprint":
+        from hermes_cli.enterprise_policy import (
+            EnterpriseSkillPolicyDenied,
+            skill_policy_operation,
+        )
+        from tools.skills_tool import skill_runtime_preflight
+
+        with skill_policy_operation():
+            raw_skills = spec.get("skills")
+            if raw_skills is None:
+                raw_skills = [spec.get("skill")] if spec.get("skill") else []
+            elif isinstance(raw_skills, str):
+                raw_skills = [raw_skills]
+            for raw_skill_name in raw_skills:
+                preflight = json.loads(skill_runtime_preflight(str(raw_skill_name)))
+                if (
+                    not preflight.get("success")
+                    and preflight.get("errorCode")
+                    == "enterprise_skill_policy_denied"
+                ):
+                    raise EnterpriseSkillPolicyDenied(preflight)
+
     job = create_job(**spec)
     _set_status(s["id"], _STATUS_ACCEPTED)
     return job
