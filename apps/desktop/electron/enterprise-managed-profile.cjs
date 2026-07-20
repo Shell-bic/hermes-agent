@@ -1,6 +1,12 @@
+const {
+  createEnterprisePublicError,
+  enterprisePublicFailure,
+  enterprisePublicResult,
+  unwrapEnterprisePublicResult
+} = require('./enterprise-public-error.cjs')
+
 const ENTERPRISE_PROFILE_NOT_MANAGED = 'enterprise_profile_not_managed'
 const DEFAULT_MANAGED_PROFILE_KEY = 'enterprise-managed'
-const MANAGED_PROFILE_ERROR_ENVELOPE = 'enterprise-managed-profile-error.v1'
 
 function isEnabledValue(enabled) {
   return typeof enabled === 'function' ? enabled() === true : enabled === true
@@ -23,6 +29,7 @@ function managedUserId(user) {
 function profileNotManagedError(operation, requested, reason = 'Enterprise managed runtime only supports its immutable primary profile.') {
   const error = new Error(reason)
   error.code = ENTERPRISE_PROFILE_NOT_MANAGED
+  error.status = 403
   error.operation = String(operation || 'profile')
   if (requested !== undefined && requested !== null && String(requested).trim()) {
     error.profile = String(requested).trim()
@@ -30,38 +37,37 @@ function profileNotManagedError(operation, requested, reason = 'Enterprise manag
   return error
 }
 
-function publicError(error) {
-  return {
-    code: ENTERPRISE_PROFILE_NOT_MANAGED,
-    message: String(error?.message || 'Enterprise managed profile operation is not allowed.'),
-    operation: String(error?.operation || 'profile'),
-    profile: error?.profile ? String(error.profile) : null,
-    status: 403
+function safeLifecycleSnapshot(getLifecycle) {
+  try {
+    return getLifecycle?.()?.getSnapshot?.() || null
+  } catch {
+    return null
   }
 }
 
-async function profileIpcResult(operation) {
+async function profileIpcResult(operation, options = {}) {
   try {
-    return await operation()
+    return enterprisePublicResult(await operation())
   } catch (error) {
-    if (error?.code !== ENTERPRISE_PROFILE_NOT_MANAGED) throw error
-    return {
-      envelope: MANAGED_PROFILE_ERROR_ENVELOPE,
-      error: publicError(error),
-      ok: false
+    let managed
+    try {
+      managed = typeof options.managed === 'function' ? options.managed() === true : options.managed !== false
+    } catch (managedError) {
+      return enterprisePublicFailure(createEnterprisePublicError(managedError))
     }
+    const status = Number(error?.httpStatus ?? error?.status ?? error?.statusCode)
+    const publicError = !managed && (status === 401 || status === 403 || status === 426)
+      ? { code: 'local_backend_request_failed', status }
+      : error
+    return enterprisePublicFailure(createEnterprisePublicError(publicError, {
+      lifecycle: managed ? safeLifecycleSnapshot(options.getLifecycle) : null,
+      operationEpoch: Number.isSafeInteger(error?.lifecycleEpoch) ? error.lifecycleEpoch : undefined
+    }))
   }
 }
 
 function unwrapProfileIpcResult(result) {
-  if (result?.envelope !== MANAGED_PROFILE_ERROR_ENVELOPE) return result
-
-  const error = new Error(result?.error?.message || 'Enterprise managed profile operation is not allowed.')
-  error.code = result?.error?.code || ENTERPRISE_PROFILE_NOT_MANAGED
-  error.operation = result?.error?.operation || 'profile'
-  error.profile = result?.error?.profile || null
-  error.status = Number.isFinite(result?.error?.status) ? result.error.status : 403
-  throw error
+  return unwrapEnterprisePublicResult(result)
 }
 
 function createManagedProfileInvoker(ipcRenderer) {
@@ -368,7 +374,7 @@ function createEnterpriseManagedProfileGuard({ enabled = false, identity = {} } 
   })
 }
 
-function registerEnterpriseManagedProfileIpc({ ipcMain, guard, actions = {} } = {}) {
+function registerEnterpriseManagedProfileIpc({ ipcMain, guard, actions = {}, assertTrusted, getLifecycle } = {}) {
   if (!ipcMain || typeof ipcMain.handle !== 'function') {
     throw new TypeError('Managed profile IPC registrar requires ipcMain.handle.')
   }
@@ -381,7 +387,17 @@ function registerEnterpriseManagedProfileIpc({ ipcMain, guard, actions = {} } = 
     return actions[name]
   }
   const register = (channel, operation) => {
-    ipcMain.handle(channel, async (_event, ...args) => profileIpcResult(() => operation(...args)))
+    ipcMain.handle(channel, async (event, ...args) => {
+      try {
+        assertTrusted?.(event)
+      } catch {
+        return enterprisePublicFailure(createEnterprisePublicError({
+          code: 'enterprise_untrusted_renderer',
+          status: 403
+        }, { lifecycle: safeLifecycleSnapshot(getLifecycle) }))
+      }
+      return profileIpcResult(() => operation(...args), { getLifecycle, managed: () => guard.isEnabled() })
+    })
   }
   const remote = (operation, requested, callback) => {
     guard.assertRemoteAllowed(operation, requested)
@@ -404,19 +420,16 @@ function registerEnterpriseManagedProfileIpc({ ipcMain, guard, actions = {} } = 
     guard.assertProfileMutation('profile:set', name)
     return action('setProfile')(name)
   })
-  register('hermes:api', request => guard.handleApiRequest(request, action('api')))
 }
 
 module.exports = {
   DEFAULT_MANAGED_PROFILE_KEY,
   ENTERPRISE_PROFILE_NOT_MANAGED,
-  MANAGED_PROFILE_ERROR_ENVELOPE,
   createManagedProfileInvoker,
   createEnterpriseManagedProfileGuard,
   managedUserId,
   profileIpcResult,
   profileNotManagedError,
-  publicError,
   registerEnterpriseManagedProfileIpc,
   unwrapProfileIpcResult
 }

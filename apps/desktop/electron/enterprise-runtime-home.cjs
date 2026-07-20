@@ -670,6 +670,71 @@ function validateManagedBootstrap(bootstrap) {
   return bootstrap
 }
 
+function normalizeSkillInstallReceiptTrust(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null
+  const trustKeys = ['algorithm', 'audience', 'issuer', 'publicKeys', 'purpose', 'schemaVersion', 'signerMode']
+  if (Object.keys(value).sort().join('\0') !== trustKeys.sort().join('\0')) return null
+  if (asArray(value.publicKeys).some(item =>
+    !item ||
+    typeof item !== 'object' ||
+    Array.isArray(item) ||
+    Object.keys(item).sort().join('\0') !== ['algorithm', 'kid', 'publicKeyPem', 'rotationState'].sort().join('\0')
+  )) return null
+  const publicKeys = asArray(value.publicKeys).map(item => ({
+    kid: String(item?.kid || '').trim(),
+    algorithm: String(item?.algorithm || '').trim(),
+    publicKeyPem: String(item?.publicKeyPem || '').trim(),
+    rotationState: String(item?.rotationState || '').trim()
+  }))
+  let parsedPublicKeys = false
+  try {
+    parsedPublicKeys = publicKeys.every(key => {
+      if (
+        Buffer.byteLength(key.publicKeyPem, 'utf8') > 8 * 1024 ||
+        key.publicKeyPem.includes('PRIVATE KEY')
+      ) return false
+      const parsed = crypto.createPublicKey(key.publicKeyPem)
+      return (
+        parsed.type === 'public' &&
+        parsed.asymmetricKeyType === 'ec' &&
+        parsed.asymmetricKeyDetails?.namedCurve === 'prime256v1'
+      )
+    })
+  } catch {
+    parsedPublicKeys = false
+  }
+  if (
+    value.schemaVersion !== 2 ||
+    value.algorithm !== 'ES256' ||
+    !['gateway-service', 'local-development', 'testing'].includes(value.signerMode) ||
+    value.audience !== 'hermes-enterprise-skill-runtime' ||
+    value.purpose !== 'hermes-enterprise-skill-materialize' ||
+    !String(value.issuer || '').trim() ||
+    publicKeys.length < 1 ||
+    publicKeys.length > 16 ||
+    publicKeys.reduce((total, key) => total + Buffer.byteLength(key.publicKeyPem, 'utf8'), 0) > 64 * 1024 ||
+    !parsedPublicKeys ||
+    publicKeys.some(key =>
+      !key.kid ||
+      key.algorithm !== 'ES256' ||
+      !['current', 'previous', 'retired', 'revoked'].includes(key.rotationState) ||
+      !key.publicKeyPem.includes('BEGIN PUBLIC KEY')
+    ) ||
+    new Set(publicKeys.map(key => key.kid)).size !== publicKeys.length ||
+    publicKeys.filter(key => key.rotationState === 'current').length !== 1 ||
+    publicKeys.filter(key => key.rotationState === 'previous').length > 1
+  ) return null
+  return {
+    schemaVersion: 2,
+    issuer: String(value.issuer).trim(),
+    audience: value.audience,
+    purpose: value.purpose,
+    algorithm: 'ES256',
+    signerMode: value.signerMode,
+    publicKeys
+  }
+}
+
 function readManagedPolicySnapshot({ expectedUserId = null, fsImpl = fs, hermesHome } = {}) {
   const policyPath = path.join(String(hermesHome || ''), 'enterprise-policy.json')
 
@@ -746,6 +811,7 @@ function buildRefreshedPolicySnapshot({ bootstrap, currentPolicy = null } = {}) 
     runtimeDefaults: scrubSecretFields(base.runtimeDefaults || {}),
     runtimeLimits: scrubSecretFields(base.runtimeLimits || {}),
     sessionId: base.sessionId || null,
+    skillInstallReceiptTrust: normalizeSkillInstallReceiptTrust(bootstrap.skillInstallReceiptTrust),
     toolPolicySnapshot: canonicalToolPolicySnapshot,
     uiPolicy: normalizeEnterpriseUiPolicy({ bootstrap }),
     user: scrubSecretFields(bootstrap.user || bootstrap.account || null)
@@ -861,6 +927,9 @@ function publicEnterpriseState({ bootstrap = null, manifest = null, modelProfile
     runtimeDefaults: scrubSecretFields(manifest?.runtimeDefaults || {}),
     runtimeLimits: scrubSecretFields(manifest?.runtimeLimits || {}),
     status: 'authenticated',
+    skillInstallReceiptTrust: normalizeSkillInstallReceiptTrust(
+      manifest?.skillInstallReceiptTrust || bootstrap?.skillInstallReceiptTrust
+    ),
     toolPolicySnapshot: normalizeToolPolicySnapshot(manifest),
     uiPolicy: normalizeEnterpriseUiPolicy({ bootstrap, manifest }),
     user: bootstrap?.user || bootstrap?.account || null
@@ -927,6 +996,7 @@ function buildPolicySnapshot({ bootstrap = null, manifest = null, modelProfiles 
     runtimeDefaults: publicState.runtimeDefaults,
     runtimeLimits: publicState.runtimeLimits,
     sessionId: manifest?.sessionId || null,
+    skillInstallReceiptTrust: publicState.skillInstallReceiptTrust,
     toolPolicySnapshot: publicState.toolPolicySnapshot,
     uiPolicy: publicState.uiPolicy,
     user: bootstrap?.user || bootstrap?.account || null
@@ -1023,6 +1093,7 @@ module.exports = {
   normalizeGatewayApiBaseUrl,
   normalizeEnterpriseUiPolicy,
   normalizeProviderRuntimeMetadata,
+  normalizeSkillInstallReceiptTrust,
   normalizeToolPolicySnapshot,
   policyRefreshMetadata,
   publicEnterpriseState,

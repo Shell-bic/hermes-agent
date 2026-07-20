@@ -12,6 +12,8 @@ import hashlib
 import os
 import re
 import unicodedata
+import uuid
+from datetime import datetime, timezone
 from contextlib import contextmanager
 from contextvars import ContextVar
 from pathlib import Path
@@ -873,21 +875,124 @@ def _enterprise_lock_entry_matches(
     *,
     policy_key: str,
     install_path: str,
+    skill_root: Optional[Path] = None,
 ) -> bool:
     if _text(entry.get("source")).lower() != "enterprise":
         return False
     entry_key = _text(entry.get("key") or entry.get("identifier"))
-    if entry_key and entry_key != policy_key:
+    if entry_key != policy_key:
         return False
     recorded_path = _text(entry.get("install_path") or entry.get("path")).replace("\\", "/")
     if recorded_path != install_path:
         return False
     metadata = entry.get("metadata")
-    if isinstance(metadata, dict):
-        metadata_key = _text(metadata.get("enterprise_key"))
-        if metadata_key and metadata_key != policy_key:
+    if not isinstance(metadata, dict) or _text(metadata.get("enterprise_key")) != policy_key:
+        return False
+    revision = entry.get("revision")
+    if isinstance(revision, bool) or not isinstance(revision, int) or revision < 1:
+        return False
+    if metadata.get("enterprise_revision") != revision:
+        return False
+    artifact_sha = _text(entry.get("artifactSha256")).lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", artifact_sha):
+        return False
+    if _text(metadata.get("artifact_sha256")).lower() != artifact_sha:
+        return False
+    operation_id = _text(metadata.get("enterprise_install_operation_id"))
+    try:
+        if str(uuid.UUID(operation_id)) != operation_id:
             return False
-    return True
+    except (ValueError, AttributeError):
+        return False
+    client_operation_id = _text(metadata.get("enterprise_client_operation_id"))
+    if not _SAFE_ERROR_TOKEN.fullmatch(client_operation_id):
+        return False
+    if not re.fullmatch(r"[0-9a-f]{64}", _text(metadata.get("install_authorization_hash"))):
+        return False
+    desktop_user_id = _text(metadata.get("enterprise_desktop_user_id"))
+    try:
+        if str(uuid.UUID(desktop_user_id)) != desktop_user_id:
+            return False
+    except (ValueError, AttributeError):
+        return False
+    current_enterprise_user_id = _text(load_enterprise_policy().get("enterpriseUserId")).lower()
+    try:
+        if (
+            str(uuid.UUID(current_enterprise_user_id)) != current_enterprise_user_id
+            or current_enterprise_user_id != desktop_user_id
+        ):
+            return False
+    except (ValueError, AttributeError):
+        return False
+    tenant_id = metadata.get("enterprise_tenant_id")
+    if tenant_id is not None and (not isinstance(tenant_id, str) or not tenant_id or len(tenant_id) > 256):
+        return False
+    binding_schema = metadata.get("materialization_binding_schema_version")
+    if type(binding_schema) is not int or binding_schema != 2:
+        return False
+    recovery_expiry = _text(metadata.get("materialization_recovery_expires_at"))
+    try:
+        parsed_recovery_expiry = datetime.fromisoformat(recovery_expiry.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if parsed_recovery_expiry.tzinfo is None:
+        return False
+    if parsed_recovery_expiry.astimezone(timezone.utc).isoformat().replace("+00:00", "Z") != recovery_expiry:
+        return False
+    receipt_digest = metadata.get("materialization_receipt_digest")
+    if not isinstance(receipt_digest, str) or not re.fullmatch(r"[0-9a-f]{64}", receipt_digest):
+        return False
+    receipt_kid = metadata.get("materialization_receipt_kid")
+    if not isinstance(receipt_kid, str) or not _SAFE_ERROR_TOKEN.fullmatch(receipt_kid):
+        return False
+    if metadata.get("materialization_receipt_validated") is not True:
+        return False
+    receipt_jws = metadata.get("materialization_receipt_jws")
+    if not isinstance(receipt_jws, str) or not receipt_jws or len(receipt_jws.encode("utf-8")) > 32 * 1024:
+        return False
+    content_hash = entry.get("content_hash")
+    if not isinstance(content_hash, str) or not re.fullmatch(r"[0-9a-f]{64}", content_hash):
+        return False
+    if skill_root is None:
+        return False
+    try:
+        from tools.enterprise_skills import (
+            EnterpriseSkillInstallError,
+            _tree_manifest,
+            _verify_materialization_receipt,
+            validate_install_operation_binding,
+        )
+
+        _manifest, actual_content_hash = _tree_manifest(Path(skill_root))
+        if actual_content_hash != content_hash:
+            return False
+        binding = validate_install_operation_binding(
+            operation_id,
+            client_operation_id=client_operation_id,
+            key=policy_key,
+            revision=revision,
+            artifact_sha256=artifact_sha,
+            install_authorization_hash=metadata.get("install_authorization_hash"),
+            desktop_user_id=desktop_user_id,
+            tenant_id=tenant_id,
+            materialization_binding_schema_version=binding_schema,
+            materialized_content_hash=content_hash,
+            materialization_recovery_expires_at=recovery_expiry,
+        )
+        proof = _verify_materialization_receipt(
+            receipt_jws,
+            binding,
+            expected_content_hash=actual_content_hash,
+            historical=True,
+        )
+    except (EnterpriseSkillInstallError, OSError, ValueError, TypeError):
+        return False
+    return (
+        proof.get("digest") == receipt_digest
+        and proof.get("kid") == receipt_kid
+        and proof.get("compactJws") == receipt_jws
+        and proof.get("materializedContentHash") == actual_content_hash
+    )
 
 
 def skill_runtime_identity(
@@ -965,6 +1070,7 @@ def skill_runtime_identity(
                     enterprise_entry,
                     policy_key=trusted_policy_key,
                     install_path=install_path,
+                    skill_root=path.parent,
                 )
             ):
                 return {"policyKey": trusted_policy_key, "provenance": "enterprise"}

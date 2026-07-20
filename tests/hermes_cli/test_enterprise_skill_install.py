@@ -3,6 +3,7 @@ from __future__ import annotations
 from io import BytesIO
 import hashlib
 import json
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import stat
 from types import SimpleNamespace
@@ -51,6 +52,24 @@ def _canonical_entries() -> list[tuple[str, bytes]]:
 
 def _canonical_artifact() -> bytes:
     return _zip(_canonical_entries())
+
+
+def _artifact_content_hash(artifact: bytes) -> str:
+    with zipfile.ZipFile(BytesIO(artifact), "r") as archive:
+        files = {
+            info.filename.replace("\\", "/"): archive.read(info)
+            for info in archive.infolist()
+            if not info.is_dir()
+        }
+    digest_input = bytearray()
+    for relative_path, content in sorted(files.items()):
+        digest_input.extend(relative_path.encode("utf-8"))
+        digest_input.extend(b"\0")
+        digest_input.extend(hashlib.sha256(content).hexdigest().encode("ascii"))
+        digest_input.extend(b"\0")
+        digest_input.extend(str(len(content)).encode("ascii"))
+        digest_input.extend(b"\n")
+    return hashlib.sha256(digest_input).hexdigest()
 
 
 def _skill_md(name: str = "expense-review") -> bytes:
@@ -423,6 +442,32 @@ def _api_install(client: TestClient, artifact: bytes, **headers):
     )
 
 
+def _api_stage(client: TestClient, artifact: bytes, **headers):
+    operation_id = "8bd3e8fb-8f0d-4f1c-8850-f79e48a8aac5"
+    request_headers = {
+        "Content-Type": "application/zip",
+        "Content-Length": str(len(artifact)),
+        "X-Hermes-Artifact-Sha256": hashlib.sha256(artifact).hexdigest(),
+        "X-Hermes-Client-Operation-Id": "desktop-operation-1",
+        "X-Hermes-Install-Authorization-Hash": "b" * 64,
+        "X-Hermes-Desktop-User-Id": "67f4d4f5-2164-45b4-9d62-3809e211b2f4",
+        "X-Hermes-Materialization-Binding-Schema-Version": "2",
+        "X-Hermes-Materialized-Content-Hash": _artifact_content_hash(artifact),
+        "X-Hermes-Materialization-Recovery-Expires-At": (
+            datetime.now(timezone.utc) + timedelta(hours=24)
+        ).isoformat().replace("+00:00", "Z"),
+        "X-Hermes-Operation-Expires-At": (
+            datetime.now(timezone.utc) + timedelta(minutes=30)
+        ).isoformat().replace("+00:00", "Z"),
+        **headers,
+    }
+    return client.post(
+        f"/api/skills/enterprise/install-operations/{operation_id}/stage?key=expense-review&revision=1",
+        content=artifact,
+        headers=request_headers,
+    )
+
+
 def test_real_api_installs_raw_zip_and_lists_contract_shape(api_client):
     artifact = _canonical_artifact()
     response = _api_install(api_client, artifact)
@@ -436,18 +481,20 @@ def test_real_api_installs_raw_zip_and_lists_contract_shape(api_client):
     assert listed.json() == {"items": [installed]}
 
 
-def test_managed_real_gateway_policy_shape_installs_and_lists(
+def test_managed_legacy_install_cannot_bypass_gateway_operation(
     api_client,
     managed_gateway_runtime_policy,
 ):
     artifact = _canonical_artifact()
 
     response = _api_install(api_client, artifact)
-    assert response.status_code == 200
+    assert response.status_code == 410
+    assert response.json()["code"] == "install_operation_required"
 
-    listed = api_client.get("/api/skills/enterprise/installed")
-    assert listed.status_code == 200
-    assert listed.json()["items"][0]["key"] == "expense-review"
+    staged = _api_stage(api_client, artifact)
+    assert staged.status_code == 200
+    assert staged.json()["state"] == "staged"
+    assert enterprise.list_installed_enterprise_skills() == {"items": []}
 
 
 def test_managed_real_gateway_policy_shape_denies_missing_role_capability(
@@ -462,7 +509,7 @@ def test_managed_real_gateway_policy_shape_denies_missing_role_capability(
     assert listed.status_code == 403
     assert listed.json()["code"] == "skill_policy_denied"
 
-    installed = _api_install(api_client, _canonical_artifact())
+    installed = _api_stage(api_client, _canonical_artifact())
     assert installed.status_code == 403
     assert installed.json()["code"] == "skill_policy_denied"
 
@@ -475,7 +522,7 @@ def test_managed_real_gateway_policy_shape_denies_blocked_skill(
     policy["toolPolicySnapshot"]["skills"][0]["status"] = "blocked"
     managed_gateway_runtime_policy.write_text(json.dumps(policy), encoding="utf-8")
 
-    response = _api_install(api_client, _canonical_artifact())
+    response = _api_stage(api_client, _canonical_artifact())
     assert response.status_code == 403
     assert response.json()["code"] == "skill_policy_denied"
 

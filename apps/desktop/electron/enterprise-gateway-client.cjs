@@ -18,10 +18,7 @@ function normalizeEnterpriseGatewayBaseUrl(rawUrl) {
 
   const hostname = parsed.hostname.toLowerCase()
   const isLoopback =
-    hostname === 'localhost' ||
-    hostname.endsWith('.localhost') ||
-    hostname === '127.0.0.1' ||
-    hostname === '[::1]'
+    hostname === 'localhost' || hostname.endsWith('.localhost') || hostname === '127.0.0.1' || hostname === '[::1]'
   if (parsed.protocol !== 'https:' && !isLoopback) {
     throw new Error('Enterprise gateway URL must use https:// unless it points to localhost.')
   }
@@ -102,6 +99,9 @@ class EnterpriseGatewayClient {
       throw new Error('Enterprise gateway client requires fetch.')
     }
 
+    if (signal?.aborted) {
+      throw new EnterpriseGatewayError('Enterprise gateway request was canceled.', { code: 'request-canceled' })
+    }
     const url = `${this.baseUrl}${String(path || '').startsWith('/') ? path : '/' + path}`
     const headers = { Accept: 'application/json' }
 
@@ -114,35 +114,48 @@ class EnterpriseGatewayClient {
     }
 
     const abortController = new AbortController()
-    let timedOut = false
-    const abortFromCaller = () => abortController.abort(signal?.reason)
+    let abortKind = null
+    let rejectAbort
+    const abortPromise = new Promise((_, reject) => {
+      rejectAbort = reject
+    })
+    const abortError = () =>
+      new EnterpriseGatewayError(
+        abortKind === 'timeout' ? 'Enterprise gateway request timed out.' : 'Enterprise gateway request was canceled.',
+        { code: abortKind === 'timeout' ? 'gateway-timeout' : 'request-canceled' }
+      )
+    const abort = (kind, reason) => {
+      if (abortKind) return
+      abortKind = kind
+      abortController.abort(reason)
+      rejectAbort(abortError())
+    }
+    const abortFromCaller = () => abort('caller', signal?.reason)
     signal?.addEventListener?.('abort', abortFromCaller, { once: true })
     if (signal?.aborted) {
       abortFromCaller()
     }
-    const timeout = setTimeout(() => {
-      timedOut = true
-      abortController.abort()
-    }, this.timeoutMs)
+    const timeout = setTimeout(() => abort('timeout'), this.timeoutMs)
     timeout.unref?.()
 
     let response
     let text
     try {
-      response = await this.fetchImpl(url, {
-        method,
-        headers,
-        body: body === undefined ? undefined : JSON.stringify(body),
-        signal: abortController.signal
-      })
-      text = await response.text()
-    } catch {
-      if (abortController.signal.aborted) {
-        throw new EnterpriseGatewayError(
-          timedOut ? 'Enterprise gateway request timed out.' : 'Enterprise gateway request was canceled.',
-          { code: timedOut ? 'gateway-timeout' : 'request-canceled' }
-        )
-      }
+      if (abortKind) await abortPromise
+      const request = (async () => {
+        response = await this.fetchImpl(url, {
+          method,
+          headers,
+          body: body === undefined ? undefined : JSON.stringify(body),
+          redirect: 'error',
+          signal: abortController.signal
+        })
+        text = await response.text()
+      })()
+      await Promise.race([request, abortPromise])
+    } catch (error) {
+      if (abortKind) throw abortError()
+      if (error instanceof EnterpriseGatewayError) throw error
       throw new EnterpriseGatewayError('Enterprise gateway is unavailable.', {
         code: 'gateway-offline'
       })
@@ -162,7 +175,8 @@ class EnterpriseGatewayClient {
     }
 
     if (!response.ok) {
-      const message = payload?.detail || payload?.message || payload?.error || `${response.status} ${response.statusText}`.trim()
+      const message =
+        payload?.detail || payload?.message || payload?.error || `${response.status} ${response.statusText}`.trim()
       const code = payload?.code || payload?.errorCode || payload?.type || 'gateway-error'
       throw new EnterpriseGatewayError(`Enterprise gateway request failed: ${message}`, {
         code,
@@ -173,19 +187,101 @@ class EnterpriseGatewayClient {
     return payload
   }
 
-  requestRaw(path, { method = 'GET', token } = {}) {
+  async requestRaw(path, { method = 'GET', signal, token } = {}) {
     if (typeof this.fetchImpl !== 'function') {
       throw new Error('Enterprise gateway client requires fetch.')
     }
 
+    if (signal?.aborted) {
+      throw new EnterpriseGatewayError('Enterprise gateway request was canceled.', { code: 'request-canceled' })
+    }
     const url = `${this.baseUrl}${String(path || '').startsWith('/') ? path : '/' + path}`
-    return this.fetchImpl(url, {
-      method,
-      headers: {
-        Accept: 'application/zip',
-        ...(token ? { Authorization: `Bearer ${token}` } : {})
-      }
+    const abortController = new AbortController()
+    let abortKind = null
+    let reader = null
+    let cleaned = false
+    let timeout = null
+    let rejectAbort
+    const abortPromise = new Promise((_, reject) => {
+      rejectAbort = reject
     })
+    const cleanup = () => {
+      if (cleaned) return
+      cleaned = true
+      clearTimeout(timeout)
+      signal?.removeEventListener?.('abort', abortFromCaller)
+    }
+    const abortError = () =>
+      new EnterpriseGatewayError(
+        abortKind === 'timeout' ? 'Enterprise gateway request timed out.' : 'Enterprise gateway request was canceled.',
+        { code: abortKind === 'timeout' ? 'gateway-timeout' : 'request-canceled' }
+      )
+    const abort = (kind, reason) => {
+      if (abortKind) return
+      abortKind = kind
+      abortController.abort(reason)
+      void reader?.cancel?.(reason).catch?.(() => undefined)
+      rejectAbort(abortError())
+      cleanup()
+    }
+    const abortFromCaller = () => abort('caller', signal?.reason)
+    timeout = setTimeout(() => abort('timeout'), this.timeoutMs)
+    timeout.unref?.()
+    signal?.addEventListener?.('abort', abortFromCaller, { once: true })
+    if (signal?.aborted) abortFromCaller()
+    try {
+      if (abortKind) await abortPromise
+      const response = await Promise.race([
+        this.fetchImpl(url, {
+          method,
+          headers: {
+            Accept: 'application/zip',
+            ...(token ? { Authorization: `Bearer ${token}` } : {})
+          },
+          redirect: 'error',
+          signal: abortController.signal
+        }),
+        abortPromise
+      ])
+      if (abortController.signal.aborted) throw abortError()
+      if (!response.body?.getReader) {
+        cleanup()
+        return response
+      }
+
+      reader = response.body.getReader()
+      const body = new ReadableStream({
+        async pull(controller) {
+          try {
+            const result = await Promise.race([reader.read(), abortPromise])
+            if (abortController.signal.aborted) throw abortError()
+            if (result.done) {
+              cleanup()
+              controller.close()
+            } else {
+              controller.enqueue(result.value)
+            }
+          } catch (error) {
+            cleanup()
+            controller.error(abortController.signal.aborted ? abortError() : error)
+          }
+        },
+        async cancel(reason) {
+          cleanup()
+          await reader.cancel(reason).catch(() => undefined)
+        }
+      })
+      return new Response(body, {
+        headers: response.headers,
+        status: response.status,
+        statusText: response.statusText
+      })
+    } catch (error) {
+      cleanup()
+      if (abortKind) throw abortError()
+      if (error instanceof EnterpriseGatewayError) throw error
+      throw new EnterpriseGatewayError('Enterprise gateway is unavailable.', { code: 'gateway-offline' })
+    }
   }
 
   async login({ password, username } = {}) {
@@ -285,7 +381,7 @@ class EnterpriseGatewayClient {
     })
   }
 
-  skillHubSkills(token, query = {}) {
+  skillHubSkills(token, query = {}, { signal } = {}) {
     const params = new URLSearchParams()
     const q = String(query.q || '').trim()
     const category = String(query.category || '').trim()
@@ -294,21 +390,66 @@ class EnterpriseGatewayClient {
     if (query.page != null) params.set('page', String(query.page))
     if (query.pageSize != null) params.set('pageSize', String(query.pageSize))
     const suffix = params.size ? `?${params}` : ''
-    return this.requestJson(`/api/desktop/skill-hub/skills${suffix}`, { token })
+    return this.requestJson(`/api/desktop/skill-hub/skills${suffix}`, { signal, token })
   }
 
-  skillHubSkill(token, key) {
+  skillHubSkill(token, key, { signal } = {}) {
     const encodedKey = encodeURIComponent(String(key || '').trim())
-    return this.requestJson(`/api/desktop/skill-hub/skills/${encodedKey}`, { token })
+    return this.requestJson(`/api/desktop/skill-hub/skills/${encodedKey}`, { signal, token })
   }
 
-  downloadSkillPackage(token, key, revision) {
+  downloadSkillPackage(token, key, revision, { signal } = {}) {
     const encodedKey = encodeURIComponent(String(key || '').trim())
     const encodedRevision = encodeURIComponent(String(revision || '').trim())
-    return this.requestRaw(
-      `/api/desktop/skill-hub/skills/${encodedKey}/packages/${encodedRevision}/download`,
-      { token }
-    )
+    return this.requestRaw(`/api/desktop/skill-hub/skills/${encodedKey}/packages/${encodedRevision}/download`, {
+      signal,
+      token
+    })
+  }
+
+  createSkillInstallOperation(token, body, { signal } = {}) {
+    if (!String(token || '').startsWith('dsk_')) {
+      throw new EnterpriseGatewayError('A desktop session is required to create an install operation.', {
+        code: 'desktop_session_required',
+        status: 401
+      })
+    }
+    return this.requestJson('/api/desktop/skill-hub/install-operations', {
+      method: 'POST',
+      body,
+      signal,
+      token
+    })
+  }
+
+  commitSkillInstallOperation(token, operationId, { signal } = {}) {
+    if (!String(token || '').startsWith('dsk_')) {
+      throw new EnterpriseGatewayError('A desktop session is required to commit an install operation.', {
+        code: 'desktop_session_required',
+        status: 401
+      })
+    }
+    const encodedId = encodeURIComponent(String(operationId || '').trim())
+    return this.requestJson(`/api/desktop/skill-hub/install-operations/${encodedId}/commit`, {
+      method: 'POST',
+      signal,
+      token
+    })
+  }
+
+  getSkillInstallOperation(operationId, { reconciliationToken, signal, token } = {}) {
+    const credential = String(reconciliationToken || token || '').trim()
+    if (!credential.startsWith('srt_') && !credential.startsWith('dsk_')) {
+      throw new EnterpriseGatewayError('Install operation reconciliation requires an operation credential.', {
+        code: 'install_operation_not_found',
+        status: 404
+      })
+    }
+    const encodedId = encodeURIComponent(String(operationId || '').trim())
+    return this.requestJson(`/api/desktop/skill-hub/install-operations/${encodedId}`, {
+      signal,
+      token: credential
+    })
   }
 }
 

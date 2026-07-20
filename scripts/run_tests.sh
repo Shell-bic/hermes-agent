@@ -11,7 +11,7 @@
 #   * Env vars blanked (conftest.py also does this, but this
 #     is belt-and-suspenders for anyone running pytest outside our
 #     conftest path — e.g. on a single file)
-#   * Proper venv activation (probes .venv, venv, then ~/.hermes/...)
+#   * Direct venv Python selection (Unix bin/python or Windows Scripts/python.exe)
 #
 # Usage:
 #   scripts/run_tests.sh                            # full suite
@@ -32,21 +32,37 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-# ── Activate venv ───────────────────────────────────────────────────────────
+# ── Locate venv Python ──────────────────────────────────────────────────────
 VENV=""
-for candidate in "$REPO_ROOT/.venv" "$REPO_ROOT/venv" "$HOME/.hermes/hermes-agent/venv"; do
-  if [ -f "$candidate/bin/activate" ]; then
+PYTHON=""
+COMMON_GIT_DIR="$(git -C "$REPO_ROOT" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)"
+COMMON_WORKTREE_ROOT=""
+if [ -n "$COMMON_GIT_DIR" ]; then
+  COMMON_WORKTREE_ROOT="$(dirname "$COMMON_GIT_DIR")"
+fi
+for candidate in \
+  "$REPO_ROOT/.venv" \
+  "$REPO_ROOT/venv" \
+  "${COMMON_WORKTREE_ROOT:+$COMMON_WORKTREE_ROOT/.venv}" \
+  "${COMMON_WORKTREE_ROOT:+$COMMON_WORKTREE_ROOT/venv}" \
+  "$HOME/.hermes/hermes-agent/venv"; do
+  [ -n "$candidate" ] || continue
+  if [ -x "$candidate/bin/python" ]; then
     VENV="$candidate"
+    PYTHON="$candidate/bin/python"
+    break
+  fi
+  if [ -f "$candidate/Scripts/python.exe" ]; then
+    VENV="$candidate"
+    PYTHON="$candidate/Scripts/python.exe"
     break
   fi
 done
 
-if [ -z "$VENV" ]; then
+if [ -z "$PYTHON" ]; then
   echo "error: no virtualenv found in $REPO_ROOT/.venv or $REPO_ROOT/venv" >&2
   exit 1
 fi
-
-PYTHON="$VENV/bin/python"
 
 
 # ── Live-gateway plugin (computed before we drop env) ───────────────────────
@@ -79,6 +95,7 @@ exec env -i \
   LANG=C.UTF-8 \
   LC_ALL=C.UTF-8 \
   PYTHONHASHSEED=0 \
+  PYTHONUTF8=1 \
   PYTHONDONTWRITEBYTECODE=1 \
   ${EXTRA_PYTHONPATH:+PYTHONPATH="$EXTRA_PYTHONPATH"} \
   ${EXTRA_PYTEST_PLUGINS:+PYTEST_PLUGINS="$EXTRA_PYTEST_PLUGINS"} \

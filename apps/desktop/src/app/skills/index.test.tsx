@@ -1,4 +1,8 @@
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { readFileSync } from 'node:fs'
+import { createRequire } from 'node:module'
+import { dirname, resolve } from 'node:path'
+import { runInNewContext } from 'node:vm'
 import { MemoryRouter } from 'react-router-dom'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
@@ -16,6 +20,66 @@ const listEnterpriseSkills = vi.fn()
 const detailEnterpriseSkill = vi.fn()
 const installEnterpriseSkill = vi.fn()
 const refreshEnterprisePolicyBridge = vi.fn()
+const enterpriseLifecycleStatus = vi.fn()
+const require = createRequire(import.meta.url)
+const {
+  createEnterprisePublicError,
+  enterprisePublicFailure,
+  unwrapEnterprisePublicResult
+} = require('../../../electron/enterprise-public-error.cjs')
+const { createEnterpriseSkillHubIpcHandler } = require('../../../electron/enterprise-skill-hub-ipc.cjs')
+
+function actualPreloadBridge(
+  invoke: (channel: string, ...args: unknown[]) => Promise<unknown>
+): typeof window.hermesDesktop {
+  const preloadPath = resolve(process.cwd(), 'electron/preload.cjs')
+  let exposed: typeof window.hermesDesktop | null = null
+  const preloadRequire = (identifier: string) => {
+    if (identifier === 'electron') {
+      return {
+        contextBridge: {
+          exposeInMainWorld: (name: string, value: typeof window.hermesDesktop) => {
+            if (name === 'hermesDesktop') {exposed = value}
+          }
+        },
+        ipcRenderer: {
+          invoke,
+          on: () => undefined,
+          removeListener: () => undefined,
+          send: () => undefined
+        },
+        webUtils: { getPathForFile: () => '' }
+      }
+    }
+    return require(identifier.startsWith('.') ? resolve(dirname(preloadPath), identifier) : identifier)
+  }
+
+  runInNewContext(readFileSync(preloadPath, 'utf8'), {
+    Buffer,
+    URL,
+    URLSearchParams,
+    clearTimeout,
+    console,
+    process,
+    require: preloadRequire,
+    setTimeout
+  }, { filename: preloadPath })
+  if (!exposed) throw new Error('Preload did not expose hermesDesktop.')
+  return exposed
+}
+
+function rendererEnterpriseError(code: string, status: number, lifecycleEpoch: number): Error {
+  const envelope = enterprisePublicFailure(createEnterprisePublicError(
+    Object.assign(new Error('private gateway response'), { code, status }),
+    { lifecycle: { lifecycleEpoch, state: 'running' } }
+  ))
+  try {
+    unwrapEnterprisePublicResult(envelope)
+  } catch (error) {
+    return error as Error
+  }
+  throw new Error('Expected enterprise public failure.')
+}
 
 vi.mock('@/hermes', () => ({
   getSkillContent: (name: string) => getSkillContent(name),
@@ -97,11 +161,13 @@ beforeEach(() => {
   detailEnterpriseSkill.mockReset()
   installEnterpriseSkill.mockReset()
   refreshEnterprisePolicyBridge.mockReset()
+  enterpriseLifecycleStatus.mockReset()
   Object.defineProperty(window, 'hermesDesktop', {
     configurable: true,
     value: {
       enterprise: {
         refreshPolicy: () => refreshEnterprisePolicyBridge(),
+        lifecycleStatus: () => enterpriseLifecycleStatus(),
         skillHub: {
           detail: (key: string) => detailEnterpriseSkill(key),
           install: (payload: unknown) => installEnterpriseSkill(payload),
@@ -128,6 +194,12 @@ beforeEach(() => {
     policyRefreshStatus: 'current',
     policyStale: false
   }))
+  enterpriseLifecycleStatus.mockResolvedValue({
+    authEpoch: 0,
+    lifecycleEpoch: 0,
+    reasonCode: 'ready',
+    state: 'running'
+  })
 })
 
 afterEach(() => {
@@ -152,6 +224,107 @@ describe('SkillsView toolset management', () => {
     expect(await screen.findByText('Enterprise sign-in required')).toBeTruthy()
     expect(screen.getByText('Enterprise Discovery')).toBeTruthy()
     expect(listEnterpriseSkills).not.toHaveBeenCalled()
+  })
+
+  it('renders a fixed safe list error when the bridge rejects a hostile ordinary Error', async () => {
+    const hostile = Object.assign(
+      new Error('token=dsk_list_secret https://gateway.invalid/private C:\\Users\\Alice\\catalog.json'),
+      { code: 'hostile_list_code', status: 503 }
+    )
+    listEnterpriseSkills.mockRejectedValue(hostile)
+    $enterprise.set(managedEnterpriseState())
+
+    await renderSkills('enterprise')
+
+    expect(await screen.findByText('Enterprise Skill Hub request failed safely.')).toBeTruthy()
+    expect(screen.queryByText(/dsk_list_secret|gateway\.invalid|Alice|hostile_list_code/)).toBeNull()
+  })
+
+  it('renders and notifies a fixed safe install error when the bridge rejects a hostile ordinary Error', async () => {
+    const item = {
+      artifactSha256: '7'.repeat(64), artifactSizeBytes: 100, category: 'general', currentRevision: 1,
+      declaredVersion: null, description: 'Hostile rejection workflow', fileCount: 1,
+      installedArtifactSha256: null, installedRevision: null, installState: 'not-installed',
+      key: 'hostile-skill', name: 'hostile-skill', policyReason: null,
+      policyStatus: 'available', publishedAt: null
+    }
+    listEnterpriseSkills.mockResolvedValue({ items: [item], page: 1, pageSize: 100, total: 1 })
+    installEnterpriseSkill.mockRejectedValue(Object.assign(
+      new Error('dsk_install_secret https://gateway.invalid/raw C:\\Users\\Alice\\artifact.zip'),
+      { code: 'hostile_install_code', errorCode: 'skill_policy_denied', recoveryKind: 'refresh-policy' }
+    ))
+    $enterprise.set(managedEnterpriseState())
+    const notifications = await import('@/store/notifications')
+
+    await renderSkills('enterprise')
+    fireEvent.click(await screen.findByRole('button', { name: 'Install hostile-skill' }))
+
+    expect(await screen.findByText('Enterprise Skill Hub request failed safely.')).toBeTruthy()
+    expect(screen.getByText(/enterprise_operation_failed/)).toBeTruthy()
+    await waitFor(() => expect(notifications.notify).toHaveBeenCalledWith(expect.objectContaining({
+      kind: 'warning',
+      message: 'Enterprise Skill Hub request failed safely.'
+    })))
+    const rendered = document.body.textContent || ''
+    const notified = JSON.stringify(vi.mocked(notifications.notify).mock.calls)
+    for (const secret of ['dsk_install_secret', 'gateway.invalid', 'Alice', 'hostile_install_code']) {
+      expect(rendered).not.toContain(secret)
+      expect(notified).not.toContain(secret)
+    }
+  })
+
+  it('keeps the real IPC public result safe through actual preload unwrap and Renderer', async () => {
+    const item = {
+      artifactSha256: '8'.repeat(64), artifactSizeBytes: 100, category: 'general', currentRevision: 1,
+      declaredVersion: null, description: 'IPC preload workflow', fileCount: 1,
+      installedArtifactSha256: null, installedRevision: null, installState: 'not-installed',
+      key: 'ipc-skill', name: 'ipc-skill', policyReason: null,
+      policyStatus: 'available', publishedAt: null
+    }
+    const lifecycle = {
+      getSnapshot: () => ({ lifecycleEpoch: 4, state: 'running' }),
+      revoke: vi.fn()
+    }
+    const handler = createEnterpriseSkillHubIpcHandler({
+      assertTrusted: () => undefined,
+      getLifecycle: () => lifecycle,
+      isEnabled: () => true
+    })
+    const invoked: string[] = []
+    const bridge = actualPreloadBridge(async channel => {
+      invoked.push(channel)
+      if (channel === 'hermes:enterprise:skill-hub:list') {
+        return handler.run({}, async () => ({ items: [item], page: 1, pageSize: 100, total: 1 }))
+      }
+      if (channel === 'hermes:enterprise:skill-hub:install') {
+        return handler.run({}, async () => {
+          throw Object.assign(
+            new Error('dsk_ipc_secret https://gateway.invalid/private C:\\Users\\Alice\\receipt.jwt'),
+            { code: 'skill_name_conflict', status: 409 }
+          )
+        })
+      }
+      throw new Error(`Unexpected IPC channel: ${channel}`)
+    })
+    Object.defineProperty(window, 'hermesDesktop', { configurable: true, value: bridge })
+    $enterprise.set(managedEnterpriseState())
+    const notifications = await import('@/store/notifications')
+
+    await renderSkills('enterprise')
+    fireEvent.click(await screen.findByRole('button', { name: 'Install ipc-skill' }))
+
+    expect(await screen.findByText('A local skill conflicts with this enterprise skill.')).toBeTruthy()
+    expect(screen.getByText(/skill_name_conflict/)).toBeTruthy()
+    await waitFor(() => expect(notifications.notify).toHaveBeenCalledWith(expect.objectContaining({
+      kind: 'warning',
+      message: 'A local skill conflicts with this enterprise skill.'
+    })))
+    expect(invoked).toContain('hermes:enterprise:skill-hub:list')
+    expect(invoked).toContain('hermes:enterprise:skill-hub:install')
+    const exposed = `${document.body.textContent}${JSON.stringify(vi.mocked(notifications.notify).mock.calls)}`
+    for (const secret of ['dsk_ipc_secret', 'gateway.invalid', 'Alice', 'receipt.jwt']) {
+      expect(exposed).not.toContain(secret)
+    }
   })
 
   it('loads enterprise detail through the narrow Skill Hub bridge', async () => {
@@ -362,7 +535,7 @@ describe('SkillsView toolset management', () => {
       expect(notifications.notify).toHaveBeenCalledWith(
         expect.objectContaining({
           kind: 'warning',
-          message: refreshError.message,
+          message: 'Enterprise Skill Hub request failed safely.',
           title: 'Enterprise skills failed to load'
         })
       )
@@ -405,9 +578,7 @@ describe('SkillsView toolset management', () => {
       pageSize: 100,
       total: 2
     })
-    installEnterpriseSkill.mockRejectedValue(
-      Object.assign(new Error('A local skill already uses this name.'), { code: 'skill_name_conflict' })
-    )
+    installEnterpriseSkill.mockRejectedValue(rendererEnterpriseError('skill_name_conflict', 409, 0))
     $enterprise.set(managedEnterpriseState())
 
     await renderSkills('enterprise')
@@ -415,7 +586,105 @@ describe('SkillsView toolset management', () => {
     expect(screen.getByText('Updates are not supported in this release.')).toBeTruthy()
 
     fireEvent.click(screen.getByRole('button', { name: 'Install conflict-skill' }))
-    expect(await screen.findByText('A local skill already uses this name.')).toBeTruthy()
+    expect(await screen.findByText('A local skill conflicts with this enterprise skill.')).toBeTruthy()
+  })
+
+  it('renders structured recovery fields and de-duplicates one current-epoch recovery action', async () => {
+    const available = {
+      artifactSha256: 'f'.repeat(64), artifactSizeBytes: 100, category: 'general', currentRevision: 1,
+      declaredVersion: null, description: 'Recoverable workflow', fileCount: 1,
+      installedArtifactSha256: null, installedRevision: null, installState: 'not-installed',
+      key: 'recoverable-skill', name: 'recoverable-skill', policyReason: null,
+      policyStatus: 'available', publishedAt: null
+    }
+    const installed = {
+      ...available,
+      installedArtifactSha256: available.artifactSha256,
+      installedRevision: 1,
+      installState: 'installed'
+    }
+    let finishRecovery: (value: unknown) => void = () => undefined
+    const recovery = new Promise(resolve => { finishRecovery = resolve })
+    listEnterpriseSkills
+      .mockResolvedValueOnce({ items: [available], page: 1, pageSize: 100, total: 1 })
+      .mockResolvedValue({ items: [installed], page: 1, pageSize: 100, total: 1 })
+    installEnterpriseSkill
+      .mockRejectedValueOnce(rendererEnterpriseError('install_operation_reconciling', 202, 7))
+      .mockImplementationOnce(() => recovery)
+    enterpriseLifecycleStatus.mockResolvedValue({
+      authEpoch: 0, lifecycleEpoch: 7, reasonCode: 'ready', state: 'running'
+    })
+    $enterprise.set(managedEnterpriseState())
+
+    await renderSkills('enterprise')
+    fireEvent.click(await screen.findByRole('button', { name: 'Install recoverable-skill' }))
+    const structured = await screen.findByText(/install_operation_reconciling/)
+    expect(structured.parentElement?.dataset.errorCode).toBe('install_operation_reconciling')
+    expect(structured.parentElement?.dataset.httpStatus).toBe('202')
+    expect(structured.parentElement?.dataset.recoveryKind).toBe('wait')
+    expect(structured.parentElement?.dataset.lifecycleEpoch).toBe('7')
+
+    const recover = screen.getByRole('button', { name: 'Refresh skills recoverable-skill' })
+    fireEvent.click(recover)
+    fireEvent.click(recover)
+    await waitFor(() => expect(enterpriseLifecycleStatus).toHaveBeenCalledTimes(1))
+    await waitFor(() => expect(installEnterpriseSkill).toHaveBeenCalledTimes(2))
+    finishRecovery({ installed: {}, item: installed })
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Installed recoverable-skill' })).toBeTruthy())
+  })
+
+  it('does not run a recovery action from an old lifecycle epoch', async () => {
+    const available = {
+      artifactSha256: '1'.repeat(64), artifactSizeBytes: 100, category: 'general', currentRevision: 1,
+      declaredVersion: null, description: 'Stale recovery workflow', fileCount: 1,
+      installedArtifactSha256: null, installedRevision: null, installState: 'not-installed',
+      key: 'stale-skill', name: 'stale-skill', policyReason: null,
+      policyStatus: 'available', publishedAt: null
+    }
+    listEnterpriseSkills.mockResolvedValue({ items: [available], page: 1, pageSize: 100, total: 1 })
+    installEnterpriseSkill.mockRejectedValueOnce(rendererEnterpriseError('install_operation_reconciling', 202, 7))
+    enterpriseLifecycleStatus.mockResolvedValue({
+      authEpoch: 1, lifecycleEpoch: 8, reasonCode: 'policy-refreshed', state: 'running'
+    })
+    $enterprise.set(managedEnterpriseState())
+
+    await renderSkills('enterprise')
+    fireEvent.click(await screen.findByRole('button', { name: 'Install stale-skill' }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Refresh skills stale-skill' }))
+    await waitFor(() => expect(enterpriseLifecycleStatus).toHaveBeenCalledTimes(1))
+    expect(installEnterpriseSkill).toHaveBeenCalledTimes(1)
+    expect(refreshEnterprisePolicyBridge).not.toHaveBeenCalled()
+  })
+
+  it('handles lifecycle status failure during recovery without an unhandled rejection', async () => {
+    const available = {
+      artifactSha256: '2'.repeat(64), artifactSizeBytes: 100, category: 'general', currentRevision: 1,
+      declaredVersion: null, description: 'Offline recovery workflow', fileCount: 1,
+      installedArtifactSha256: null, installedRevision: null, installState: 'not-installed',
+      key: 'offline-skill', name: 'offline-skill', policyReason: null,
+      policyStatus: 'available', publishedAt: null
+    }
+    listEnterpriseSkills.mockResolvedValue({ items: [available], page: 1, pageSize: 100, total: 1 })
+    installEnterpriseSkill.mockRejectedValueOnce(rendererEnterpriseError('install_operation_reconciling', 202, 7))
+    enterpriseLifecycleStatus.mockRejectedValue(Object.assign(
+      new Error('token dsk_secret at C:\\Users\\Alice\\enterprise\\skill.zip'),
+      { code: 'hostile_internal_code' }
+    ))
+    $enterprise.set(managedEnterpriseState())
+    const notifications = await import('@/store/notifications')
+
+    await renderSkills('enterprise')
+    fireEvent.click(await screen.findByRole('button', { name: 'Install offline-skill' }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Refresh skills offline-skill' }))
+    await waitFor(() => expect(notifications.notify).toHaveBeenCalledWith(expect.objectContaining({
+      kind: 'warning',
+      message: 'Enterprise skill recovery could not be completed safely.'
+    })))
+    expect(JSON.stringify(vi.mocked(notifications.notify).mock.calls)).not.toContain('dsk_secret')
+    expect(JSON.stringify(vi.mocked(notifications.notify).mock.calls)).not.toContain('Alice')
+    expect(screen.queryByText(/hostile_internal_code|dsk_secret|Alice/)).toBeNull()
+    expect(screen.getByText(/install_operation_reconciling/)).toBeTruthy()
+    expect(installEnterpriseSkill).toHaveBeenCalledTimes(1)
   })
 
   it('renders a switch for each toolset and toggles it off', async () => {

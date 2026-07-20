@@ -39,8 +39,6 @@ test('every enterprise IPC handler validates a trusted main-frame sender', () =>
   assert.match(main, /senderFrame !== sender\.mainFrame/)
   assert.match(main, /isTrustedEnterpriseRendererUrl\(senderFrame\.url \|\| sender\.getURL\(\)\)/)
   assert.match(main, /BrowserWindow\.fromWebContents\(sender\)/)
-  assert.match(main, /enterpriseSkillHubIpc\(event, operation\)[\s\S]*isTrustedDesktopRendererUrl\(event\?\.senderFrame\?\.url\)/)
-
   const handlers = [...main.matchAll(/ipcMain\.handle\('hermes:enterprise:([^']+)'/g)]
   assert.ok(handlers.length > 0)
   for (let index = 0; index < handlers.length; index += 1) {

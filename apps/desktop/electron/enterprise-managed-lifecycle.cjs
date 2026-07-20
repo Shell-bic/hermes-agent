@@ -59,11 +59,10 @@ function createEnterpriseManagedLifecycle(options = {}) {
   let state = options.hasSession === true ? 'recovering' : 'unauthenticated'
   let lifecycleEpoch = 0
   let authEpoch = 0
-  let reasonCode = options.hasSession === true
-    ? 'enterprise_session_recovery_required'
-    : 'enterprise_auth_required'
+  let reasonCode = options.hasSession === true ? 'enterprise_session_recovery_required' : 'enterprise_auth_required'
   let revokePromise = null
   let retryPromise = null
+  const subscribers = new Set()
 
   function getSnapshot() {
     return Object.freeze({
@@ -77,7 +76,23 @@ function createEnterpriseManagedLifecycle(options = {}) {
   function emit() {
     const event = getSnapshot()
     publish(event)
+    for (const subscriber of subscribers) {
+      try {
+        subscriber(event)
+      } catch {
+        // Lifecycle publication is authoritative. A diagnostic subscriber
+        // must never prevent revocation from invalidating active operations.
+      }
+    }
     return event
+  }
+
+  function subscribe(subscriber) {
+    if (typeof subscriber !== 'function') {
+      throw new TypeError('Enterprise lifecycle subscriber must be a function.')
+    }
+    subscribers.add(subscriber)
+    return () => subscribers.delete(subscriber)
   }
 
   function setState(nextState, nextReasonCode) {
@@ -119,11 +134,7 @@ function createEnterpriseManagedLifecycle(options = {}) {
   }
 
   function isLeaseCurrent(lease) {
-    return Boolean(
-      lease &&
-      lease.lifecycleEpoch === lifecycleEpoch &&
-      lease.authEpoch === authEpoch
-    )
+    return Boolean(lease && lease.lifecycleEpoch === lifecycleEpoch && lease.authEpoch === authEpoch)
   }
 
   function advanceAuthEpoch(nextReasonCode = 'enterprise_auth_epoch_advanced') {
@@ -151,11 +162,7 @@ function createEnterpriseManagedLifecycle(options = {}) {
 
   async function runCleanupEffects() {
     let failed = false
-    for (const effectName of [
-      'cancelPendingStarts',
-      'closeWindowConnections',
-      'stopOwnedProcesses'
-    ]) {
+    for (const effectName of ['cancelPendingStarts', 'closeWindowConnections', 'stopOwnedProcesses']) {
       try {
         await effects[effectName]()
       } catch {
@@ -176,16 +183,10 @@ function createEnterpriseManagedLifecycle(options = {}) {
     if (revokePromise) return revokePromise
     const terminalState = revokeOptions.terminalState
     if (!TERMINAL_STATES.has(terminalState)) {
-      return Promise.reject(new EnterpriseLifecycleError(
-        LIFECYCLE_ERROR_CODES.INVALID_TERMINAL_STATE,
-        state
-      ))
+      return Promise.reject(new EnterpriseLifecycleError(LIFECYCLE_ERROR_CODES.INVALID_TERMINAL_STATE, state))
     }
     if (state !== 'running' && state !== 'recovering') {
-      return Promise.reject(new EnterpriseLifecycleError(
-        LIFECYCLE_ERROR_CODES.INVALID_TRANSITION,
-        state
-      ))
+      return Promise.reject(new EnterpriseLifecycleError(LIFECYCLE_ERROR_CODES.INVALID_TRANSITION, state))
     }
 
     transition('revoking', { reasonCode: revokeOptions.reasonCode })
@@ -206,16 +207,10 @@ function createEnterpriseManagedLifecycle(options = {}) {
     if (retryPromise) return retryPromise
     const terminalState = retryOptions.terminalState
     if (!TERMINAL_STATES.has(terminalState)) {
-      return Promise.reject(new EnterpriseLifecycleError(
-        LIFECYCLE_ERROR_CODES.INVALID_TERMINAL_STATE,
-        state
-      ))
+      return Promise.reject(new EnterpriseLifecycleError(LIFECYCLE_ERROR_CODES.INVALID_TERMINAL_STATE, state))
     }
     if (state !== 'stop_failed') {
-      return Promise.reject(new EnterpriseLifecycleError(
-        LIFECYCLE_ERROR_CODES.RETRY_NOT_ALLOWED,
-        state
-      ))
+      return Promise.reject(new EnterpriseLifecycleError(LIFECYCLE_ERROR_CODES.RETRY_NOT_ALLOWED, state))
     }
 
     retryPromise = runCleanupEffects()
@@ -244,7 +239,8 @@ function createEnterpriseManagedLifecycle(options = {}) {
     markRunning,
     markUnauthenticated,
     retryStop,
-    revoke
+    revoke,
+    subscribe
   })
 }
 

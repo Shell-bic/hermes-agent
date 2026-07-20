@@ -1,5 +1,6 @@
 const test = require('node:test')
 const assert = require('node:assert/strict')
+const { createEnterpriseManagedLifecycle } = require('./enterprise-managed-lifecycle.cjs')
 
 const {
   ENTERPRISE_PROFILE_NOT_MANAGED,
@@ -357,14 +358,16 @@ test('managed profile IPC envelope preserves structured error fields across seri
   )
   const serialized = JSON.parse(JSON.stringify(wireValue))
 
+  assert.equal(serialized.envelope, 'enterprise-public-result.v1')
   assert.equal(serialized.ok, false)
-  assert.equal(serialized.error.code, ENTERPRISE_PROFILE_NOT_MANAGED)
-  assert.equal(serialized.error.operation, 'profile:post')
-  assert.equal(serialized.error.status, 403)
+  assert.equal(serialized.error.envelope, 'enterprise-public-error.v1')
+  assert.equal(serialized.error.errorCode, ENTERPRISE_PROFILE_NOT_MANAGED)
+  assert.equal(serialized.error.httpStatus, 403)
+  assert.equal(serialized.error.operation, undefined)
   assert.throws(() => unwrapProfileIpcResult(serialized), error => {
     assert.equal(error.code, ENTERPRISE_PROFILE_NOT_MANAGED)
-    assert.equal(error.operation, 'profile:post')
     assert.equal(error.status, 403)
+    assert.equal(error.operation, undefined)
     return true
   })
 })
@@ -381,7 +384,6 @@ test('managed profile IPC registrar rejects guarded operations before action sid
     ipcMain: { handle: (channel, handler) => handlers.set(channel, handler) },
     guard,
     actions: {
-      api: action('api'),
       applyConnectionConfig: action('apply'),
       connection: action('connection'),
       gatewayWsUrl: action('ws'),
@@ -398,7 +400,6 @@ test('managed profile IPC registrar rejects guarded operations before action sid
   const invoke = (channel, ...args) => handlers.get(channel)(null, ...args)
   const blocked = [
     ['hermes:connection', 'finance'],
-    ['hermes:api', { path: '/api/config?profile=finance' }],
     ['hermes:backend:touch', 'finance'],
     ['hermes:connection-config:save', { mode: 'remote', profile: 'default' }],
     ['hermes:profile:set', 'finance']
@@ -407,12 +408,98 @@ test('managed profile IPC registrar rejects guarded operations before action sid
   for (const [channel, payload] of blocked) {
     const result = await invoke(channel, payload)
     assert.equal(result.ok, false)
-    assert.equal(result.error.code, ENTERPRISE_PROFILE_NOT_MANAGED)
+    assert.equal(result.error.errorCode, ENTERPRISE_PROFILE_NOT_MANAGED)
   }
   assert.deepEqual(calls, [])
 
-  assert.deepEqual(await invoke('hermes:connection', 'default'), { name: 'connection', value: 'default' })
+  assert.deepEqual(await invoke('hermes:connection', 'default'), {
+    envelope: 'enterprise-public-result.v1',
+    ok: true,
+    value: { name: 'connection', value: 'default' }
+  })
   assert.deepEqual(calls, [['connection', 'default']])
+})
+
+test('managed profile registrar converts ordinary action failures to one safe public result', async () => {
+  const handlers = new Map()
+  registerEnterpriseManagedProfileIpc({
+    ipcMain: { handle: (channel, handler) => handlers.set(channel, handler) },
+    guard: createEnterpriseManagedProfileGuard({ enabled: true }),
+    getLifecycle: () => ({ getSnapshot: () => ({ lifecycleEpoch: 7, state: 'running' }) }),
+    actions: {
+      applyConnectionConfig: async () => {},
+      connection: async () => { throw Object.assign(new Error('private host and token'), { code: 'gateway-offline', statusCode: 503 }) },
+      gatewayWsUrl: async () => {},
+      getConnectionConfig: async () => {},
+      oauthLoginConnectionConfig: async () => {},
+      oauthLogoutConnectionConfig: async () => {},
+      probeConnectionConfig: async () => {},
+      saveConnectionConfig: async () => {},
+      setProfile: async () => {},
+      testConnectionConfig: async () => {},
+      touchBackend: async () => {}
+    }
+  })
+
+  const result = await handlers.get('hermes:connection')({}, 'default')
+  assert.equal(result.error.errorCode, 'gateway-offline')
+  assert.equal(result.error.httpStatus, 503)
+  assert.equal(result.error.lifecycleEpoch, 7)
+  assert.doesNotMatch(result.error.message, /private host|token/)
+})
+
+test('trust rejection remains a safe v1 failure when lifecycle is not initialized', async () => {
+  const handlers = new Map()
+  registerEnterpriseManagedProfileIpc({
+    ipcMain: { handle: (channel, handler) => handlers.set(channel, handler) },
+    guard: createEnterpriseManagedProfileGuard({ enabled: true }),
+    assertTrusted: () => { throw new Error('untrusted') },
+    getLifecycle: () => { throw new Error('not initialized') },
+    actions: {
+      applyConnectionConfig: async () => {},
+      connection: async () => assert.fail('must not run'),
+      gatewayWsUrl: async () => {},
+      getConnectionConfig: async () => {},
+      oauthLoginConnectionConfig: async () => {},
+      oauthLogoutConnectionConfig: async () => {},
+      probeConnectionConfig: async () => {},
+      saveConnectionConfig: async () => {},
+      setProfile: async () => {},
+      testConnectionConfig: async () => {},
+      touchBackend: async () => {}
+    }
+  })
+  const result = await handlers.get('hermes:connection')({}, 'default')
+  assert.equal(result.envelope, 'enterprise-public-result.v1')
+  assert.equal(result.error.errorCode, 'enterprise_untrusted_renderer')
+  assert.equal(result.error.lifecycleEpoch, 0)
+  assert.equal(result.error.recoveryKind, 'none')
+})
+
+test('unmanaged profile actions do not inherit unauthenticated enterprise lifecycle recovery', async () => {
+  const lifecycle = createEnterpriseManagedLifecycle({ hasSession: false })
+  const before = lifecycle.getSnapshot()
+  for (const [thrown, recoveryKind] of [
+    [new Error('ordinary local failure'), 'none'],
+    [Object.assign(new Error('local authorization response'), { statusCode: 401 }), 'none'],
+    [Object.assign(new Error('local service unavailable'), { statusCode: 500 }), 'retry']
+  ]) {
+    const result = await profileIpcResult(async () => { throw thrown }, {
+      getLifecycle: () => lifecycle,
+      managed: false
+    })
+    assert.equal(result.error.recoveryKind, recoveryKind)
+    assert.deepEqual(lifecycle.getSnapshot(), before)
+  }
+})
+
+test('managed mode callback failure cannot escape the profile IPC envelope', async () => {
+  const result = await profileIpcResult(async () => { throw new Error('action failed') }, {
+    managed: () => { throw new Error('mode unavailable') }
+  })
+  assert.equal(result.envelope, 'enterprise-public-result.v1')
+  assert.equal(result.ok, false)
+  assert.equal(result.error.recoveryKind, 'none')
 })
 
 test('managed profile preload invoker unwraps the serialized IPC error envelope', async () => {

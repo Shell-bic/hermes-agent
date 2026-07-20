@@ -1,5 +1,5 @@
 import { useStore } from '@nanostores/react'
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -9,7 +9,7 @@ import { TextTab, TextTabMeta } from '@/components/ui/text-tab'
 import type { EnterpriseSkillHubItem } from '@/global'
 import { useI18n } from '@/i18n'
 import { $enterprise, refreshEnterprisePolicy } from '@/store/enterprise'
-import { dismissNotification, notify, notifyError } from '@/store/notifications'
+import { dismissNotification, notify } from '@/store/notifications'
 
 import { PAGE_INSET_X } from '../layout-constants'
 
@@ -21,16 +21,204 @@ interface EnterpriseDiscoveryProps {
 }
 
 interface OperationError {
-  code: string
+  errorCode: string
+  httpStatus: number | null
+  lifecycleEpoch: number
   message: string
+  recoveryKind: 'none' | 'refresh-policy' | 'restart' | 'retry' | 'retry-stop' | 'sign-in' | 'upgrade' | 'wait'
+}
+
+const RECOVERY_ERROR_KINDS = new Set<OperationError['recoveryKind']>([
+  'none', 'refresh-policy', 'restart', 'retry', 'retry-stop', 'sign-in', 'upgrade', 'wait'
+])
+const PUBLIC_ERROR_ENVELOPE = 'enterprise-public-error.v1'
+const PUBLIC_ERROR_CODES = new Set([
+  'artifact_body_missing',
+  'artifact_hash_mismatch',
+  'artifact_length_mismatch',
+  'artifact_length_missing',
+  'artifact_metadata_invalid',
+  'artifact_too_large',
+  'client_operation_id_conflict',
+  'desktop_active_role_required',
+  'desktop_session_required',
+  'enterprise_lifecycle_effect_denied',
+  'enterprise_lifecycle_ipc_denied',
+  'enterprise_operation_superseded',
+  'enterprise_operation_failed',
+  'enterprise_profile_not_managed',
+  'enterprise_runtime_access_unavailable',
+  'enterprise_skill_download_failed',
+  'enterprise_skill_hub_disabled',
+  'enterprise_skill_hub_untrusted_renderer',
+  'enterprise_skill_install_busy',
+  'enterprise_skill_install_failed',
+  'enterprise_skill_install_recovery_failed',
+  'enterprise_skill_install_recovery_unavailable',
+  'enterprise_managed_user_invalid',
+  'enterprise_untrusted_renderer',
+  'gateway-offline',
+  'gateway-timeout',
+  'install_operation_abort_unconfirmed',
+  'install_operation_binding_mismatch',
+  'install_operation_content_changed',
+  'install_operation_content_mismatch',
+  'install_operation_expired',
+  'install_operation_journal_invalid',
+  'install_operation_not_authorized',
+  'install_operation_not_found',
+  'install_operation_pending_limit',
+  'install_operation_reconciliation_invalid',
+  'install_operation_receipt_expired',
+  'install_operation_receipt_invalid',
+  'install_operation_receipt_required',
+  'install_operation_reconciling',
+  'install_operation_response_invalid',
+  'install_operation_target_invalid',
+  'install_operation_user_mismatch',
+  'install_policy_changed',
+  'local_backend_request_failed',
+  'local_backend_unavailable',
+  'local_install_response_invalid',
+  'local_stage_response_invalid',
+  'package_revision_changed',
+  'request-canceled',
+  'skill_install_receipt_ineligible',
+  'skill_install_receipt_recovery_expired',
+  'skill_install_receipt_unavailable',
+  'skill_name_conflict',
+  'skill_policy_denied',
+  'skills_manage_required',
+  'update_not_supported'
+])
+const SAFE_PUBLIC_MESSAGES: Readonly<Record<string, string>> = Object.freeze({
+  client_operation_id_conflict: 'The enterprise skill operation conflicts with an existing request.',
+  desktop_active_role_required: 'Contact an administrator to assign an active enterprise role.',
+  desktop_session_required: 'Sign in to your enterprise account and try again.',
+  enterprise_lifecycle_effect_denied: 'Enterprise access changed while the operation was running.',
+  enterprise_lifecycle_ipc_denied: 'Enterprise policy does not allow this operation right now.',
+  enterprise_managed_user_invalid: 'The managed enterprise user identity is invalid.',
+  enterprise_operation_superseded: 'Enterprise access changed while the operation was running.',
+  enterprise_skill_install_recovery_failed: 'The enterprise skill installation could not be recovered safely.',
+  enterprise_skill_install_recovery_unavailable: 'Secure enterprise skill recovery is unavailable.',
+  install_operation_abort_unconfirmed: 'Hermes could not confirm that the enterprise skill target is absent.',
+  install_operation_binding_mismatch: 'The enterprise skill authorization no longer matches this operation.',
+  install_operation_content_changed: 'The staged enterprise skill content changed before installation completed.',
+  install_operation_content_mismatch: 'The enterprise skill content does not match its authorization.',
+  install_operation_expired: 'The enterprise skill operation expired before installation completed.',
+  install_operation_journal_invalid: 'The local enterprise skill recovery record is invalid.',
+  install_operation_not_authorized: 'The enterprise skill operation is not authorized for installation.',
+  install_operation_not_found: 'The enterprise skill operation no longer exists.',
+  install_operation_pending_limit: 'Too many enterprise skill installations are pending. Wait before retrying.',
+  install_operation_receipt_expired: 'The enterprise skill installation receipt expired.',
+  install_operation_receipt_invalid: 'The enterprise skill installation receipt is invalid.',
+  install_operation_receipt_required: 'A signed enterprise skill installation receipt is required.',
+  install_operation_reconciliation_invalid: 'The enterprise skill recovery state is invalid.',
+  install_operation_reconciling: 'The enterprise skill installation is being safely reconciled.',
+  install_operation_response_invalid: 'The enterprise Gateway returned an invalid install operation.',
+  install_operation_target_invalid: 'The local enterprise skill target is invalid.',
+  install_operation_user_mismatch: 'The enterprise skill operation belongs to a different managed user.',
+  install_policy_changed: 'Enterprise policy changed while this skill was being installed.',
+  local_stage_response_invalid: 'The local enterprise skill staging result is invalid.',
+  package_revision_changed: 'The enterprise skill package changed before installation.',
+  request_canceled: 'The operation was canceled because enterprise access changed.',
+  'request-canceled': 'The operation was canceled because enterprise access changed.',
+  skill_install_receipt_ineligible: 'This enterprise skill operation cannot receive an installation receipt.',
+  skill_install_receipt_recovery_expired: 'The enterprise skill receipt recovery window expired.',
+  skill_install_receipt_unavailable: 'The enterprise Gateway could not issue an installation receipt.',
+  skill_name_conflict: 'A local skill conflicts with this enterprise skill.',
+  skill_policy_denied: 'Enterprise policy does not allow this skill to be installed.',
+  skills_manage_required: 'Contact an administrator to grant enterprise skill management access.',
+  update_not_supported: 'This enterprise skill cannot be updated by the current Desktop version.'
+})
+const SAFE_SKILL_HUB_FAILURE_MESSAGE = 'Enterprise Skill Hub request failed safely.'
+const SAFE_RECOVERY_FAILURE_MESSAGE = 'Enterprise skill recovery could not be completed safely.'
+
+function deterministicRecoveryKind(code: string, status: number | null): OperationError['recoveryKind'] | null {
+  if (
+    code === 'enterprise_skill_hub_untrusted_renderer' ||
+    code === 'enterprise_skill_hub_disabled' ||
+    code === 'enterprise_runtime_access_unavailable' ||
+    code === 'enterprise_profile_not_managed' ||
+    code === 'enterprise_untrusted_renderer' ||
+    code === 'request-canceled' ||
+    code === 'enterprise_operation_superseded' ||
+    code === 'local_backend_request_failed'
+  ) return 'none'
+  if (status === 401 || code === 'desktop_session_required') return 'sign-in'
+  if (status === 426) return 'upgrade'
+  if (code === 'install_operation_reconciling' || code === 'install_operation_pending_limit') return 'wait'
+  if (
+    status === 403 ||
+    code === 'desktop_active_role_required' ||
+    code === 'skills_manage_required' ||
+    code === 'skill_policy_denied' ||
+    code === 'install_policy_changed'
+  ) return 'refresh-policy'
+  if (
+    code === 'install_operation_expired' ||
+    code === 'skill_install_receipt_recovery_expired' ||
+    code === 'skill_install_receipt_unavailable'
+  ) return 'retry'
+  if ((status !== null && status >= 500) || code === 'gateway-offline' || code === 'gateway-timeout') return 'retry'
+  return null
+}
+
+function safePublicMessage(code: string, status: number | null, recoveryKind: OperationError['recoveryKind']): string {
+  if (SAFE_PUBLIC_MESSAGES[code]) return SAFE_PUBLIC_MESSAGES[code]
+  if (recoveryKind === 'sign-in') return 'Sign in to your enterprise account and try again.'
+  if (recoveryKind === 'upgrade') return 'Update Hermes Desktop before continuing.'
+  if (recoveryKind === 'wait') return 'Hermes maintenance is still in progress. Wait before retrying.'
+  if (recoveryKind === 'retry-stop') return 'Hermes could not stop safely. Retry the stop before continuing.'
+  if (recoveryKind === 'restart') return 'Restart Hermes Desktop before continuing.'
+  if (recoveryKind === 'refresh-policy') return 'Enterprise policy does not allow this operation right now.'
+  if (status !== null && status >= 500) return 'The enterprise service is temporarily unavailable. Try again.'
+  return SAFE_SKILL_HUB_FAILURE_MESSAGE
+}
+
+function verifiedPublicError(error: unknown): OperationError | null {
+  const value = error as {
+    code?: unknown
+    envelope?: unknown
+    errorCode?: unknown
+    httpStatus?: unknown
+    lifecycleEpoch?: unknown
+    message?: unknown
+    recoveryKind?: unknown
+    status?: unknown
+  }
+  const code = typeof value?.errorCode === 'string' ? value.errorCode : ''
+  const status = value?.httpStatus
+  const lifecycleEpoch = value?.lifecycleEpoch
+  const recoveryKind = value?.recoveryKind
+  if (
+    value?.envelope !== PUBLIC_ERROR_ENVELOPE ||
+    !PUBLIC_ERROR_CODES.has(code) ||
+    value?.code !== code ||
+    value?.status !== status ||
+    !(status === null || (Number.isInteger(status) && Number(status) >= 100 && Number(status) <= 599)) ||
+    !Number.isSafeInteger(lifecycleEpoch) || Number(lifecycleEpoch) < 0 ||
+    typeof recoveryKind !== 'string' || !RECOVERY_ERROR_KINDS.has(recoveryKind as OperationError['recoveryKind']) ||
+    typeof value?.message !== 'string' ||
+    (deterministicRecoveryKind(code, status as number | null) || 'none') !== recoveryKind
+  ) return null
+
+  return {
+    errorCode: code,
+    httpStatus: status as number | null,
+    lifecycleEpoch: lifecycleEpoch as number,
+    message: safePublicMessage(code, status as number | null, recoveryKind as OperationError['recoveryKind']),
+    recoveryKind: recoveryKind as OperationError['recoveryKind']
+  }
 }
 
 function errorInfo(error: unknown): OperationError {
-  const value = error as { code?: unknown; message?: unknown }
-
-  return {
-    code: String(value?.code || 'enterprise_skill_hub_error'),
-    message: String(value?.message || error || 'Enterprise Skill Hub request failed.')
+  return verifiedPublicError(error) || {
+    errorCode: 'enterprise_operation_failed',
+    httpStatus: null,
+    lifecycleEpoch: 0,
+    message: SAFE_SKILL_HUB_FAILURE_MESSAGE,
+    recoveryKind: 'none'
   }
 }
 
@@ -67,6 +255,8 @@ export function EnterpriseDiscovery({ authenticated, onInstalled, query, refresh
   const [detail, setDetail] = useState<EnterpriseSkillHubItem | null>(null)
   const [detailLoading, setDetailLoading] = useState(false)
   const [refreshingPolicy, setRefreshingPolicy] = useState(false)
+  const [recovering, setRecovering] = useState<string | null>(null)
+  const recoveryFlightRef = useRef<Promise<void> | null>(null)
 
   useEffect(() => {
     if (!authenticated) {
@@ -132,7 +322,7 @@ export function EnterpriseDiscovery({ authenticated, onInstalled, query, refresh
       await refreshEnterprisePolicy()
       await Promise.all([refreshList(), onInstalled()])
     } catch (error) {
-      notifyError(error, t.skills.enterpriseLoadFailed)
+      notify({ kind: 'warning', message: errorInfo(error).message, title: t.skills.enterpriseLoadFailed })
     } finally {
       setRefreshingPolicy(false)
     }
@@ -164,7 +354,7 @@ export function EnterpriseDiscovery({ authenticated, onInstalled, query, refresh
     try {
       setDetail(await window.hermesDesktop.enterprise.skillHub.detail(item.key))
     } catch (error) {
-      notifyError(error, t.skills.enterpriseLoadFailed)
+      notify({ kind: 'warning', message: errorInfo(error).message, title: t.skills.enterpriseLoadFailed })
     } finally {
       setDetailLoading(false)
     }
@@ -199,14 +389,45 @@ export function EnterpriseDiscovery({ authenticated, onInstalled, query, refresh
       const info = errorInfo(error)
       setOperationErrors(current => ({ ...current, [item.key]: info }))
 
-      if (info.code === 'package_revision_changed') {
+      if (info.errorCode === 'package_revision_changed') {
         await refreshList().catch(() => undefined)
       }
 
-      notifyError(error, t.skills.enterpriseInstallFailed(item.name))
+      notify({ kind: 'warning', message: info.message, title: t.skills.enterpriseInstallFailed(item.name) })
     } finally {
       setInstalling(null)
     }
+  }
+
+  function canRecover(error: OperationError): boolean {
+    return ['refresh-policy', 'retry', 'wait'].includes(error.recoveryKind)
+  }
+
+  function recover(item: EnterpriseSkillHubItem, operationError: OperationError): void {
+    if (!canRecover(operationError) || recoveryFlightRef.current) {return}
+    const flight = (async () => {
+      setRecovering(item.key)
+      const lifecycle = await window.hermesDesktop.enterprise.lifecycleStatus()
+      if (lifecycle.lifecycleEpoch !== operationError.lifecycleEpoch) {return}
+      if (operationError.recoveryKind === 'refresh-policy') {
+        await handleRefreshPolicy()
+      } else {
+        await install(item)
+      }
+    })().catch(error => {
+      const next = verifiedPublicError(error) || operationError
+      setOperationErrors(current => ({ ...current, [item.key]: next }))
+      notify({
+        id: `enterprise-skill-recovery:${item.key}`,
+        kind: 'warning',
+        message: SAFE_RECOVERY_FAILURE_MESSAGE,
+        title: t.skills.enterpriseInstallFailed(item.name)
+      })
+    }).finally(() => {
+      if (recoveryFlightRef.current === flight) {recoveryFlightRef.current = null}
+      setRecovering(null)
+    })
+    recoveryFlightRef.current = flight
   }
 
   if (!authenticated) {
@@ -330,10 +551,42 @@ export function EnterpriseDiscovery({ authenticated, onInstalled, query, refresh
                   {item.description || t.skills.noDescription}
                 </p>
                 {(denied || updateAvailable || operationErrors[item.key]) && (
-                  <p className={`mt-2 text-[0.7rem] leading-4 ${operationErrors[item.key] ? 'text-destructive' : 'text-muted-foreground'}`}>
-                    {operationErrors[item.key]?.message ||
-                      (denied ? item.policyReason : t.skills.enterpriseUpdateUnsupported)}
-                  </p>
+                  <div
+                    className={`mt-2 text-[0.7rem] leading-4 ${operationErrors[item.key] ? 'text-destructive' : 'text-muted-foreground'}`}
+                    data-error-code={operationErrors[item.key]?.errorCode}
+                    data-http-status={operationErrors[item.key]?.httpStatus ?? undefined}
+                    data-lifecycle-epoch={operationErrors[item.key]?.lifecycleEpoch}
+                    data-recovery-kind={operationErrors[item.key]?.recoveryKind}
+                  >
+                    <p>
+                      {operationErrors[item.key]?.message ||
+                        (denied ? item.policyReason : t.skills.enterpriseUpdateUnsupported)}
+                    </p>
+                    {operationErrors[item.key] && (
+                      <p className="mt-1 text-(--ui-text-tertiary)">
+                        {operationErrors[item.key].errorCode}
+                        {operationErrors[item.key].httpStatus ? ` · HTTP ${operationErrors[item.key].httpStatus}` : ''}
+                        {` · ${operationErrors[item.key].recoveryKind} · epoch ${operationErrors[item.key].lifecycleEpoch}`}
+                      </p>
+                    )}
+                    {operationErrors[item.key] && canRecover(operationErrors[item.key]) && (
+                      <Button
+                        aria-label={`${operationErrors[item.key].recoveryKind === 'refresh-policy'
+                          ? t.skills.enterprisePolicyRefresh
+                          : t.skills.refresh} ${item.name}`}
+                        className="mt-1.5"
+                        disabled={recovering === item.key}
+                        onClick={() => recover(item, operationErrors[item.key])}
+                        size="sm"
+                        type="button"
+                        variant="outline"
+                      >
+                        {operationErrors[item.key].recoveryKind === 'refresh-policy'
+                          ? t.skills.enterprisePolicyRefresh
+                          : t.skills.refresh}
+                      </Button>
+                    )}
+                  </div>
                 )}
                 <div className="mt-auto flex items-center justify-between gap-2 pt-3">
                   <Badge variant="outline">{item.category || 'general'}</Badge>

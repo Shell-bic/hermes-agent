@@ -44,6 +44,7 @@ const { canImportHermesCli, verifyHermesCli } = require('./backend-probes.cjs')
 const { probeGatewayWebSocket } = require('./gateway-ws-probe.cjs')
 const { adoptServedDashboardToken } = require('./dashboard-token.cjs')
 const { waitForDashboardPort } = require('./backend-ready.cjs')
+const { createNodeJsonFetcher } = require('./enterprise-http-transport.cjs')
 const { serializeJsonBody, setJsonRequestHeaders } = require('./oauth-net-request.cjs')
 const { fetchMarketplaceThemes, searchMarketplaceThemes } = require('./vscode-marketplace.cjs')
 const { buildDesktopBackendEnv, normalizeHermesHomeRoot } = require('./backend-env.cjs')
@@ -91,6 +92,9 @@ const {
   resolveTimeoutMs
 } = require('./hardening.cjs')
 const { createEnterpriseAuthStore } = require('./enterprise-auth-store.cjs')
+const { createEnterpriseApiIpcHandler } = require('./enterprise-api-ipc.cjs')
+const { resolveBackendForOperation } = require('./enterprise-backend-request.cjs')
+const { createProfileDeleteCoordinator } = require('./enterprise-profile-delete.cjs')
 const {
   createTerminalOperationGate,
   createEnterpriseBackendOwnership,
@@ -108,7 +112,11 @@ const {
   managedUserId,
   registerEnterpriseManagedProfileIpc
 } = require('./enterprise-managed-profile.cjs')
-const { createEnterpriseSkillHub, publicError: publicEnterpriseSkillHubError } = require('./enterprise-skill-hub.cjs')
+const { createEnterpriseSkillHub } = require('./enterprise-skill-hub.cjs')
+const {
+  createEnterpriseSkillInstallOperationStore
+} = require('./enterprise-skill-install-operation-store.cjs')
+const { registerEnterpriseSkillHubIpc } = require('./enterprise-skill-hub-ipc.cjs')
 const { createEnterpriseManagedLifecycle } = require('./enterprise-managed-lifecycle.cjs')
 const { createEnterpriseRuntimeAccess } = require('./enterprise-runtime-access.cjs')
 const { createEnterpriseWindowConnections } = require('./enterprise-window-connections.cjs')
@@ -366,6 +374,11 @@ const DESKTOP_UPDATE_CONFIG_PATH = path.join(app.getPath('userData'), 'updates.j
 // no --profile flag, so the backend honors active_profile / default.
 const DESKTOP_PROFILE_CONFIG_PATH = path.join(app.getPath('userData'), 'active-profile.json')
 const ENTERPRISE_AUTH_STORE_PATH = path.join(app.getPath('userData'), 'enterprise', 'desktop-auth.json')
+const ENTERPRISE_SKILL_INSTALL_OPERATION_STORE_PATH = path.join(
+  app.getPath('userData'),
+  'enterprise',
+  'active-skill-install.json'
+)
 const ENTERPRISE_RUNTIME_OPTIONS = resolveEnterpriseRuntimeOptions(process.env, {
   configPaths: resolveEnterpriseDesktopConfigPaths({
     executablePath: process.execPath,
@@ -376,6 +389,10 @@ const ENTERPRISE_RUNTIME_OPTIONS = resolveEnterpriseRuntimeOptions(process.env, 
 const ENTERPRISE_MANAGED_OUTPUTS = ENTERPRISE_RUNTIME_OPTIONS.enabled || isEnterpriseManagedEnv(process.env)
 const enterpriseAuthStore = createEnterpriseAuthStore({
   filePath: ENTERPRISE_AUTH_STORE_PATH,
+  safeStorage
+})
+const enterpriseSkillInstallOperationStore = createEnterpriseSkillInstallOperationStore({
+  filePath: ENTERPRISE_SKILL_INSTALL_OPERATION_STORE_PATH,
   safeStorage
 })
 const enterpriseGatewayClient = ENTERPRISE_RUNTIME_OPTIONS.gatewayUrl
@@ -411,40 +428,20 @@ const enterpriseRuntime = createEnterpriseRuntime({
 const enterpriseSkillHub = createEnterpriseSkillHub({
   authStore: enterpriseAuthStore,
   client: enterpriseGatewayClient,
-  localConnection: () => ensureBackend(primaryProfileKey())
+  getManagedContext: () => {
+    const identity = enterpriseManagedProfileGuard.identity()
+    return { hermesHome: identity.hermesHome, userId: identity.userId }
+  },
+  getRuntimeAccess: () => enterpriseRuntimeAccess,
+  isManaged: () => enterpriseRuntime.isEnabled(),
+  localConnection: options => ensureBackend(primaryProfileKey(), options),
+  operationStore: enterpriseSkillInstallOperationStore
 })
-
 function isTrustedDesktopRendererUrl(url) {
   return isTrustedRendererUrl(url, {
     devServer: DEV_SERVER,
     rendererEntryUrl: DEV_SERVER ? null : pathToFileURL(resolveRendererIndex()).toString()
   })
-}
-
-async function enterpriseSkillHubIpc(event, operation) {
-  if (!isTrustedDesktopRendererUrl(event?.senderFrame?.url)) {
-    rememberLog('[enterprise-skill-hub] rejected untrusted renderer IPC')
-    return {
-      error: {
-        code: 'enterprise_skill_hub_untrusted_renderer',
-        message: 'Enterprise Skill Hub is available only from the Hermes Desktop renderer.',
-        status: 403
-      },
-      ok: false
-    }
-  }
-  if (!enterpriseRuntime.isEnabled() || !enterpriseGatewayClient) {
-    return {
-      error: { code: 'enterprise_skill_hub_disabled', message: 'Enterprise Skill Hub is not configured.', status: null },
-      ok: false
-    }
-  }
-  try {
-    return { ok: true, value: await operation() }
-  } catch (error) {
-    rememberLog(`[enterprise-skill-hub] ${error?.code || 'error'} status=${error?.status || 'n/a'}`)
-    return { error: publicEnterpriseSkillHubError(error), ok: false }
-  }
 }
 
 function enterpriseAuthRequiredError() {
@@ -3022,75 +3019,12 @@ async function ensureRuntime(backend) {
   return backend
 }
 
-
-function fetchJson(url, token, options = {}) {
-  return new Promise((resolve, reject) => {
-    const body = options.body === undefined ? undefined : Buffer.from(JSON.stringify(options.body))
-    const parsed = new URL(url)
-    const client = parsed.protocol === 'https:' ? https : http
-    const timeoutMs = resolveTimeoutMs(options.timeoutMs, DEFAULT_FETCH_TIMEOUT_MS)
-
-    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
-      reject(new Error(`Unsupported Hermes backend URL protocol: ${parsed.protocol}`))
-      return
-    }
-
-    const req = client.request(
-      parsed,
-      {
-        method: options.method || 'GET',
-        headers: {
-          'Content-Type': 'application/json',
-          'X-Hermes-Session-Token': token,
-          ...(body ? { 'Content-Length': String(body.length) } : {})
-        }
-      },
-      res => {
-        const chunks = []
-        res.on('error', reject)
-        res.on('data', chunk => chunks.push(chunk))
-        res.on('end', () => {
-          const text = Buffer.concat(chunks).toString('utf8')
-          if ((res.statusCode || 500) >= 400) {
-            reject(new Error(`${res.statusCode}: ${text || res.statusMessage}`))
-            return
-          }
-          if (!text) {
-            resolve(null)
-            return
-          }
-          // A 2xx response whose body is HTML means the request fell through
-          // to the SPA index.html (e.g. an unregistered /api path). JSON.parse
-          // would throw an opaque `Unexpected token '<'` here, so surface a
-          // clear diagnostic with the offending URL instead.
-          const looksHtml = /^\s*<(?:!doctype|html)/i.test(text)
-          const contentType = String(res.headers['content-type'] || '')
-          if (looksHtml || contentType.includes('text/html')) {
-            reject(
-              new Error(
-                `Expected JSON from ${url} but got HTML (status ${res.statusCode}). ` +
-                  'The endpoint is likely missing on the Hermes backend.'
-              )
-            )
-            return
-          }
-          try {
-            resolve(JSON.parse(text))
-          } catch {
-            reject(new Error(`Invalid JSON from ${url} (status ${res.statusCode}): ${text.slice(0, 200)}`))
-          }
-        })
-      }
-    )
-
-    req.on('error', reject)
-    req.setTimeout(timeoutMs, () => {
-      req.destroy(new Error(`Timed out connecting to Hermes backend after ${timeoutMs}ms`))
-    })
-    if (body) req.write(body)
-    req.end()
-  })
-}
+const fetchJson = createNodeJsonFetcher({
+  defaultTimeoutMs: DEFAULT_FETCH_TIMEOUT_MS,
+  http,
+  https,
+  resolveTimeoutMs
+})
 
 function fetchPublicJson(url, options = {}) {
   // Credential-free JSON GET/POST for public gateway endpoints
@@ -4805,16 +4739,21 @@ function globalRemoteActive() {
 }
 
 // GET a profile's resolved backend (remote pool or local primary), parsed JSON.
-async function fetchJsonForProfile(profile, path) {
-  return requestJsonForProfile(profile, path, 'GET')
+async function fetchJsonForProfile(profile, path, active) {
+  return requestJsonForProfile(profile, path, 'GET', undefined, active)
 }
 
 // Issue an arbitrary method against a profile's resolved backend, parsed JSON.
-async function requestJsonForProfile(profile, path, method, body) {
-  const conn = await ensureBackend(profile)
+async function requestJsonForProfile(profile, path, method, body, active) {
+  const conn = await resolveBackendForOperation({ active, ensureBackend, profile })
   const url = `${conn.baseUrl}${path}`
-  const opts = { method, body, timeoutMs: DEFAULT_FETCH_TIMEOUT_MS }
-  return conn.authMode === 'oauth' ? fetchJsonViaOauthSession(url, opts) : fetchJson(url, conn.token, opts)
+  const opts = { method, body, signal: active?.signal, timeoutMs: DEFAULT_FETCH_TIMEOUT_MS }
+  active?.checkpoint()
+  const result = await (conn.authMode === 'oauth'
+    ? fetchJsonViaOauthSession(url, opts)
+    : fetchJson(url, conn.token, opts))
+  active?.checkpoint()
+  return result
 }
 
 async function probeRemoteAuthMode(rawUrl) {
@@ -5139,8 +5078,11 @@ function primaryProfileKey() {
 // profile to startHermes() (the window backend: boot UI, bootstrap, remote
 // mode), and any OTHER profile to a lazily-spawned pool backend. An empty /
 // unknown profile resolves to the primary, so all legacy callers are unchanged.
-async function ensureBackend(profile) {
+async function ensureBackend(profile, operationOptions = {}) {
   enterpriseBackendOwnership.assertMaintenanceStartAllowed()
+  if (operationOptions.signal?.aborted) {
+    throw Object.assign(new Error('Enterprise backend request was canceled.'), { code: 'request-canceled' })
+  }
   const accessOptions = { allowRecovery: true }
   const lease = enterpriseRuntimeAccess.acquire('ensureBackend', accessOptions)
   if (enterpriseAuthPending()) {
@@ -5153,6 +5095,9 @@ async function ensureBackend(profile) {
 
   if (key === primaryProfileKey()) {
     const connection = await startHermes()
+    if (operationOptions.signal?.aborted) {
+      throw Object.assign(new Error('Enterprise backend request was canceled.'), { code: 'request-canceled' })
+    }
     enterpriseRuntimeAccess.checkpoint('ensureBackend', lease, accessOptions)
     return connection
   }
@@ -5382,50 +5327,15 @@ async function stopAllPoolBackends() {
   await Promise.all([...backendPool.keys()].map(profile => stopPoolBackend(profile)))
 }
 
-function profileNameFromDeleteRequest(request) {
-  if (!request || String(request.method || 'GET').toUpperCase() !== 'DELETE') {
-    return null
-  }
-
-  const match = String(request.path || '').match(/^\/api\/profiles\/([^/?#]+)(?:[?#].*)?$/)
-  if (!match) {
-    return null
-  }
-
-  let raw = ''
-  try {
-    raw = decodeURIComponent(match[1])
-  } catch {
-    return null
-  }
-
-  const name = raw.trim()
-  if (!name) {
-    return null
-  }
-  if (name.toLowerCase() === 'default') {
-    return 'default'
-  }
-  return name.toLowerCase()
-}
-
-async function prepareProfileDeleteRequest(request) {
-  const profile = profileNameFromDeleteRequest(request)
-  if (enterpriseRuntime.isEnabled() && profile) {
-    enterpriseManagedProfileGuard.assertProfileMutation('profile:delete', request?.path)
-  }
-  if (!profile || profile === 'default' || !PROFILE_NAME_RE.test(profile)) {
-    return
-  }
-
-  if (profile === primaryProfileKey()) {
-    writeActiveDesktopProfile('default')
-    await teardownPrimaryBackendAndWait()
-    return
-  }
-
-  await teardownPoolBackendAndWait(profile)
-}
+const prepareProfileDeleteRequest = createProfileDeleteCoordinator({
+  assertProfileMutation: (...args) => enterpriseManagedProfileGuard.assertProfileMutation(...args),
+  isManaged: () => enterpriseRuntime.isEnabled(),
+  isValidProfileName: value => PROFILE_NAME_RE.test(value),
+  primaryProfileKey,
+  teardownPoolBackendAndWait,
+  teardownPrimaryBackendAndWait,
+  writeActiveDesktopProfile
+})
 
 async function startHermes() {
   enterpriseBackendOwnership.assertMaintenanceStartAllowed()
@@ -5619,6 +5529,13 @@ async function startHermes() {
     }))
     if (enterpriseManaged && enterpriseLifecycle.getSnapshot().state === 'recovering') {
       enterpriseLifecycle.markRunning({ reasonCode: 'enterprise_runtime_ready' })
+    }
+    if (enterpriseManaged) {
+      setImmediate(() => {
+        enterpriseSkillHub.recoverPendingOperation().catch(error => {
+          rememberLog(`[enterprise-skill-hub] startup reconciliation ${error?.code || 'failed'}`)
+        })
+      })
     }
     updateBootProgress({
       phase: 'backend.ready',
@@ -6014,15 +5931,14 @@ ipcMain.handle('hermes:enterprise:logout', async event => {
   }
   return state
 })
-ipcMain.handle('hermes:enterprise:skill-hub:list', async (event, query) =>
-  enterpriseSkillHubIpc(event, () => enterpriseSkillHub.list(query || {}))
-)
-ipcMain.handle('hermes:enterprise:skill-hub:detail', async (event, key) =>
-  enterpriseSkillHubIpc(event, () => enterpriseSkillHub.detail(key))
-)
-ipcMain.handle('hermes:enterprise:skill-hub:install', async (event, payload) =>
-  enterpriseSkillHubIpc(event, () => enterpriseSkillHub.install(payload || {}))
-)
+registerEnterpriseSkillHubIpc({
+  getLifecycle: () => enterpriseLifecycle,
+  hub: enterpriseSkillHub,
+  ipcMain,
+  isEnabled: () => enterpriseRuntime.isEnabled() && Boolean(enterpriseGatewayClient),
+  assertTrusted: event => assertTrustedEnterpriseSender(event),
+  rememberLog
+})
 
 // Reconnect-after-wake recovery. A REMOTE primary backend has no child process,
 // so the 'exit'/'error' handlers that would clear a dead connectionPromise never
@@ -6190,7 +6106,7 @@ ipcMain.handle('hermes:requestMicrophoneAccess', async () => {
 //   GET    /api/sessions/{id}[/messages] → read from remote
 //   DELETE /api/sessions/{id}            → delete on remote
 //   PATCH  /api/sessions/{id}            → rename/archive on remote
-async function interceptSessionRequestForRemote(request) {
+async function interceptSessionRequestForRemote(request, active) {
   if (typeof request?.path !== 'string') {
     return undefined
   }
@@ -6211,9 +6127,9 @@ async function interceptSessionRequestForRemote(request) {
     }
     const requested = (searchParams.get('profile') || 'all').trim() || 'all'
     if (requested !== 'all') {
-      return profileHasRemoteOverride(requested) ? remoteSessionList(requested, searchParams) : undefined
+      return profileHasRemoteOverride(requested) ? remoteSessionList(requested, searchParams, active) : undefined
     }
-    return mergeRemoteProfileSessions(searchParams, remoteProfiles)
+    return mergeRemoteProfileSessions(searchParams, remoteProfiles, active)
   }
 
   // Per-session read/mutation. Owner is in ?profile= (reads) or request.profile
@@ -6229,21 +6145,23 @@ async function interceptSessionRequestForRemote(request) {
     }
     if (profileHasRemoteOverride(profile)) {
       if (method === 'GET') {
-        return fetchJsonForProfile(profile, pathname)
+        return fetchJsonForProfile(profile, pathname, active)
       }
       const body = request.body && typeof request.body === 'object' ? { ...request.body } : request.body
       if (body) delete body.profile
-      return requestJsonForProfile(profile, pathname, method, body)
+      active?.checkpoint()
+      return requestJsonForProfile(profile, pathname, method, body, active)
     }
     if (globalRemoteActive()) {
       // Single global backend: keep ?profile= so it opens the right state.db.
       const sep = pathname.includes('?') ? '&' : '?'
       const path = `${pathname}${sep}profile=${encodeURIComponent(profile)}`
       if (method === 'GET') {
-        return fetchJsonForProfile(null, path)
+        return fetchJsonForProfile(null, path, active)
       }
       const body = request.body && typeof request.body === 'object' ? { ...request.body, profile } : { profile }
-      return requestJsonForProfile(null, path, method, body)
+      active?.checkpoint()
+      return requestJsonForProfile(null, path, method, body, active)
     }
     return undefined
   }
@@ -6255,10 +6173,10 @@ const rowsOf = data => (Array.isArray(data?.sessions) ? data.sessions : [])
 
 // A remote profile's session list, read from its remote host and tagged with the
 // desktop-facing profile name (the remote's /api/sessions doesn't know it).
-async function remoteSessionList(profile, searchParams) {
+async function remoteSessionList(profile, searchParams, active) {
   const qs = new URLSearchParams(searchParams)
   qs.delete('profile') // remote serves its own db; no cross-profile read there
-  const data = await fetchJsonForProfile(profile, `/api/sessions?${qs}`)
+  const data = await fetchJsonForProfile(profile, `/api/sessions?${qs}`, active)
   for (const s of rowsOf(data)) {
     s.profile = profile
     s.is_default_profile = false
@@ -6270,16 +6188,18 @@ async function remoteSessionList(profile, searchParams) {
 // rows/totals swapped for the remote's real ones, re-sorted by recency and
 // re-windowed to the requested page. A dead remote contributes nothing rather
 // than breaking the sidebar.
-async function mergeRemoteProfileSessions(searchParams, remoteProfiles) {
+async function mergeRemoteProfileSessions(searchParams, remoteProfiles, active) {
   const limit = Math.max(1, Number(searchParams.get('limit')) || 20)
   const offset = Math.max(0, Number(searchParams.get('offset')) || 0)
   const order = searchParams.get('order') === 'created' ? 'started_at' : 'last_active'
 
-  const primary = await ensureBackend(null)
+  const primary = await resolveBackendForOperation({ active, ensureBackend, profile: null })
   const base = await fetchJson(`${primary.baseUrl}/api/profiles/sessions?${searchParams}`, primary.token, {
     method: 'GET',
+    signal: active?.signal,
     timeoutMs: DEFAULT_FETCH_TIMEOUT_MS
   }).catch(() => ({ sessions: [], total: 0, profile_totals: {} }))
+  active?.checkpoint()
 
   // Over-fetch each remote from offset 0 (limit+offset rows) so the merged window
   // is correct for this page — mirrors the primary's per-profile over-fetch.
@@ -6295,7 +6215,11 @@ async function mergeRemoteProfileSessions(searchParams, remoteProfiles) {
   // Swap each remote profile's stale local rows/total for the remote's real ones.
   await Promise.all(
     remoteProfiles.map(async name => {
-      const list = await remoteSessionList(name, remoteParams).catch(() => null)
+      const list = await remoteSessionList(name, remoteParams, active).catch(error => {
+        if (active?.signal?.aborted) throw error
+        return null
+      })
+      active?.checkpoint()
       if (!list) {
         delete profileTotals[name] // dead remote → drop its stale local total too
         return
@@ -6312,34 +6236,22 @@ async function mergeRemoteProfileSessions(searchParams, remoteProfiles) {
   return { ...base, sessions: merged.slice(offset, offset + limit), total, profile_totals: profileTotals }
 }
 
-async function handleHermesApiRequest(request) {
-  const pendingEnterpriseResponse = enterprisePendingApiResponse(request)
-  if (pendingEnterpriseResponse !== undefined) {
-    return pendingEnterpriseResponse
-  }
-
-  const accessOptions = { ipc: true }
-  const lease = enterpriseRuntimeAccess.acquire('hermes:api', accessOptions)
-  const response = await handleHermesApiRequestWithRuntime(request)
-  enterpriseRuntimeAccess.checkpoint('hermes:api', lease, accessOptions)
-  return response
-}
-
-async function handleHermesApiRequestWithRuntime(request) {
-
+async function handleHermesApiRequestWithRuntime(request, active) {
   // Remote-profile session requests would otherwise hit the local primary off
   // each profile's on-disk state.db — fine for local profiles, but a remote
   // profile's sessions live on its remote host, so the UI's IDs 404 (or mutations
   // no-op) the moment they run there. Route reads + mutations to the remote.
-  const rerouted = await interceptSessionRequestForRemote(request)
+  const rerouted = await interceptSessionRequestForRemote(request, active)
+  active?.checkpoint()
   if (rerouted !== undefined) {
     return rerouted
   }
 
-  await prepareProfileDeleteRequest(request)
+  const commitProfileDelete = prepareProfileDeleteRequest(request, active)
+  active?.checkpoint()
 
   const profile = request?.profile
-  const connection = await ensureBackend(profile)
+  const connection = await resolveBackendForOperation({ active, ensureBackend, profile })
   const timeoutMs = resolveTimeoutMs(request?.timeoutMs, DEFAULT_FETCH_TIMEOUT_MS)
   const requestPath = pathWithGlobalRemoteProfile(request.path, profile, {
     globalRemote: globalRemoteActive(),
@@ -6350,23 +6262,42 @@ async function handleHermesApiRequestWithRuntime(request) {
   // the OAuth partition — route through Electron's net stack bound to that
   // session so the cookie attaches automatically. Token/local modes keep using
   // the static session-token header.
-  if (connection.authMode === 'oauth') {
-    return fetchJsonViaOauthSession(url, {
+  const result = connection.authMode === 'oauth'
+    ? await fetchJsonViaOauthSession(url, {
       method: request?.method,
       body: request?.body,
+      signal: active?.signal,
       timeoutMs
     })
-  }
-  return fetchJson(url, connection.token, {
-    method: request?.method,
-    body: request?.body,
-    timeoutMs
-  })
+    : await fetchJson(url, connection.token, {
+      method: request?.method,
+      body: request?.body,
+      signal: active?.signal,
+      timeoutMs
+    })
+  active?.checkpoint()
+  await commitProfileDelete?.()
+  active?.checkpoint()
+  return result
 }
+
+const enterpriseApiIpcHandler = createEnterpriseApiIpcHandler({
+  assertTrusted: event => assertTrustedEnterpriseSender(event),
+  getLifecycle: () => enterpriseLifecycle,
+  getPendingResponse: enterprisePendingApiResponse,
+  guard: enterpriseManagedProfileGuard,
+  handleRawRequest: handleHermesApiRequestWithRuntime,
+  isManaged: () => enterpriseRuntime.isEnabled(),
+  runtimeAccess: enterpriseRuntimeAccess
+})
+
+ipcMain.handle('hermes:api', (event, request) => enterpriseApiIpcHandler.run(event, request))
 
 registerEnterpriseManagedProfileIpc({
   ipcMain,
   guard: enterpriseManagedProfileGuard,
+  assertTrusted: event => assertTrustedEnterpriseSender(event),
+  getLifecycle: () => enterpriseLifecycle,
   actions: {
     connection: ensureBackend,
     touchBackend: profile => {
@@ -6412,8 +6343,7 @@ registerEnterpriseManagedProfileIpc({
       await teardownPrimaryBackendAndWait()
       mainWindow?.reload()
       return { profile: next }
-    },
-    api: handleHermesApiRequest
+    }
   }
 })
 

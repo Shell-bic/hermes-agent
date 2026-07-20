@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "algorithm": "sha256-tree-manifest-v1",
+  "files": [
+    {
+      "path": "assets/\ud83d\ude00.bin",
+      "contentBase64": "AP8QCg=="
+    },
+    {
+      "path": "notes/space name.txt",
+      "contentBase64": "bGluZTENCmxpbmUyCg=="
+    },
+    {
+      "path": "SKILL.md",
+      "contentBase64": "LS0tCm5hbWU6IHByb3ZlbmFuY2UtZml4dHVyZQpkZXNjcmlwdGlvbjogQ2Fub25pY2FsIGZpeHR1cmUKY2F0ZWdvcnk6IHRlc3QKLS0tCg=="
+    },
+    {
+      "path": "assets/\ue000.txt",
+      "contentBase64": "Ym1wCg=="
+    }
+  ],
+  "expectedMaterializedContentHash": "19e686d5adc436648772b303fd7f33fdb7d85606fa91438a7f8442de0460cb8d"
+}

@@ -1,5 +1,6 @@
 const test = require('node:test')
 const assert = require('node:assert/strict')
+const crypto = require('node:crypto')
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
@@ -9,6 +10,7 @@ const {
   buildManagedConfigYaml,
   enterpriseUserPathSegment,
   normalizeGatewayApiBaseUrl,
+  normalizeSkillInstallReceiptTrust,
   publicEnterpriseState,
   readManagedPolicySnapshot,
   replaceManagedPolicySnapshot,
@@ -16,6 +18,77 @@ const {
   validateManagedBootstrap,
   writeManagedRuntimeHome
 } = require('./enterprise-runtime-home.cjs')
+
+test('receipt trust preserves the exact signer contract and rejects widened shapes', () => {
+  const { privateKey, publicKey } = crypto.generateKeyPairSync('ec', { namedCurve: 'prime256v1' })
+  const publicKeyPem = publicKey.export({ format: 'pem', type: 'spki' }).trim()
+  const trust = {
+    schemaVersion: 2,
+    issuer: 'https://gateway.example.test',
+    audience: 'hermes-enterprise-skill-runtime',
+    purpose: 'hermes-enterprise-skill-materialize',
+    signerMode: 'gateway-service',
+    algorithm: 'ES256',
+    publicKeys: [{
+      kid: 'p256-sha256-0123456789abcdef0123456789abcdef',
+      algorithm: 'ES256',
+      publicKeyPem,
+      rotationState: 'current'
+    }]
+  }
+  assert.deepEqual(normalizeSkillInstallReceiptTrust(trust), trust)
+  assert.equal(normalizeSkillInstallReceiptTrust({ ...trust, signerMode: 'unknown' }), null)
+  assert.equal(normalizeSkillInstallReceiptTrust({ ...trust, unexpected: true }), null)
+  assert.equal(normalizeSkillInstallReceiptTrust({
+    ...trust,
+    publicKeys: [{ ...trust.publicKeys[0], unexpected: true }]
+  }), null)
+  assert.equal(normalizeSkillInstallReceiptTrust({ ...trust, signerMode: 'local-development' }).signerMode, 'local-development')
+  assert.equal(normalizeSkillInstallReceiptTrust({ ...trust, signerMode: 'testing' }).signerMode, 'testing')
+  assert.equal(normalizeSkillInstallReceiptTrust({
+    ...trust,
+    publicKeys: [trust.publicKeys[0], { ...trust.publicKeys[0], kid: 'retired-key', rotationState: 'retired' }]
+  }).publicKeys[1].rotationState, 'retired')
+  assert.equal(normalizeSkillInstallReceiptTrust({
+    ...trust,
+    publicKeys: [trust.publicKeys[0], { ...trust.publicKeys[0], kid: 'revoked-key', rotationState: 'revoked' }]
+  }).publicKeys[1].rotationState, 'revoked')
+  assert.equal(normalizeSkillInstallReceiptTrust({
+    ...trust,
+    publicKeys: Array.from({ length: 17 }, (_, index) => ({
+      ...trust.publicKeys[0],
+      kid: `key-${index}`
+    }))
+  }), null)
+  assert.equal(normalizeSkillInstallReceiptTrust({
+    ...trust,
+    publicKeys: [trust.publicKeys[0], { ...trust.publicKeys[0] }]
+  }), null)
+  assert.equal(normalizeSkillInstallReceiptTrust({
+    ...trust,
+    publicKeys: [{ ...trust.publicKeys[0], publicKeyPem: privateKey.export({ format: 'pem', type: 'pkcs8' }) }]
+  }), null)
+  assert.equal(normalizeSkillInstallReceiptTrust({
+    ...trust,
+    publicKeys: [{ ...trust.publicKeys[0], publicKeyPem: `-----BEGIN PUBLIC KEY-----\n${'A'.repeat(9 * 1024)}\n-----END PUBLIC KEY-----` }]
+  }), null)
+  assert.equal(normalizeSkillInstallReceiptTrust({
+    ...trust,
+    publicKeys: [{ ...trust.publicKeys[0], rotationState: 'retired' }]
+  }), null)
+  assert.equal(normalizeSkillInstallReceiptTrust({
+    ...trust,
+    publicKeys: [trust.publicKeys[0], { ...trust.publicKeys[0], kid: 'second-current' }]
+  }), null)
+  assert.equal(normalizeSkillInstallReceiptTrust({
+    ...trust,
+    publicKeys: [
+      trust.publicKeys[0],
+      { ...trust.publicKeys[0], kid: 'previous-1', rotationState: 'previous' },
+      { ...trust.publicKeys[0], kid: 'previous-2', rotationState: 'previous' }
+    ]
+  }), null)
+})
 
 function manifest(overrides = {}) {
   return {

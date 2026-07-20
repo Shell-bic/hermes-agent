@@ -1,19 +1,18 @@
 const { contextBridge, ipcRenderer, webUtils } = require('electron')
 const { isEnterpriseManagedEnv, redactManagedText } = require('./managed-redaction.cjs')
 const { createManagedProfileInvoker } = require('./enterprise-managed-profile.cjs')
+const { unwrapEnterprisePublicResult } = require('./enterprise-public-error.cjs')
 const { WINDOW_CONNECTION_CHANNELS } = require('./enterprise-window-connections.cjs')
 
 const ENTERPRISE_MANAGED_OUTPUTS = isEnterpriseManagedEnv(process.env)
 
 function unwrapEnterpriseSkillHub(result) {
-  if (result?.ok) return result.value
-  const error = new Error(result?.error?.message || 'Enterprise Skill Hub request failed.')
-  error.code = result?.error?.code || 'enterprise_skill_hub_error'
-  error.status = result?.error?.status || null
-  throw error
+  return unwrapEnterprisePublicResult(result)
 }
 
-const invokeManagedProfile = createManagedProfileInvoker(ipcRenderer)
+const invokeProfile = createManagedProfileInvoker(ipcRenderer)
+const invokeManagedProfile = (channel, ...args) => invokeProfile(channel, ...args)
+const invokeHermesApi = request => ipcRenderer.invoke('hermes:api', request).then(unwrapEnterprisePublicResult)
 
 contextBridge.exposeInMainWorld('hermesDesktop', {
   getConnection: profile => invokeManagedProfile('hermes:connection', profile),
@@ -62,7 +61,7 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
     get: () => ipcRenderer.invoke('hermes:profile:get'),
     set: name => invokeManagedProfile('hermes:profile:set', name)
   },
-  api: request => invokeManagedProfile('hermes:api', request),
+  api: invokeHermesApi,
   notify: payload => ipcRenderer.invoke('hermes:notify', payload),
   requestMicrophoneAccess: () => ipcRenderer.invoke('hermes:requestMicrophoneAccess'),
   readFileDataUrl: filePath => ipcRenderer.invoke('hermes:readFileDataUrl', filePath),

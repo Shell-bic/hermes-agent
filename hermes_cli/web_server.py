@@ -97,7 +97,7 @@ try:
     from fastapi.middleware.cors import CORSMiddleware
     from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
     from fastapi.staticfiles import StaticFiles
-    from pydantic import BaseModel
+    from pydantic import BaseModel, StrictInt
 except ImportError:
     # First try lazy-installing the dashboard extras. Only the user actually
     # running `hermes dashboard` needs fastapi+uvicorn; lazy install keeps
@@ -109,7 +109,7 @@ except ImportError:
         from fastapi.middleware.cors import CORSMiddleware
         from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
         from fastapi.staticfiles import StaticFiles
-        from pydantic import BaseModel
+        from pydantic import BaseModel, StrictInt
     except Exception:
         raise SystemExit(
             "Web UI requires fastapi and uvicorn.\n"
@@ -8692,6 +8692,44 @@ async def prune_checkpoints():
 
 
 _ENTERPRISE_ARTIFACT_SHA256_HEADER = "X-Hermes-Artifact-Sha256"
+_ENTERPRISE_INSTALL_AUTHORIZATION_HEADER = "X-Hermes-Install-Authorization-Hash"
+_ENTERPRISE_CLIENT_OPERATION_HEADER = "X-Hermes-Client-Operation-Id"
+_ENTERPRISE_OPERATION_EXPIRY_HEADER = "X-Hermes-Operation-Expires-At"
+_ENTERPRISE_DESKTOP_USER_HEADER = "X-Hermes-Desktop-User-Id"
+_ENTERPRISE_TENANT_HEADER = "X-Hermes-Tenant-Id"
+_ENTERPRISE_MATERIALIZATION_BINDING_SCHEMA_HEADER = "X-Hermes-Materialization-Binding-Schema-Version"
+_ENTERPRISE_MATERIALIZED_CONTENT_HASH_HEADER = "X-Hermes-Materialized-Content-Hash"
+_ENTERPRISE_MATERIALIZATION_RECOVERY_EXPIRY_HEADER = "X-Hermes-Materialization-Recovery-Expires-At"
+
+
+class EnterpriseInstallOperationRequest(BaseModel):
+    clientOperationId: str
+    key: str
+    revision: StrictInt
+    artifactSha256: str
+    installAuthorizationHash: str
+    desktopUserId: str
+    tenantId: Optional[str] = None
+    materializationBindingSchemaVersion: StrictInt
+    materializedContentHash: str
+    materializationRecoveryExpiresAt: str
+    receipt: Optional[str] = None
+
+
+def _enterprise_operation_kwargs(operation_id: str, request: EnterpriseInstallOperationRequest):
+    return {
+        "operation_id": operation_id,
+        "client_operation_id": request.clientOperationId,
+        "key": request.key,
+        "revision": request.revision,
+        "artifact_sha256": request.artifactSha256,
+        "install_authorization_hash": request.installAuthorizationHash,
+        "desktop_user_id": request.desktopUserId,
+        "tenant_id": request.tenantId,
+        "materialization_binding_schema_version": request.materializationBindingSchemaVersion,
+        "materialized_content_hash": request.materializedContentHash,
+        "materialization_recovery_expires_at": request.materializationRecoveryExpiresAt,
+    }
 
 
 def _enterprise_install_error_response(exc):
@@ -8752,6 +8790,15 @@ async def install_enterprise_skill(
     revision: str = "",
 ):
     """Install a gateway-downloaded raw ZIP without gateway credentials."""
+
+    if is_enterprise_managed():
+        return JSONResponse(
+            status_code=410,
+            content={
+                "code": "install_operation_required",
+                "message": "Managed enterprise skill installation requires a Gateway install operation.",
+            },
+        )
 
     from tools.enterprise_skills import (
         MAX_ARTIFACT_BYTES,
@@ -8833,6 +8880,179 @@ async def install_enterprise_skill(
             key=metadata.key,
             revision=metadata.revision,
             artifact_sha256=metadata.artifact_sha256,
+        )
+    except Exception as exc:
+        return _enterprise_install_error_response(exc)
+
+
+@app.post("/api/skills/enterprise/install-operations/{operation_id}/stage")
+async def stage_enterprise_skill_install_operation(
+    request: Request,
+    operation_id: str,
+    key: str = "",
+    revision: str = "",
+):
+    """Validate and persist a package without exposing it to the skill loader."""
+
+    from tools.enterprise_skills import (
+        MAX_ARTIFACT_BYTES,
+        EnterpriseSkillInstallError,
+        stage_enterprise_skill_operation,
+        validate_install_operation_binding,
+    )
+
+    client_operation_id = request.headers.get(_ENTERPRISE_CLIENT_OPERATION_HEADER, "")
+    artifact_sha256 = request.headers.get(_ENTERPRISE_ARTIFACT_SHA256_HEADER, "")
+    install_authorization_hash = request.headers.get(_ENTERPRISE_INSTALL_AUTHORIZATION_HEADER, "")
+    desktop_user_id = request.headers.get(_ENTERPRISE_DESKTOP_USER_HEADER, "")
+    tenant_id = request.headers.get(_ENTERPRISE_TENANT_HEADER) or None
+    materialization_binding_schema_version = request.headers.get(_ENTERPRISE_MATERIALIZATION_BINDING_SCHEMA_HEADER, "")
+    materialized_content_hash = request.headers.get(_ENTERPRISE_MATERIALIZED_CONTENT_HASH_HEADER, "")
+    materialization_recovery_expires_at = request.headers.get(_ENTERPRISE_MATERIALIZATION_RECOVERY_EXPIRY_HEADER, "")
+    expires_at = request.headers.get(_ENTERPRISE_OPERATION_EXPIRY_HEADER, "")
+    try:
+        normalized_revision = int(revision) if re.fullmatch(r"[1-9][0-9]*", revision) else revision
+        binding = validate_install_operation_binding(
+            operation_id,
+            client_operation_id=client_operation_id,
+            key=key,
+            revision=normalized_revision,
+            artifact_sha256=artifact_sha256,
+            install_authorization_hash=install_authorization_hash,
+            desktop_user_id=desktop_user_id,
+            tenant_id=tenant_id,
+            materialization_binding_schema_version=int(materialization_binding_schema_version) if materialization_binding_schema_version.isdigit() else materialization_binding_schema_version,
+            materialized_content_hash=materialized_content_hash,
+            materialization_recovery_expires_at=materialization_recovery_expires_at,
+        )
+    except EnterpriseSkillInstallError as exc:
+        return _enterprise_install_error_response(exc)
+
+    try:
+        _require_enterprise_surface(
+            "skills",
+            action=f"/api/skills/enterprise/install-operations/{operation_id}/stage",
+            capability="skills.manage",
+        )
+        _require_enterprise_skill(binding.metadata.key, f"/api/skills/enterprise/install-operations/{operation_id}/stage")
+    except HTTPException as exc:
+        return JSONResponse(
+            status_code=403,
+            content={"code": "skill_policy_denied", "message": str(exc.detail)},
+        )
+
+    content_type = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+    raw_length = request.headers.get("content-length")
+    try:
+        content_length = int(raw_length) if raw_length is not None else -1
+    except ValueError:
+        content_length = -1
+    if content_type != "application/zip" or content_length < 1:
+        return JSONResponse(
+            status_code=400,
+            content={"code": "invalid_package", "message": "A ZIP body with positive Content-Length is required."},
+        )
+    if content_length > MAX_ARTIFACT_BYTES:
+        return JSONResponse(
+            status_code=413,
+            content={"code": "artifact_too_large", "message": "Artifact exceeds the configured size limit."},
+        )
+    body = bytearray()
+    try:
+        async for chunk in request.stream():
+            body.extend(chunk)
+            if len(body) > MAX_ARTIFACT_BYTES:
+                return JSONResponse(
+                    status_code=413,
+                    content={"code": "artifact_too_large", "message": "Artifact exceeds the configured size limit."},
+                )
+    except Exception:
+        return JSONResponse(
+            status_code=400,
+            content={"code": "invalid_package", "message": "Artifact body could not be read."},
+        )
+    if len(body) != content_length:
+        return JSONResponse(
+            status_code=400,
+            content={"code": "invalid_package", "message": "Content-Length does not match the artifact body."},
+        )
+    try:
+        normalized_revision = int(revision) if re.fullmatch(r"[1-9][0-9]*", revision) else revision
+        return await asyncio.to_thread(
+            stage_enterprise_skill_operation,
+            bytes(body),
+            operation_id=binding.operation_id,
+            client_operation_id=binding.client_operation_id,
+            key=binding.metadata.key,
+            revision=binding.metadata.revision,
+            artifact_sha256=binding.metadata.artifact_sha256,
+            install_authorization_hash=binding.install_authorization_hash,
+            desktop_user_id=binding.desktop_user_id,
+            tenant_id=binding.tenant_id,
+            materialization_binding_schema_version=binding.materialization_binding_schema_version,
+            materialized_content_hash=binding.materialized_content_hash,
+            materialization_recovery_expires_at=binding.materialization_recovery_expires_at,
+            expires_at=expires_at,
+        )
+    except Exception as exc:
+        return _enterprise_install_error_response(exc)
+
+
+@app.get("/api/skills/enterprise/install-operations/{operation_id}")
+async def get_enterprise_skill_install_operation(
+    request: Request,
+    operation_id: str,
+    key: str = "",
+    revision: str = "",
+    artifactSha256: str = "",
+):
+    from tools.enterprise_skills import get_enterprise_skill_operation
+    try:
+        normalized_revision = int(revision) if re.fullmatch(r"[1-9][0-9]*", revision) else revision
+        return await asyncio.to_thread(
+            get_enterprise_skill_operation,
+            operation_id=operation_id,
+            client_operation_id=request.headers.get(_ENTERPRISE_CLIENT_OPERATION_HEADER, ""),
+            key=key,
+            revision=normalized_revision,
+            artifact_sha256=artifactSha256,
+            install_authorization_hash=request.headers.get(_ENTERPRISE_INSTALL_AUTHORIZATION_HEADER, ""),
+            desktop_user_id=request.headers.get(_ENTERPRISE_DESKTOP_USER_HEADER, ""),
+            tenant_id=request.headers.get(_ENTERPRISE_TENANT_HEADER) or None,
+            materialization_binding_schema_version=int(request.headers.get(_ENTERPRISE_MATERIALIZATION_BINDING_SCHEMA_HEADER, "")) if request.headers.get(_ENTERPRISE_MATERIALIZATION_BINDING_SCHEMA_HEADER, "").isdigit() else request.headers.get(_ENTERPRISE_MATERIALIZATION_BINDING_SCHEMA_HEADER, ""),
+            materialized_content_hash=request.headers.get(_ENTERPRISE_MATERIALIZED_CONTENT_HASH_HEADER, ""),
+            materialization_recovery_expires_at=request.headers.get(_ENTERPRISE_MATERIALIZATION_RECOVERY_EXPIRY_HEADER, ""),
+        )
+    except Exception as exc:
+        return _enterprise_install_error_response(exc)
+
+
+@app.post("/api/skills/enterprise/install-operations/{operation_id}/materialize")
+async def materialize_enterprise_skill_install_operation(
+    operation_id: str,
+    request: EnterpriseInstallOperationRequest,
+):
+    from tools.enterprise_skills import materialize_enterprise_skill_operation
+    try:
+        return await asyncio.to_thread(
+            materialize_enterprise_skill_operation,
+            **_enterprise_operation_kwargs(operation_id, request),
+            receipt=request.receipt or "",
+        )
+    except Exception as exc:
+        return _enterprise_install_error_response(exc)
+
+
+@app.post("/api/skills/enterprise/install-operations/{operation_id}/abort")
+async def abort_enterprise_skill_install_operation(
+    operation_id: str,
+    request: EnterpriseInstallOperationRequest,
+):
+    from tools.enterprise_skills import abort_enterprise_skill_operation
+    try:
+        return await asyncio.to_thread(
+            abort_enterprise_skill_operation,
+            **_enterprise_operation_kwargs(operation_id, request),
         )
     except Exception as exc:
         return _enterprise_install_error_response(exc)
