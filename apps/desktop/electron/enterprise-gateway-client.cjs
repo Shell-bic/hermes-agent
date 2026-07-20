@@ -38,6 +38,9 @@ function pickDesktopToken(payload) {
   return String(payload.desktopToken || payload.accessToken || payload.sessionToken || payload.token || '').trim()
 }
 
+const DESKTOP_BOOTSTRAP_CONTRACT_HEADER = 'X-Hermes-Desktop-Bootstrap-Contract'
+const DESKTOP_BOOTSTRAP_CONTRACT_VERSION = 2
+
 function normalizeLoginResponse(payload) {
   const desktopToken = pickDesktopToken(payload)
 
@@ -94,7 +97,7 @@ class EnterpriseGatewayClient {
     this.timeoutMs = Math.max(100, Number(timeoutMs) || 10000)
   }
 
-  async requestJson(path, { method = 'GET', body, signal, token } = {}) {
+  async requestJson(path, { method = 'GET', body, headers: requestHeaders = {}, signal, token } = {}) {
     if (typeof this.fetchImpl !== 'function') {
       throw new Error('Enterprise gateway client requires fetch.')
     }
@@ -103,7 +106,7 @@ class EnterpriseGatewayClient {
       throw new EnterpriseGatewayError('Enterprise gateway request was canceled.', { code: 'request-canceled' })
     }
     const url = `${this.baseUrl}${String(path || '').startsWith('/') ? path : '/' + path}`
-    const headers = { Accept: 'application/json' }
+    const headers = { Accept: 'application/json', ...requestHeaders }
 
     if (body !== undefined) {
       headers['Content-Type'] = 'application/json'
@@ -366,7 +369,10 @@ class EnterpriseGatewayClient {
   }
 
   bootstrap(token) {
-    return this.requestJson('/api/desktop/bootstrap', { token })
+    return this.requestJson('/api/desktop/bootstrap', {
+      headers: { [DESKTOP_BOOTSTRAP_CONTRACT_HEADER]: String(DESKTOP_BOOTSTRAP_CONTRACT_VERSION) },
+      token
+    })
   }
 
   modelProfiles(token) {
@@ -458,6 +464,8 @@ function createEnterpriseGatewayClient(options) {
 }
 
 module.exports = {
+  DESKTOP_BOOTSTRAP_CONTRACT_HEADER,
+  DESKTOP_BOOTSTRAP_CONTRACT_VERSION,
   ENTERPRISE_LOGIN_METHODS,
   EnterpriseGatewayError,
   EnterpriseGatewayClient,

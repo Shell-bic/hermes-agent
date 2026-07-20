@@ -19,6 +19,7 @@ function validBootstrap(overrides = {}) {
   const policyHash = overrides.policyHash || 'policy-hash'
   const policyVersion = overrides.policyVersion || 'role-policy.v1'
   return {
+    bootstrapContractVersion: 2,
     capabilities: ['skills.manage'],
     generatedAt,
     lockedSurfaces: ['skills'],

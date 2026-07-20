@@ -23,6 +23,7 @@ function validBootstrap(overrides = {}) {
   const snapshotOverrides = overrides.toolPolicySnapshot || {}
 
   return {
+    bootstrapContractVersion: 2,
     capabilities: ['skills.manage'],
     generatedAt,
     lockedSurfaces: ['skills'],

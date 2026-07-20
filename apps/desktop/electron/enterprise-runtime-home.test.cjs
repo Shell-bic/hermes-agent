@@ -156,6 +156,7 @@ function bootstrapPolicy(overrides = {}) {
   const nestedPolicyVersion = overrides.toolPolicySnapshot?.policyVersion || `tool-policy.v1+roles:${policyVersion}`
 
   return {
+    bootstrapContractVersion: 2,
     capabilities: ['skills.manage'],
     generatedAt,
     lockedSurfaces: ['skills'],
@@ -189,6 +190,30 @@ test('managed bootstrap validator accepts the Gateway dual-version contract and 
       return true
     }
   )
+})
+
+test('managed bootstrap validator classifies old future and malformed contract versions before policy validation', () => {
+  const valid = bootstrapPolicy()
+  const cases = [
+    [undefined, 'enterprise_gateway_contract_too_old'],
+    [1, 'enterprise_gateway_contract_too_old'],
+    [3, 'enterprise_desktop_contract_too_old'],
+    [null, 'enterprise_gateway_contract_invalid'],
+    ['2', 'enterprise_gateway_contract_invalid'],
+    [2.5, 'enterprise_gateway_contract_invalid'],
+    [0, 'enterprise_gateway_contract_invalid']
+  ]
+
+  for (const [bootstrapContractVersion, code] of cases) {
+    const payload = { ...valid, bootstrapContractVersion, capabilities: null }
+    if (bootstrapContractVersion === undefined) delete payload.bootstrapContractVersion
+    assert.throws(() => validateManagedBootstrap(payload), error => {
+      assert.equal(error.code, code)
+      assert.equal(error.message.includes(String(bootstrapContractVersion)), false)
+      assert.equal(error.message.includes('skills.manage'), false)
+      return true
+    })
+  }
 })
 
 test('managed runtime home writes company-gateway config and token env only in private outputs', () => {

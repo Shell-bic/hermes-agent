@@ -661,6 +661,19 @@ function isValidManagedPolicySnapshot(policy, { bootstrapContract = false } = {}
 }
 
 function validateManagedBootstrap(bootstrap) {
+  const contractVersion = bootstrap?.bootstrapContractVersion
+  if (contractVersion !== 2) {
+    const error = new Error('Enterprise Gateway bootstrap contract is not compatible with this Desktop version.')
+    if (contractVersion === undefined || contractVersion === 1) {
+      error.code = 'enterprise_gateway_contract_too_old'
+    } else if (Number.isSafeInteger(contractVersion) && contractVersion > 2) {
+      error.code = 'enterprise_desktop_contract_too_old'
+    } else {
+      error.code = 'enterprise_gateway_contract_invalid'
+    }
+    throw error
+  }
+
   if (!isValidManagedPolicySnapshot(bootstrap, { bootstrapContract: true })) {
     const error = new Error('Enterprise policy bootstrap payload is invalid.')
     error.code = 'enterprise_policy_payload_invalid'

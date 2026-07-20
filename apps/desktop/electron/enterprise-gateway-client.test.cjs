@@ -2,6 +2,8 @@ const test = require('node:test')
 const assert = require('node:assert/strict')
 
 const {
+  DESKTOP_BOOTSTRAP_CONTRACT_HEADER,
+  DESKTOP_BOOTSTRAP_CONTRACT_VERSION,
   EnterpriseGatewayError,
   createEnterpriseGatewayClient,
   normalizeEnterpriseGatewayBaseUrl,
@@ -109,6 +111,25 @@ test('Gateway ProblemDetails preserves stable code detail and HTTP status', asyn
       return true
     }
   )
+})
+
+test('only bootstrap sends the Desktop bootstrap contract header', async () => {
+  const calls = []
+  const client = createEnterpriseGatewayClient({
+    baseUrl: 'https://gateway.example.com',
+    fetchImpl: async (url, options) => {
+      calls.push({ options, url: String(url) })
+      return jsonResponse({ bootstrapContractVersion: 2, methods: [] })
+    }
+  })
+
+  await client.bootstrap('dsk_secret')
+  await client.loginMethods()
+  await client.modelProfiles('dsk_secret')
+
+  assert.equal(calls[0].options.headers[DESKTOP_BOOTSTRAP_CONTRACT_HEADER], String(DESKTOP_BOOTSTRAP_CONTRACT_VERSION))
+  assert.equal(Object.hasOwn(calls[1].options.headers, DESKTOP_BOOTSTRAP_CONTRACT_HEADER), false)
+  assert.equal(Object.hasOwn(calls[2].options.headers, DESKTOP_BOOTSTRAP_CONTRACT_HEADER), false)
 })
 
 test('Gateway request timeout aborts and returns a stable non-enumerating code', async () => {
