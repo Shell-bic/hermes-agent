@@ -92,6 +92,16 @@ def managed_tool_policy(tmp_path, monkeypatch):
                 "allowedModels": ["allowed/model"],
                 "currentModel": "allowed/model",
                 "defaultModel": "allowed/model",
+                "role": [
+                    {
+                        "name": "operations-admin",
+                        "capabilities": [
+                            "skills.manage",
+                            "toolsets.manage",
+                            "mcp.manage",
+                        ],
+                    }
+                ],
                 "toolPolicySnapshot": {
                     "policyVersion": "u2-test",
                     "policyHash": "hash-u2-test",
@@ -114,11 +124,6 @@ def managed_tool_policy(tmp_path, monkeypatch):
                         {"key": "restricted-mcp", "status": "restricted"},
                         {"key": "blocked-mcp", "status": "blocked"},
                     ],
-                    "capabilityFlags": {
-                        "skills.manage": True,
-                        "toolsets.manage": True,
-                        "mcp.manage": True,
-                    },
                 },
             }
         ),
@@ -138,6 +143,16 @@ def managed_tool_policy_gateway_capability_entries(tmp_path, monkeypatch):
                 "allowedModels": ["allowed/model"],
                 "currentModel": "allowed/model",
                 "defaultModel": "allowed/model",
+                "role": [
+                    {
+                        "name": "operations-admin",
+                        "capabilities": [
+                            "skills.manage",
+                            "toolsets.manage",
+                            "mcp.manage",
+                        ],
+                    }
+                ],
                 "toolPolicySnapshot": {
                     "policyVersion": "u2-test",
                     "skills": [
@@ -219,13 +234,14 @@ def managed_tool_policy_blocked_skill_capability(tmp_path, monkeypatch):
                 "allowedModels": ["allowed/model"],
                 "currentModel": "allowed/model",
                 "defaultModel": "allowed/model",
+                "role": [{"name": "employee", "capabilities": []}],
                 "toolPolicySnapshot": {
                     "policyVersion": "u2-test",
                     "skills": [
                         {"key": "enterprise-skill", "status": "recommended"},
                     ],
                     "capabilityFlags": [
-                        {"key": "skills.manage", "status": "blocked"},
+                        {"key": "skills.manage", "status": "available"},
                     ],
                 },
             }
@@ -269,12 +285,14 @@ def test_tool_policy_parser_reads_snapshot_and_status(managed_tool_policy):
         is_skill_allowed,
         is_tool_allowed,
         is_toolset_allowed,
+        role_management_capability_enabled,
         tool_policy_snapshot,
     )
 
     snapshot = tool_policy_snapshot()
     assert snapshot["policyVersion"] == "u2-test"
-    assert capability_enabled("skills.manage") is True
+    assert role_management_capability_enabled("skills.manage") is True
+    assert capability_enabled("skills.manage") is False
     assert is_skill_allowed("enterprise-skill") is True
     assert is_skill_allowed("restricted-skill") is False
     assert is_toolset_allowed("tts") is False
@@ -283,10 +301,13 @@ def test_tool_policy_parser_reads_snapshot_and_status(managed_tool_policy):
     assert is_mcp_allowed("blocked-mcp") is False
 
 
-def test_gateway_capability_entries_default_unlisted_capabilities_to_allowed(
+def test_gateway_role_capabilities_grant_management_independently_of_tool_flags(
     client, managed_tool_policy_gateway_capability_entries, monkeypatch
 ):
-    from hermes_cli.enterprise_policy import capability_enabled
+    from hermes_cli.enterprise_policy import (
+        capability_enabled,
+        role_management_capability_enabled,
+    )
     import tools.skills_tool as skills_tool
 
     monkeypatch.setattr(
@@ -298,9 +319,10 @@ def test_gateway_capability_entries_default_unlisted_capabilities_to_allowed(
     )
 
     assert capability_enabled("capability.env.secret-access") is False
-    assert capability_enabled("skills.manage") is True
-    assert capability_enabled("toolsets.manage") is True
-    assert capability_enabled("mcp.manage") is True
+    assert capability_enabled("skills.manage") is False
+    assert role_management_capability_enabled("skills.manage") is True
+    assert role_management_capability_enabled("toolsets.manage") is True
+    assert role_management_capability_enabled("mcp.manage") is True
 
     skill_resp = client.put(
         "/api/skills/toggle",
@@ -324,6 +346,76 @@ def test_gateway_runtime_role_capabilities_grant_coarse_skill_surface(
     from hermes_cli.enterprise_policy import require_surface_allowed
 
     require_surface_allowed("skills", capability="skills.manage")
+
+
+def test_role_management_namespace_is_exact_and_ignores_concrete_resources():
+    from hermes_cli.enterprise_policy import (
+        ROLE_MANAGEMENT_CAPABILITIES,
+        role_management_capability_enabled,
+    )
+
+    expected = {
+        "credentials.manage",
+        "cron.manage",
+        "mcp.manage",
+        "memory.manage",
+        "skills.manage",
+        "toolsets.manage",
+        "webhooks.manage",
+    }
+    policy = {
+        "role": [
+            {
+                "name": "admin",
+                "capabilities": sorted(
+                    expected
+                    | {
+                        "capability.file.write",
+                        "skill.expense-review",
+                        "tool.terminal.exec",
+                        "toolset.browser",
+                        "mcp.filesystem",
+                    }
+                ),
+            }
+        ]
+    }
+
+    assert set(ROLE_MANAGEMENT_CAPABILITIES) == expected
+    assert all(role_management_capability_enabled(item, policy) for item in expected)
+    for item in (
+        "capability.file.write",
+        "skill.expense-review",
+        "tool.terminal.exec",
+        "toolset.browser",
+        "mcp.filesystem",
+        "skills:manage",
+        "skills_manage",
+        "skills.submit",
+    ):
+        assert role_management_capability_enabled(item, policy) is False
+
+
+def test_unknown_management_capability_cannot_bypass_exact_role_catalog(monkeypatch):
+    from hermes_cli.enterprise_policy import EnterprisePolicyDenied, require_surface_allowed
+
+    policy = {
+        "role": [
+            {
+                "name": "legacy-role",
+                "capabilities": ["custom.manage"],
+            }
+        ]
+    }
+    monkeypatch.setenv("HERMES_ENTERPRISE_MANAGED", "1")
+    monkeypatch.setenv("HERMES_ENTERPRISE_TOOL_POLICY_JSON", json.dumps(policy))
+    monkeypatch.delenv("HERMES_ENTERPRISE_TOOL_POLICY_FILE", raising=False)
+
+    with pytest.raises(
+        EnterprisePolicyDenied,
+        match="capability 'custom.manage' is not granted",
+    ):
+        require_surface_allowed("custom", capability="custom.manage")
 
 
 def test_gateway_runtime_role_capabilities_are_union_across_roles(
@@ -350,29 +442,32 @@ def test_gateway_runtime_role_capabilities_deny_ungranted_coarse_skill_surface(
     policy["role"][0]["capabilities"] = ["chat.completions", "messages"]
     managed_gateway_runtime_policy.write_text(json.dumps(policy), encoding="utf-8")
 
-    with pytest.raises(EnterprisePolicyDenied, match="capability 'skills.manage' is disabled"):
+    with pytest.raises(EnterprisePolicyDenied, match="capability 'skills.manage' is not granted"):
         require_surface_allowed("skills", capability="skills.manage")
 
 
-def test_legacy_top_level_capability_explicit_value_precedes_runtime_roles(
+def test_top_level_model_capabilities_do_not_override_runtime_role_grant(
     managed_gateway_runtime_policy,
 ):
-    from hermes_cli.enterprise_policy import EnterprisePolicyDenied, require_surface_allowed
+    from hermes_cli.enterprise_policy import require_surface_allowed
 
     policy = json.loads(managed_gateway_runtime_policy.read_text(encoding="utf-8"))
     policy["capabilities"]["skills.manage"] = False
     managed_gateway_runtime_policy.write_text(json.dumps(policy), encoding="utf-8")
 
-    with pytest.raises(EnterprisePolicyDenied, match="capability 'skills.manage' is disabled"):
-        require_surface_allowed("skills", capability="skills.manage")
+    require_surface_allowed("skills", capability="skills.manage")
 
 
-def test_gateway_capability_entries_block_listed_skill_manage(
+def test_tool_policy_management_shaped_flag_does_not_grant_skill_manage(
     client, managed_tool_policy_blocked_skill_capability
 ):
-    from hermes_cli.enterprise_policy import capability_enabled
+    from hermes_cli.enterprise_policy import (
+        capability_enabled,
+        role_management_capability_enabled,
+    )
 
     assert capability_enabled("skills.manage") is False
+    assert role_management_capability_enabled("skills.manage") is False
 
     resp = client.put(
         "/api/skills/toggle",
@@ -380,7 +475,77 @@ def test_gateway_capability_entries_block_listed_skill_manage(
     )
 
     assert resp.status_code == 403
-    assert "capability 'skills.manage' is disabled" in _detail(resp)
+    assert "capability 'skills.manage' is not granted" in _detail(resp)
+
+
+@pytest.mark.parametrize(
+    ("role_granted", "management_shaped_flag", "expected_allowed"),
+    [
+        (True, True, True),
+        (True, False, True),
+        (False, True, False),
+        (False, False, False),
+    ],
+)
+def test_management_shaped_tool_policy_flag_cannot_grant_or_deny_role_capability(
+    role_granted,
+    management_shaped_flag,
+    expected_allowed,
+):
+    from hermes_cli.enterprise_policy import role_management_capability_enabled
+
+    policy = {
+        "role": [
+            {
+                "name": "skill-admin",
+                "capabilities": ["skills.manage"] if role_granted else [],
+            }
+        ],
+        "toolPolicySnapshot": {
+            "capabilityFlags": {"skills.manage": management_shaped_flag},
+        },
+    }
+
+    assert role_management_capability_enabled("skills.manage", policy) is expected_allowed
+
+
+@pytest.mark.parametrize("role_flag", [True, False])
+def test_role_capability_shaped_entry_cannot_grant_or_deny_tool_policy_capability(
+    role_flag,
+    monkeypatch,
+):
+    from hermes_cli.enterprise_policy import (
+        EnterprisePolicyDenied,
+        capability_enabled,
+        require_surface_allowed,
+    )
+
+    policy = {
+        "role": [
+            {
+                "name": "runtime-role",
+                "capabilities": {"capability.file.write": role_flag},
+            }
+        ],
+        "toolPolicySnapshot": {"capabilityFlags": {}},
+    }
+
+    assert capability_enabled("capability.file.write", policy) is False
+
+    # Exercise the generic surface guard with the same policy through the real
+    # managed policy loader.  A role-shaped capability.* entry must not be a
+    # second authorization source.
+    monkeypatch.setenv("HERMES_ENTERPRISE_MANAGED", "1")
+    monkeypatch.setenv("HERMES_ENTERPRISE_TOOL_POLICY_JSON", json.dumps(policy))
+    monkeypatch.delenv("HERMES_ENTERPRISE_TOOL_POLICY_FILE", raising=False)
+    with pytest.raises(
+        EnterprisePolicyDenied,
+        match="capability 'capability.file.write' is disabled",
+    ):
+        require_surface_allowed(
+            "file.write",
+            capability="capability.file.write",
+        )
 
 
 def test_policy_version_alone_does_not_create_tool_policy_snapshot(
@@ -592,7 +757,7 @@ def test_legacy_policy_with_policy_version_still_rejects_disabled_skill_capabili
     )
 
     assert resp.status_code == 403
-    assert "capability 'skills.manage' is disabled" in _detail(resp)
+    assert "capability 'skills.manage' is not granted" in _detail(resp)
 
 
 def test_managed_skills_list_marks_policy_status(client, managed_tool_policy, monkeypatch):

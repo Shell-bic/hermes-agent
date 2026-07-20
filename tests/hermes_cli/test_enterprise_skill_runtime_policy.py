@@ -20,10 +20,15 @@ def _write_policy(home: Path, monkeypatch, skills: list[dict], *, manage: bool =
     policy_path.write_text(
         json.dumps(
             {
+                "role": [
+                    {
+                        "name": "skill-admin",
+                        "capabilities": ["skills.manage"] if manage else [],
+                    }
+                ],
                 "toolPolicySnapshot": {
                     "policyHash": "runtime-policy-test",
                     "skills": skills,
-                    "capabilityFlags": {"skills.manage": manage},
                 }
             }
         ),

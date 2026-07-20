@@ -32,7 +32,11 @@ def _install_policy(monkeypatch, snapshot: dict | None, *, extra: dict | None = 
 def _install_registry(monkeypatch, entries: dict[str, str]) -> None:
     definitions = [_schema(name) for name in entries]
     entry_map = {
-        name: SimpleNamespace(name=name, toolset=toolset)
+        name: SimpleNamespace(
+            name=name,
+            toolset=toolset,
+            schema=_schema(name)["function"],
+        )
         for name, toolset in entries.items()
     }
     monkeypatch.setattr(
@@ -106,6 +110,7 @@ def test_allowed_statuses_keep_high_risk_tools_visible(monkeypatch, status):
         {
             "policyHash": f"hash-{status}",
             "tools": [{"key": "terminal", "status": status}],
+            "capabilityFlags": {"capability.terminal.shell": True},
         },
     )
 
@@ -159,6 +164,7 @@ def test_terminal_exec_gateway_alias_allows_terminal_family(monkeypatch):
         {
             "policyHash": "hash-terminal-alias",
             "tools": [{"key": "tool.terminal.exec", "status": "defaultEnabled"}],
+            "capabilityFlags": {"capability.terminal.shell": True},
         },
     )
 
@@ -219,7 +225,9 @@ def test_mcp_server_matches_toolset_without_mcp_prefix(monkeypatch):
         {
             "policyHash": "hash-mcp-allowed",
             "mcpServers": [{"key": "allowed", "status": "available"}],
+            "capabilityFlags": {"capability.mcp.install": True},
         },
+        extra={"role": [{"name": "mcp-admin", "capabilities": ["mcp.manage"]}]},
     )
 
     assert "mcp_allowed_search" in _tool_names()
@@ -257,12 +265,15 @@ def test_capability_flags_hide_runtime_tools(monkeypatch, tool_name, toolset, ca
         snapshot["mcpServers"] = [{"key": toolset[4:], "status": "available"}]
     else:
         snapshot["tools"] = [{"key": tool_name, "status": "available"}]
-    _install_policy(monkeypatch, snapshot)
+    extra = None
+    if toolset.startswith("mcp-"):
+        extra = {"role": [{"name": "mcp-admin", "capabilities": ["mcp.manage"]}]}
+    _install_policy(monkeypatch, snapshot, extra=extra)
 
     assert tool_name not in _tool_names()
 
 
-def test_old_manifest_without_tool_policy_snapshot_keeps_behavior(monkeypatch):
+def test_managed_high_risk_tool_without_tool_policy_snapshot_fails_closed(monkeypatch):
     _install_registry(monkeypatch, {"terminal": "terminal"})
     _install_policy(
         monkeypatch,
@@ -270,7 +281,170 @@ def test_old_manifest_without_tool_policy_snapshot_keeps_behavior(monkeypatch):
         extra={"policyVersion": "legacy-u2", "lockedSurfaces": ["mcp"]},
     )
 
+    assert "terminal" not in _tool_names()
+
+
+@pytest.mark.parametrize(
+    ("role_granted", "tool_flag_enabled", "expected_allowed"),
+    [
+        (True, True, True),
+        (True, False, False),
+        (False, True, False),
+        (False, False, False),
+    ],
+)
+def test_mcp_role_and_tool_policy_quadrants_keep_schema_and_execution_in_sync(
+    monkeypatch,
+    role_granted,
+    tool_flag_enabled,
+    expected_allowed,
+):
+    tool_name = "mcp_filesystem_read"
+    _install_registry(monkeypatch, {tool_name: "mcp-filesystem"})
+    _install_policy(
+        monkeypatch,
+        {
+            "policyHash": f"quadrant-{int(role_granted)}-{int(tool_flag_enabled)}",
+            "mcpServers": [{"key": "filesystem", "status": "available"}],
+            "capabilityFlags": {
+                "capability.mcp.install": tool_flag_enabled,
+            },
+        },
+        extra={
+            "role": [
+                {
+                    "name": "mcp-admin",
+                    "capabilities": ["mcp.manage"] if role_granted else [],
+                }
+            ]
+        },
+    )
+    monkeypatch.setattr(
+        model_tools.registry,
+        "dispatch",
+        lambda *args, **kwargs: json.dumps({"ok": True, "tool": tool_name}),
+    )
+
+    schema_allowed = tool_name in _tool_names()
+    payload = json.loads(model_tools.handle_function_call(tool_name, {"path": "demo"}))
+    execution_allowed = payload.get("ok") is True
+
+    assert schema_allowed is expected_allowed
+    assert execution_allowed is expected_allowed
+    if not expected_allowed:
+        assert payload["code"] == "enterprise_tool_policy_denied"
+
+
+@pytest.mark.parametrize(
+    ("role_granted", "tool_policy_allowed", "expected_allowed"),
+    [
+        (True, True, True),
+        (True, False, False),
+        (False, True, False),
+        (False, False, False),
+    ],
+)
+@pytest.mark.parametrize(
+    ("policy_collection", "policy_key"),
+    [
+        ("tools", "skill_manage"),
+        ("toolSets", "skills"),
+    ],
+)
+def test_skill_manage_role_and_tool_policy_quadrants_keep_schema_and_execution_in_sync(
+    monkeypatch,
+    role_granted,
+    tool_policy_allowed,
+    expected_allowed,
+    policy_collection,
+    policy_key,
+):
+    tool_name = "skill_manage"
+    _install_registry(monkeypatch, {tool_name: "skills"})
+    _install_policy(
+        monkeypatch,
+        {
+            "policyHash": (
+                f"skill-quadrant-{int(role_granted)}-{int(tool_policy_allowed)}"
+            ),
+            policy_collection: [
+                {
+                    "key": policy_key,
+                    "status": "available" if tool_policy_allowed else "blocked",
+                }
+            ],
+        },
+        extra={
+            "role": [
+                {
+                    "name": "skill-admin",
+                    "capabilities": ["skills.manage"] if role_granted else [],
+                }
+            ]
+        },
+    )
+    monkeypatch.setattr(
+        model_tools.registry,
+        "dispatch",
+        lambda *args, **kwargs: json.dumps({"ok": True, "tool": tool_name}),
+    )
+
+    schema_allowed = tool_name in _tool_names()
+    payload = json.loads(model_tools.handle_function_call(tool_name, {"action": "list"}))
+    execution_allowed = payload.get("ok") is True
+
+    assert schema_allowed is expected_allowed
+    assert execution_allowed is expected_allowed
+    if not expected_allowed:
+        assert payload["code"] == "enterprise_tool_policy_denied"
+
+
+def test_unmanaged_tool_schema_and_direct_execution_are_unchanged(monkeypatch):
+    _install_registry(monkeypatch, {"terminal": "terminal"})
+    monkeypatch.delenv("HERMES_ENTERPRISE_MANAGED", raising=False)
+    monkeypatch.delenv("HERMES_ENTERPRISE_TOOL_POLICY_JSON", raising=False)
+    monkeypatch.delenv("HERMES_ENTERPRISE_TOOL_POLICY_FILE", raising=False)
+    model_tools._clear_tool_defs_cache()
+    monkeypatch.setattr(
+        model_tools.registry,
+        "dispatch",
+        lambda *args, **kwargs: json.dumps({"ok": True}),
+    )
+
     assert "terminal" in _tool_names()
+    assert json.loads(
+        model_tools.handle_function_call("terminal", {"command": "noop"})
+    ) == {"ok": True}
+
+
+def test_role_capability_namespace_cannot_supply_tool_policy_flag(monkeypatch):
+    _install_registry(monkeypatch, {"terminal": "terminal"})
+    _install_policy(
+        monkeypatch,
+        {
+            "policyHash": "role-capability-does-not-cross",
+            "tools": [{"key": "terminal", "status": "available"}],
+            "capabilityFlags": {},
+        },
+        extra={
+            "role": [
+                {
+                    "name": "misconfigured-role",
+                    "capabilities": ["capability.terminal.shell"],
+                }
+            ]
+        },
+    )
+    monkeypatch.setattr(
+        model_tools.registry,
+        "dispatch",
+        lambda *args, **kwargs: pytest.fail("role capability must not dispatch terminal"),
+    )
+
+    assert "terminal" not in _tool_names()
+    payload = json.loads(model_tools.handle_function_call("terminal", {"command": "noop"}))
+    assert payload["code"] == "enterprise_tool_policy_denied"
+    assert payload["reason"] == "enterprise_capability_disabled"
 
 
 def test_quiet_cache_invalidates_when_policy_hash_changes(monkeypatch):
@@ -350,4 +524,4 @@ def test_stale_direct_high_risk_tool_call_returns_policy_error(monkeypatch):
 
     assert payload["code"] == "enterprise_tool_policy_denied"
     assert payload["tool"] == "terminal"
-    assert payload["reason"] == "enterprise_high_risk_tool_not_allowed"
+    assert payload["reason"] == "enterprise_capability_disabled"

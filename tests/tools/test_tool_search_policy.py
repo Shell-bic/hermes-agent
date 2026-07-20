@@ -67,6 +67,9 @@ def policy_tools(monkeypatch, tmp_path):
     policy_path.write_text(
         json.dumps(
             {
+                "role": [
+                    {"name": "mcp-admin", "capabilities": ["mcp.manage"]},
+                ],
                 "toolPolicySnapshot": {
                     "policyVersion": "u3-test",
                     "policyHash": "hash-u3-tool-search-policy",
@@ -82,9 +85,7 @@ def policy_tools(monkeypatch, tmp_path):
                         {"key": "u3-policy-denied", "status": "restricted"},
                     ],
                     "capabilityFlags": {
-                        "mcp.manage": True,
-                        "skills.manage": True,
-                        "toolsets.manage": True,
+                        "capability.mcp.install": True,
                     },
                 },
             }
@@ -268,13 +269,16 @@ def test_mcp_dot_filesystem_restriction_blocks_runtime_mcp_filesystem_aliases(
     policy_path.write_text(
         json.dumps(
             {
+                "role": [
+                    {"name": "mcp-admin", "capabilities": ["mcp.manage"]},
+                ],
                 "toolPolicySnapshot": {
                     "policyVersion": "u3-mapping-test",
                     "policyHash": "hash-u3-mcp-filesystem",
                     "mcpServers": [
                         {"key": "mcp.filesystem", "status": "restricted"},
                     ],
-                    "capabilityFlags": {"mcp.manage": True},
+                    "capabilityFlags": {"capability.mcp.install": True},
                 },
             }
         ),

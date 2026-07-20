@@ -51,7 +51,7 @@ _MODEL_CONFIG_KEYS = {
     "delegation",
 }
 
-_DEFAULT_DENY_CAPABILITIES = {
+ROLE_MANAGEMENT_CAPABILITIES = frozenset({
     "credentials.manage",
     "cron.manage",
     "mcp.manage",
@@ -59,7 +59,9 @@ _DEFAULT_DENY_CAPABILITIES = {
     "skills.manage",
     "toolsets.manage",
     "webhooks.manage",
-}
+})
+
+_DEFAULT_DENY_CAPABILITIES = ROLE_MANAGEMENT_CAPABILITIES
 
 _TOOL_POLICY_COLLECTION_KEYS = {
     "skills": ("skills",),
@@ -581,13 +583,21 @@ def _runtime_tool_capabilities(tool_name: str, toolset: str) -> list[str]:
     tool_name = _text(tool_name)
     toolset = _text(toolset)
     if _is_mcp_runtime_tool(tool_name, toolset):
-        return ["capability.mcp.install", "mcp.manage"]
+        return ["capability.mcp.install"]
     if tool_name in {"terminal", "process", "execute_code"} or toolset == "terminal":
         return ["capability.terminal.shell"]
     if tool_name in {"write_file", "patch"}:
         return ["capability.file.write"]
     if tool_name.startswith("browser_") or toolset in {"browser", "browser-cdp"}:
         return ["capability.browser.automation"]
+    return []
+
+
+def _runtime_tool_role_capabilities(tool_name: str, toolset: str) -> list[str]:
+    tool_name = _text(tool_name)
+    toolset = _text(toolset)
+    if _is_mcp_runtime_tool(tool_name, toolset):
+        return ["mcp.manage"]
     if tool_name == "skill_manage":
         return ["skills.manage"]
     return []
@@ -601,21 +611,32 @@ def runtime_tool_schema_decision(
 ) -> dict[str, Any]:
     """Return whether a runtime tool may appear in callable schemas.
 
-    U3 schema enforcement only activates for enterprise managed mode with a
-    real ``toolPolicySnapshot``. Older manifests that only contain
-    ``policyVersion`` keep their U2 behavior.
+    Management grants and runtime capabilities are intentionally separate:
+    ``*.manage`` comes only from role capabilities, while ``capability.*``
+    comes only from the Tool Policy snapshot.  Direct execution reuses this
+    decision so the callable schema and dispatch boundary cannot drift.
     """
     if not is_enterprise_managed():
         return {"allowed": True, "reason": "not_enterprise_managed"}
 
     policy = policy or load_enterprise_policy()
     snapshot = tool_policy_snapshot(policy)
-    if not snapshot:
-        return {"allowed": True, "reason": "no_tool_policy_snapshot"}
-
     tool_name = _text(tool_name)
     toolset = _text(toolset)
     policy_hash = _policy_hash(snapshot)
+
+    for capability in _runtime_tool_role_capabilities(tool_name, toolset):
+        if not role_management_capability_enabled(capability, policy):
+            return {
+                "allowed": False,
+                "collection": "roleCapabilities",
+                "key": capability,
+                "policyHash": policy_hash,
+                "reason": "enterprise_role_capability_not_granted",
+                "status": "blocked",
+                "tool": tool_name,
+                "toolset": toolset,
+            }
 
     def _collect(candidates: list[tuple[str, str]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         denied_items: list[dict[str, Any]] = []
@@ -665,7 +686,7 @@ def runtime_tool_schema_decision(
         }
 
     for capability in _runtime_tool_capabilities(tool_name, toolset):
-        if not capability_enabled(capability, policy, default=True):
+        if not capability_enabled(capability, policy, default=False):
             return {
                 "allowed": False,
                 "collection": "capabilityFlags",
@@ -784,9 +805,12 @@ def capability_enabled(
     name: str,
     policy: Optional[Mapping[str, Any]] = None,
     *,
-    default: bool = True,
+    default: bool = False,
 ) -> bool:
+    """Return a Tool Policy ``capability.*`` flag without role fallback."""
     capability = _text(name)
+    if not capability.lower().startswith("capability."):
+        return False
     policy = policy or load_enterprise_policy()
     snapshot = tool_policy_snapshot(policy)
     flags = snapshot.get("capabilityFlags") or snapshot.get("capability_flags")
@@ -814,8 +838,7 @@ def capability_enabled(
         if raw is not None:
             return _capability_raw_enabled(raw, default)
 
-    legacy = _capability_value(capability, policy)
-    return default if legacy is None else legacy
+    return default
 
 
 def is_skill_allowed(name: str, policy: Optional[Mapping[str, Any]] = None) -> bool:
@@ -1500,6 +1523,52 @@ def _capability_value(name: str, policy: Optional[Mapping[str, Any]] = None) -> 
     return False if saw_role_capabilities else None
 
 
+def role_management_capability_enabled(
+    name: str,
+    policy: Optional[Mapping[str, Any]] = None,
+) -> bool:
+    """Return an exact enterprise role-management grant.
+
+    The Gateway runtime manifest also has a top-level ``capabilities`` object
+    for model features.  It is deliberately ignored here, as are Tool Policy
+    ``capabilityFlags``.  Multiple role records remain additive.
+    """
+    capability = _text(name).lower()
+    if capability not in ROLE_MANAGEMENT_CAPABILITIES:
+        return False
+
+    policy = policy or load_enterprise_policy()
+    raw_roles = _policy_value_any(policy, "role", "roles")
+    if isinstance(raw_roles, dict):
+        roles = [raw_roles]
+    elif isinstance(raw_roles, list):
+        roles = [role for role in raw_roles if isinstance(role, dict)]
+    else:
+        roles = []
+
+    for role in roles:
+        role_capabilities = role.get("capabilities")
+        if isinstance(role_capabilities, list):
+            normalized = {
+                _text(item).lower() for item in role_capabilities if _text(item)
+            }
+            if capability in normalized:
+                return True
+            continue
+        if not isinstance(role_capabilities, dict):
+            continue
+
+        raw = role_capabilities.get(capability)
+        if raw is True:
+            return True
+        if isinstance(raw, dict) and any(
+            raw.get(key) is True for key in ("enabled", "allowed", "allow")
+        ):
+            return True
+
+    return False
+
+
 def denial_message(action: str, reason: str = "") -> str:
     detail = f"Enterprise managed policy denied {action}"
     if reason:
@@ -1533,9 +1602,9 @@ def _require_tool_policy_allowed(
             )
         )
 
-    if not capability_enabled(capability, policy, default=True):
+    if not role_management_capability_enabled(capability, policy):
         raise EnterprisePolicyDenied(
-            denial_message(action, f"capability '{capability}' is disabled")
+            denial_message(action, f"capability '{capability}' is not granted")
         )
 
 
@@ -1590,14 +1659,28 @@ def require_surface_allowed(
 ) -> None:
     if not is_enterprise_managed():
         return
+    policy = load_enterprise_policy()
     surface_norm = _normalize_surface(surface)
     action_label = action or surface_norm
-    if is_surface_locked(surface_norm):
+    if is_surface_locked(surface_norm, policy):
         raise EnterprisePolicyDenied(
             denial_message(action_label, f"surface '{surface_norm}' is locked")
         )
     cap = capability or f"{surface_norm.split('.', 1)[0]}.manage"
-    decision = _capability_value(cap)
+    cap_norm = _text(cap).lower()
+    if cap_norm.endswith(".manage"):
+        if not role_management_capability_enabled(cap_norm, policy):
+            raise EnterprisePolicyDenied(
+                denial_message(action_label, f"capability '{cap}' is not granted")
+            )
+        return
+    if cap_norm.startswith("capability."):
+        if not capability_enabled(cap, policy, default=False):
+            raise EnterprisePolicyDenied(
+                denial_message(action_label, f"capability '{cap}' is disabled")
+            )
+        return
+    decision = _capability_value(cap, policy)
     if decision is False:
         raise EnterprisePolicyDenied(
             denial_message(action_label, f"capability '{cap}' is disabled")
