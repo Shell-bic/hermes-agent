@@ -195,6 +195,39 @@ class TestSkillViewQualifiedName:
         assert result["name"] == "superpowers:writing-plans"
         assert "writing-plans body." in result["content"]
 
+    def test_plugin_linked_file_is_served_without_main_body_or_banner(self, tmp_path):
+        from tools.skills_tool import skill_view
+
+        md = self._register_skill(tmp_path)
+        references = md.parent / "references"
+        references.mkdir()
+        (references / "guide.md").write_text("LINKED-ONLY", encoding="utf-8")
+
+        main = json.loads(skill_view("superpowers:writing-plans", preprocess=False))
+        linked = json.loads(
+            skill_view(
+                "superpowers:writing-plans",
+                file_path="references/guide.md",
+                preprocess=False,
+            )
+        )
+
+        assert main["linked_files"] == {"references": ["references/guide.md"]}
+        assert linked["content"] == "LINKED-ONLY"
+        assert "writing-plans body" not in linked["content"]
+        assert "Bundle context" not in linked["content"]
+
+    @pytest.mark.parametrize("file_path", ["../outside.md", "C:/outside.md", "/outside.md"])
+    def test_plugin_linked_file_rejects_escape(self, tmp_path, file_path):
+        from tools.skills_tool import skill_view
+
+        self._register_skill(tmp_path)
+        result = json.loads(
+            skill_view("superpowers:writing-plans", file_path=file_path)
+        )
+
+        assert result["success"] is False
+
     def test_invalid_namespace_returns_error(self, tmp_path):
         from tools.skills_tool import skill_view
 
@@ -378,6 +411,33 @@ class TestBundleContextBanner:
         result = json.loads(skill_view("myplugin:only-one"))
         assert "Bundle context" in result["content"]
         assert "Sibling skills:" not in result["content"]
+
+    def test_blocked_sibling_is_hidden_from_banner_and_missing_list(
+        self, tmp_path, monkeypatch
+    ):
+        from tools.skills_tool import skill_view
+
+        self._setup_bundle(tmp_path, skills=("foo", "bar"))
+        policy = tmp_path / "enterprise-policy.json"
+        policy.write_text(
+            json.dumps(
+                {
+                    "toolPolicySnapshot": {
+                        "skills": [{"key": "myplugin:bar", "status": "blocked"}]
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_ENTERPRISE_MANAGED", "1")
+        monkeypatch.setenv("HERMES_ENTERPRISE_TOOL_POLICY_FILE", str(policy))
+
+        main = json.loads(skill_view("myplugin:foo", preprocess=False))
+        missing = json.loads(skill_view("myplugin:missing", preprocess=False))
+
+        assert "bar" not in main["content"]
+        assert "myplugin:bar" not in missing["available_skills"]
+        assert "myplugin:foo" in missing["available_skills"]
 
     def test_original_content_preserved(self, tmp_path):
         from tools.skills_tool import skill_view

@@ -204,6 +204,55 @@ class TestSkillsInjection:
             assert "You are a code reviewer" in event.text
             mock_build.assert_called_once()
 
+    @pytest.mark.asyncio
+    async def test_blocked_skill_returns_redacted_403_before_event_or_body_build(self):
+        routes = {
+            "pr-review": {
+                "secret": _INSECURE_NO_AUTH,
+                "events": ["pull_request"],
+                "prompt": "Review this PR: {pull_request.title}",
+                "skills": ["expense-review"],
+            }
+        }
+        adapter = _make_adapter(routes)
+        adapter.handle_message = AsyncMock()
+        denial = json.dumps(
+            {
+                "success": False,
+                "errorCode": "enterprise_skill_policy_denied",
+                "policyKey": "expense-review",
+                "status": "blocked",
+                "error": "Enterprise managed policy denied skill 'expense-review' (blocked).",
+            }
+        )
+
+        with patch(
+            "tools.skills_tool.skill_runtime_preflight", return_value=denial
+        ), patch(
+            "agent.skill_commands.get_skill_commands", return_value={}
+        ), patch(
+            "agent.skill_commands.build_skill_invocation_message"
+        ) as mock_build:
+            app = _create_app(adapter)
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.post(
+                    "/webhooks/pr-review",
+                    json=GITHUB_PR_PAYLOAD,
+                    headers={
+                        "X-GitHub-Event": "pull_request",
+                        "X-GitHub-Delivery": "blocked-skill-001",
+                    },
+                )
+
+                assert resp.status == 403
+                payload = await resp.json()
+
+        assert payload["errorCode"] == "enterprise_skill_policy_denied"
+        assert payload["policyKey"] == "expense-review"
+        assert "Review this PR" not in json.dumps(payload)
+        mock_build.assert_not_called()
+        adapter.handle_message.assert_not_called()
+
 
 # ===================================================================
 # Test 3: Cross-platform delivery (webhook → Telegram)

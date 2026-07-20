@@ -87,6 +87,44 @@ def _patch_aux_client(content: str):
     )
 
 
+def _write_managed_profile_policy(profile_dir: Path, monkeypatch, status: str) -> None:
+    skill_dir = profile_dir / "skills" / "enterprise" / "expense-review"
+    skill_dir.mkdir(parents=True, exist_ok=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\nname: expense-review\ndescription: private\n---\nBODY-SENTINEL\n",
+        encoding="utf-8",
+    )
+    lock_dir = profile_dir / "skills" / ".hub"
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    (lock_dir / "lock.json").write_text(
+        jsonlib.dumps(
+            {
+                "installed": {
+                    "expense-review": {
+                        "source": "enterprise",
+                        "key": "expense-review",
+                        "install_path": "enterprise/expense-review",
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    policy = profile_dir / "enterprise-policy.json"
+    policy.write_text(
+        jsonlib.dumps(
+            {
+                "toolPolicySnapshot": {
+                    "skills": [{"key": "expense-review", "status": status}]
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_ENTERPRISE_MANAGED", "1")
+    monkeypatch.setenv("HERMES_ENTERPRISE_TOOL_POLICY_FILE", str(policy))
+
+
 def test_describer_writes_description_with_auto_true(profile_env, monkeypatch):
     # Pretend "myprof" is a registered profile pointing at profile_env.
     monkeypatch.setattr(
@@ -110,6 +148,45 @@ def test_describer_writes_description_with_auto_true(profile_env, monkeypatch):
     meta = profiles_mod.read_profile_meta(profile_env)
     assert meta["description"] == "writes Python codebases"
     assert meta["description_auto"] is True
+
+
+def test_describer_omits_blocked_skill_name_and_count(profile_env, monkeypatch):
+    _write_managed_profile_policy(profile_env, monkeypatch, "blocked")
+    local = profile_env / "skills" / "local-helper"
+    local.mkdir(parents=True)
+    (local / "SKILL.md").write_text(
+        "---\nname: local-helper\ndescription: local\n---\nLOCAL-BODY\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(profiles_mod, "profile_exists", lambda n: n == "myprof")
+    monkeypatch.setattr(profiles_mod, "normalize_profile_name", lambda n: n)
+    monkeypatch.setattr(profiles_mod, "get_profile_dir", lambda n: profile_env)
+    client = MagicMock()
+    client.chat.completions.create.return_value = _fake_aux_response(
+        jsonlib.dumps({"description": "local work"})
+    )
+
+    with patch(
+        "agent.auxiliary_client.get_text_auxiliary_client",
+        return_value=(client, "test-model"),
+    ), patch("agent.auxiliary_client.get_auxiliary_extra_body", return_value={}):
+        outcome = describer.describe_profile("myprof")
+
+    assert outcome.ok
+    user_prompt = client.chat.completions.create.call_args.kwargs["messages"][1]["content"]
+    assert "expense-review" not in user_prompt
+    assert "Installed skill count: 1" in user_prompt
+    assert "local-helper" in user_prompt
+
+
+def test_named_profile_available_enterprise_skill_is_classified_in_its_own_home(
+    profile_env, monkeypatch
+):
+    _write_managed_profile_policy(profile_env, monkeypatch, "available")
+
+    assert describer._authorized_skill_names(profile_env) == [
+        "enterprise/expense-review"
+    ]
 
 
 def test_describer_refuses_to_overwrite_user_authored(profile_env, monkeypatch):

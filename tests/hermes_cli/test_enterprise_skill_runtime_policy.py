@@ -1,4 +1,7 @@
 import json
+import os
+import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -89,6 +92,20 @@ def _write_enterprise_locks(skills_root: Path, names: list[str]) -> None:
             "metadata": {"enterprise_key": name},
         }
     lock_path.write_text(json.dumps(lock), encoding="utf-8")
+
+
+def _link_directory(link: Path, target: Path) -> None:
+    """Create the platform's real directory indirection; never skip coverage."""
+    if os.name == "nt":
+        result = subprocess.run(
+            ["cmd.exe", "/d", "/c", "mklink", "/J", str(link), str(target)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode == 0, result.stderr or result.stdout
+    else:
+        link.symlink_to(target, target_is_directory=True)
 
 
 def test_runtime_policy_fixture_is_table_driven(_isolate_hermes_home, monkeypatch):
@@ -240,6 +257,90 @@ def test_invalid_enterprise_provenance_fails_closed(
     assert decision["errorCode"] == "enterprise_skill_policy_denied"
 
 
+def test_enterprise_directory_link_escape_is_denied_without_body_read(
+    _isolate_hermes_home, monkeypatch, tmp_path
+):
+    from hermes_constants import get_hermes_home
+    import tools.skills_tool as skills_tool
+
+    home = get_hermes_home()
+    skills_root = home / "skills"
+    link = skills_root / "enterprise" / "expense-review"
+    link.parent.mkdir(parents=True, exist_ok=True)
+    outside_md = _write_skill(tmp_path, "outside", "expense-review")
+    _link_directory(link, outside_md.parent)
+    _write_enterprise_lock(skills_root, "expense-review")
+    _write_policy(
+        home,
+        monkeypatch,
+        [{"key": "expense-review", "status": "available"}],
+    )
+    monkeypatch.setattr(skills_tool, "SKILLS_DIR", skills_root)
+    original_read_text = Path.read_text
+    body_reads: list[Path] = []
+
+    def _track(path, *args, **kwargs):
+        if path.resolve(strict=False) == outside_md.resolve(strict=False):
+            body_reads.append(path)
+        return original_read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", _track)
+    payload = json.loads(skills_tool.skill_view("expense-review", preprocess=False))
+
+    assert payload["errorCode"] == "enterprise_skill_policy_denied"
+    assert payload["status"] == "invalid-provenance"
+    assert "Secret body" not in json.dumps(payload)
+    assert body_reads == []
+
+
+def test_enterprise_linked_directory_escape_never_reads_external_content(
+    _isolate_hermes_home, monkeypatch, tmp_path
+):
+    from hermes_constants import get_hermes_home
+    import tools.skills_tool as skills_tool
+
+    home = get_hermes_home()
+    skills_root = home / "skills"
+    skill_md = _write_skill(
+        skills_root, "enterprise/expense-review", "expense-review"
+    )
+    references = skill_md.parent / "references"
+    shutil.rmtree(references)
+    outside = tmp_path / "outside-references"
+    outside.mkdir()
+    secret = outside / "secret.md"
+    secret.write_text("EXTERNAL-LINKED-SENTINEL", encoding="utf-8")
+    _link_directory(references, outside)
+    _write_enterprise_lock(skills_root, "expense-review")
+    _write_policy(
+        home,
+        monkeypatch,
+        [{"key": "expense-review", "status": "available"}],
+    )
+    monkeypatch.setattr(skills_tool, "SKILLS_DIR", skills_root)
+    original_read_text = Path.read_text
+    linked_reads: list[Path] = []
+
+    def _track(path, *args, **kwargs):
+        if path.resolve(strict=False) == secret.resolve(strict=False):
+            linked_reads.append(path)
+        return original_read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", _track)
+    payload = json.loads(
+        skills_tool.skill_view(
+            "expense-review",
+            file_path="references/secret.md",
+            preprocess=False,
+        )
+    )
+
+    assert payload["success"] is False
+    assert "outside" in payload["error"].lower()
+    assert "EXTERNAL-LINKED-SENTINEL" not in json.dumps(payload)
+    assert linked_reads == []
+
+
 @pytest.mark.parametrize(
     ("mutation", "content"),
     [
@@ -367,12 +468,77 @@ def test_blocked_plugin_guard_precedes_disabled_and_stale_registry_checks(
     monkeypatch.setattr(plugins, "_get_disabled_plugins", lambda: {"acme"})
 
     payload = json.loads(skills_tool.skill_view("acme:danger", preprocess=False))
+    linked = json.loads(
+        skills_tool.skill_view(
+            "acme:danger",
+            file_path="references/secret.md",
+            preprocess=False,
+        )
+    )
     serialized = json.dumps(payload)
 
     assert payload["errorCode"] == "enterprise_skill_policy_denied"
     assert payload["policyKey"] == "acme:danger"
     assert "PLUGIN-BODY" not in serialized
     assert str(tmp_path) not in serialized
+    assert linked["errorCode"] == "enterprise_skill_policy_denied"
+
+
+def test_plugin_linked_directory_escape_never_reads_external_content(
+    _isolate_hermes_home, monkeypatch, tmp_path
+):
+    from hermes_constants import get_hermes_home
+    import hermes_cli.plugins as plugins
+    import tools.skills_tool as skills_tool
+
+    plugin_dir = tmp_path / "plugins" / "acme" / "skills" / "safe"
+    plugin_dir.mkdir(parents=True)
+    plugin_md = plugin_dir / "SKILL.md"
+    plugin_md.write_text(
+        "---\nname: safe\ndescription: safe\n---\nPLUGIN-BODY\n",
+        encoding="utf-8",
+    )
+    outside = tmp_path / "plugin-outside"
+    outside.mkdir()
+    secret = outside / "secret.md"
+    secret.write_text("PLUGIN-EXTERNAL-SENTINEL", encoding="utf-8")
+    _link_directory(plugin_dir / "references", outside)
+
+    class _PluginManager:
+        def find_plugin_skill(self, name):
+            return plugin_md if name == "acme:safe" else None
+
+        def list_plugin_skills(self, namespace):
+            return ["safe"] if namespace == "acme" else []
+
+    _write_policy(
+        get_hermes_home(),
+        monkeypatch,
+        [{"key": "acme:safe", "status": "available"}],
+    )
+    monkeypatch.setattr(plugins, "discover_plugins", lambda: None)
+    monkeypatch.setattr(plugins, "get_plugin_manager", lambda: _PluginManager())
+    monkeypatch.setattr(plugins, "_get_disabled_plugins", lambda: set())
+    original_read_text = Path.read_text
+    linked_reads = []
+
+    def _track(path, *args, **kwargs):
+        if path.resolve(strict=False) == secret.resolve(strict=False):
+            linked_reads.append(path)
+        return original_read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", _track)
+    payload = json.loads(
+        skills_tool.skill_view(
+            "acme:safe",
+            file_path="references/secret.md",
+            preprocess=False,
+        )
+    )
+
+    assert payload["success"] is False
+    assert "PLUGIN-EXTERNAL-SENTINEL" not in json.dumps(payload)
+    assert linked_reads == []
 
 
 def test_skill_view_denies_main_and_linked_reads_before_runtime_setup(
@@ -507,6 +673,39 @@ def test_blocked_enterprise_discovery_does_not_read_body(
     assert body_reads == []
 
 
+def test_prompt_index_authorization_error_fails_closed_only_in_managed_mode(
+    _isolate_hermes_home, monkeypatch
+):
+    from hermes_constants import get_hermes_home
+    from agent.prompt_builder import _parse_skill_file
+    import hermes_cli.enterprise_policy as enterprise_policy
+
+    skill_md = _write_skill(
+        get_hermes_home() / "skills", "custom/local-helper", "local-helper"
+    )
+    original_read_text = Path.read_text
+    body_reads = []
+
+    def _track(path, *args, **kwargs):
+        if path == skill_md:
+            body_reads.append(path)
+        return original_read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", _track)
+    monkeypatch.setattr(
+        enterprise_policy,
+        "skill_runtime_identity",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("auth down")),
+    )
+    monkeypatch.setenv("HERMES_ENTERPRISE_MANAGED", "1")
+
+    assert _parse_skill_file(skill_md)[0] is False
+    assert body_reads == []
+
+    monkeypatch.delenv("HERMES_ENTERPRISE_MANAGED")
+    assert _parse_skill_file(skill_md)[0] is True
+
+
 def test_slash_cache_tracks_policy_fingerprint_and_preload_denies(
     _isolate_hermes_home, monkeypatch
 ):
@@ -579,11 +778,46 @@ def test_prompt_snapshot_keeps_denied_skill_metadata_for_policy_only_allow(
     assert "expense-review: Runtime policy test." in allowed_prompt
 
 
+def test_existing_session_prompt_bytes_do_not_change_after_policy_refresh(
+    _isolate_hermes_home, monkeypatch
+):
+    from types import SimpleNamespace
+    from hermes_constants import get_hermes_home
+    from agent.prompt_builder import (
+        build_skills_system_prompt,
+        clear_skills_system_prompt_cache,
+    )
+    import tools.skills_tool as skills_tool
+
+    home = get_hermes_home()
+    skills_root = home / "skills"
+    _write_skill(skills_root, "enterprise/expense-review", "expense-review")
+    _write_enterprise_lock(skills_root, "expense-review")
+    policy_path = _write_policy(
+        home,
+        monkeypatch,
+        [{"key": "expense-review", "status": "available"}],
+    )
+    monkeypatch.setattr(skills_tool, "SKILLS_DIR", skills_root)
+    clear_skills_system_prompt_cache(clear_snapshot=True)
+    agent = SimpleNamespace(_cached_system_prompt=build_skills_system_prompt())
+    before = agent._cached_system_prompt.encode("utf-8")
+
+    policy = json.loads(policy_path.read_text(encoding="utf-8"))
+    policy["toolPolicySnapshot"]["skills"][0]["status"] = "blocked"
+    policy_path.write_text(json.dumps(policy), encoding="utf-8")
+    denied = json.loads(skills_tool.skill_view("expense-review", preprocess=False))
+
+    assert denied["errorCode"] == "enterprise_skill_policy_denied"
+    assert agent._cached_system_prompt.encode("utf-8") == before
+
+
 def test_bundle_and_cron_abort_whole_operation_on_policy_denial(
     _isolate_hermes_home, monkeypatch
 ):
     from hermes_constants import get_hermes_home
     import agent.skill_bundles as skill_bundles
+    import agent.skill_commands as skill_commands
     import tools.skills_tool as skills_tool
     import tools.skill_usage as skill_usage
     from cron.scheduler import _build_job_prompt
@@ -644,6 +878,13 @@ def test_bundle_and_cron_abort_whole_operation_on_policy_denial(
     assert usage == []
 
     with pytest.raises(EnterpriseSkillPolicyDenied):
+        skill_commands.build_auto_loaded_skills_message(
+            ["local-helper", "expense-review"],
+            "user text",
+        )
+    assert usage == []
+
+    with pytest.raises(EnterpriseSkillPolicyDenied):
         _build_job_prompt({"id": "job-1", "prompt": "run", "skills": ["local-helper", "expense-review"]})
     assert usage == []
 
@@ -651,6 +892,119 @@ def test_bundle_and_cron_abort_whole_operation_on_policy_denial(
         _build_job_prompt({"id": "job-2", "prompt": "run", "skills": ["mixed"]})
     assert usage == []
 
+
+def test_cron_run_denial_precedes_script_session_agent_and_usage(
+    _isolate_hermes_home, monkeypatch
+):
+    from hermes_constants import get_hermes_home
+    import cron.scheduler as scheduler
+    import hermes_state
+    import tools.skill_usage as skill_usage
+    import tools.skills_tool as skills_tool
+
+    home = get_hermes_home()
+    skills_root = home / "skills"
+    _write_skill(skills_root, "enterprise/expense-review", "expense-review")
+    _write_enterprise_lock(skills_root, "expense-review")
+    _write_policy(
+        home,
+        monkeypatch,
+        [{"key": "expense-review", "status": "blocked"}],
+    )
+    monkeypatch.setattr(skills_tool, "SKILLS_DIR", skills_root)
+    monkeypatch.setattr(
+        scheduler,
+        "_run_job_script",
+        lambda *_args, **_kwargs: pytest.fail("pre-run script executed before denial"),
+    )
+    monkeypatch.setattr(
+        hermes_state,
+        "SessionDB",
+        lambda *_args, **_kwargs: pytest.fail("SessionDB created before denial"),
+    )
+    monkeypatch.setattr(
+        skill_usage,
+        "bump_use",
+        lambda *_args, **_kwargs: pytest.fail("usage bumped before denial"),
+    )
+
+    success, document, response, error = scheduler.run_job(
+        {
+            "id": "job-blocked",
+            "name": "Blocked Job",
+            "prompt": "run",
+            "script": "must-not-run.sh",
+            "skills": ["expense-review"],
+        }
+    )
+
+    assert success is False
+    assert response == ""
+    assert error == "enterprise_skill_policy_denied"
+    assert "enterprise_skill_policy_denied" in document
+    assert "expense-review" not in document
+    assert "Secret body" not in document
+
+
+def test_cron_run_reuses_initial_policy_snapshot_after_file_refresh(
+    _isolate_hermes_home, monkeypatch
+):
+    from hermes_constants import get_hermes_home
+    from hermes_cli.enterprise_policy import skill_runtime_decision
+    import cron.scheduler as scheduler
+    import hermes_state
+    import tools.skills_tool as skills_tool
+
+    home = get_hermes_home()
+    skills_root = home / "skills"
+    skill_md = _write_skill(
+        skills_root, "enterprise/expense-review", "expense-review"
+    )
+    _write_enterprise_lock(skills_root, "expense-review")
+    policy_path = _write_policy(
+        home,
+        monkeypatch,
+        [{"key": "expense-review", "status": "available"}],
+    )
+    monkeypatch.setattr(skills_tool, "SKILLS_DIR", skills_root)
+
+    def _flip_policy_on_session_start():
+        policy = json.loads(policy_path.read_text(encoding="utf-8"))
+        policy["toolPolicySnapshot"]["skills"][0]["status"] = "blocked"
+        policy_path.write_text(json.dumps(policy), encoding="utf-8")
+        return object()
+
+    def _assert_frozen_policy(_job, prerun_script=None):
+        identity = {
+            "policyKey": "expense-review",
+            "provenance": "enterprise",
+        }
+        assert skill_runtime_decision(identity)["allowed"] is True
+        return None
+
+    monkeypatch.setattr(hermes_state, "SessionDB", _flip_policy_on_session_start)
+    monkeypatch.setattr(
+        scheduler,
+        "_build_job_prompt_with_policy",
+        _assert_frozen_policy,
+    )
+
+    success, document, response, error = scheduler.run_job(
+        {
+            "id": "job-frozen",
+            "name": "Frozen Job",
+            "prompt": "run",
+            "skills": ["expense-review"],
+        }
+    )
+
+    assert success is True
+    assert document == ""
+    assert response == scheduler.SILENT_MARKER
+    assert error is None
+    assert json.loads(policy_path.read_text(encoding="utf-8"))[
+        "toolPolicySnapshot"
+    ]["skills"][0]["status"] == "blocked"
 
 def test_bundle_uses_one_policy_snapshot_when_file_changes_between_members(
     _isolate_hermes_home, monkeypatch

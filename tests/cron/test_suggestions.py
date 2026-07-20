@@ -88,6 +88,36 @@ class TestStore:
         # And accepting again is a no-op (not pending anymore).
         assert store.accept_suggestion("acc") is None
 
+    def test_blocked_blueprint_accept_keeps_suggestion_pending(self, store):
+        rec = store.add_suggestion(
+            title="Private Blueprint",
+            description="desc",
+            source="blueprint",
+            job_spec={
+                "prompt": "do it",
+                "schedule": "0 9 * * *",
+                "skills": "expense-review",
+            },
+            dedup_key="blueprint:private",
+        )
+        denial = json.dumps(
+            {
+                "success": False,
+                "errorCode": "enterprise_skill_policy_denied",
+                "policyKey": "expense-review",
+                "status": "blocked",
+            }
+        )
+
+        with patch(
+            "tools.skills_tool.skill_runtime_preflight", return_value=denial
+        ), patch("cron.jobs.create_job") as create_job:
+            with pytest.raises(PermissionError):
+                store.accept_suggestion(rec["id"])
+
+        create_job.assert_not_called()
+        assert store.get_suggestion(rec["id"])["status"] == "pending"
+
     def test_get_by_id_and_index_and_title(self, store):
         rec = _add(store, key="byref", title="Findable")
         assert store.get_suggestion(rec["id"])["id"] == rec["id"]

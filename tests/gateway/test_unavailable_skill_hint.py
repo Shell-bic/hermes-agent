@@ -19,6 +19,7 @@ These tests pin the fixed behavior:
 """
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from unittest.mock import patch
 
@@ -114,6 +115,46 @@ def test_matched_but_not_disabled_returns_none(
         "agent.skill_utils.get_all_skills_dirs", return_value=[tmp_skills]
     ):
         assert gateway_run._check_unavailable_skill("ascii-art") is None
+
+
+def test_blocked_skill_returns_stable_denial_without_reading_body(
+    tmp_skills: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from gateway import run as gateway_run
+
+    skill_md = _write_skill(tmp_skills, "finance/expense-review", "expense-review")
+    policy = tmp_skills.parent / "enterprise-policy.json"
+    policy.write_text(
+        json.dumps(
+            {
+                "toolPolicySnapshot": {
+                    "skills": [{"key": "expense-review", "status": "blocked"}]
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_ENTERPRISE_MANAGED", "1")
+    monkeypatch.setenv("HERMES_ENTERPRISE_TOOL_POLICY_FILE", str(policy))
+    original_read_text = Path.read_text
+    body_reads = []
+
+    def _track(path, *args, **kwargs):
+        if path == skill_md:
+            body_reads.append(path)
+        return original_read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", _track)
+    with patch(
+        "tools.skills_tool._get_disabled_skill_names", return_value=set()
+    ), patch("agent.skill_utils.get_all_skills_dirs", return_value=[tmp_skills]):
+        message = gateway_run._check_unavailable_skill("expense-review")
+
+    assert message == (
+        "Skill unavailable [enterprise_skill_policy_denied]: "
+        "expense-review (blocked)."
+    )
+    assert body_reads == []
 
 
 def test_slug_normalization_strips_non_alnum(

@@ -11,6 +11,9 @@ gap for headless/VPS users. These tests pin:
 - POST /api/cron/jobs accepts ``skills`` and persists it on the job;
   PUT /api/cron/jobs/{id} can update the list.
 """
+import json
+from pathlib import Path
+
 import pytest
 
 
@@ -91,6 +94,63 @@ class TestSkillContent:
     def test_get_content_unknown_skill_404(self, client, isolated_profiles):
         resp = client.get("/api/skills/content", params={"name": "nope"})
         assert resp.status_code == 404
+
+    def test_blocked_enterprise_content_is_denied_before_body_read(
+        self, client, isolated_profiles, monkeypatch
+    ):
+        home = isolated_profiles["default"]
+        skill_dir = home / "skills" / "enterprise" / "expense-review"
+        _write_skill(skill_dir.parent, "expense-review")
+        skill_md = skill_dir / "SKILL.md"
+        lock_dir = home / "skills" / ".hub"
+        lock_dir.mkdir()
+        (lock_dir / "lock.json").write_text(
+            json.dumps(
+                {
+                    "installed": {
+                        "expense-review": {
+                            "source": "enterprise",
+                            "key": "expense-review",
+                            "install_path": "enterprise/expense-review",
+                        }
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        policy = home / "enterprise-policy.json"
+        policy.write_text(
+            json.dumps(
+                {
+                    "toolPolicySnapshot": {
+                        "skills": [
+                            {"key": "expense-review", "status": "blocked"}
+                        ]
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_ENTERPRISE_MANAGED", "1")
+        monkeypatch.setenv("HERMES_ENTERPRISE_TOOL_POLICY_FILE", str(policy))
+        original_read_text = Path.read_text
+        body_reads = []
+
+        def _track(path, *args, **kwargs):
+            if path == skill_md:
+                body_reads.append(path)
+            return original_read_text(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "read_text", _track)
+        resp = client.get(
+            "/api/skills/content", params={"name": "expense-review"}
+        )
+
+        assert resp.status_code == 403
+        assert resp.json()["detail"]["errorCode"] == "enterprise_skill_policy_denied"
+        assert resp.json()["detail"]["policyKey"] == "expense-review"
+        assert "Do the thing" not in resp.text
+        assert body_reads == []
 
 
 class TestSkillCreate:

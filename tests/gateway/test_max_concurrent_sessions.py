@@ -120,6 +120,39 @@ def test_new_session_gets_clean_error_at_active_session_limit(monkeypatch):
     runner.session_store.get_or_create_session.assert_not_called()
 
 
+def test_auto_skill_denial_precedes_session_creation(monkeypatch):
+    from hermes_cli.enterprise_policy import EnterpriseSkillPolicyDenied
+
+    runner = _make_runner()
+    event = _make_event()
+    event.auto_skill = ["expense-review"]
+    runner.session_store.would_start_fresh_session.return_value = True
+    denial = {
+        "allowed": False,
+        "errorCode": "enterprise_skill_policy_denied",
+        "policyKey": "expense-review",
+        "status": "blocked",
+        "reason": "blocked",
+        "provenance": "enterprise",
+    }
+    monkeypatch.setattr(
+        "agent.skill_commands.preflight_skill_identifiers",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            EnterpriseSkillPolicyDenied(denial)
+        ),
+    )
+
+    result = asyncio.run(
+        runner._handle_message_with_agent(event, event.source, "quick", 1)
+    )
+
+    assert result == (
+        "Skill unavailable [enterprise_skill_policy_denied]: "
+        "expense-review (blocked)."
+    )
+    runner.session_store.get_or_create_session.assert_not_called()
+
+
 def test_existing_active_session_uses_busy_handling_at_limit(monkeypatch):
     _silence_global_gateway_hooks(monkeypatch)
     runner = _make_runner(max_concurrent_sessions=1)

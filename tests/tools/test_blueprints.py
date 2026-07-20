@@ -5,6 +5,7 @@ the create-job bridge, and the export round-trip without touching the real
 cron store.
 """
 
+import json
 import sys
 from pathlib import Path
 from unittest.mock import patch
@@ -142,6 +143,27 @@ class TestCreateBlueprintJob:
         assert captured["deliver"] == "telegram"
         assert captured["prompt"].startswith("Summarize")
         assert job["id"] == "abc123"
+
+    def test_reauthorizes_existing_spec_before_create_job(self):
+        spec = parse_blueprint(BLUEPRINT_SKILL)
+        denial = json.dumps(
+            {
+                "success": False,
+                "errorCode": "enterprise_skill_policy_denied",
+                "policyKey": "morning-brief",
+                "status": "blocked",
+            }
+        )
+
+        with patch(
+            "tools.skills_tool.skill_runtime_preflight", return_value=denial
+        ), patch("cron.jobs.create_job") as create_job:
+            with pytest.raises(PermissionError) as raised:
+                create_blueprint_job(spec)
+
+        create_job.assert_not_called()
+        assert raised.value.decision["policyKey"] == "morning-brief"
+        assert raised.value.decision["status"] == "blocked"
 
 
 class TestExportBlueprint:
