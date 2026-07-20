@@ -229,6 +229,7 @@ class EnterpriseRuntime {
     enabled,
     gatewayUrl,
     homeWriter = writeManagedRuntimeHome,
+    managedIdentityBinder = null,
     managedHermesHome,
     policyReader = readManagedPolicySnapshot,
     policyWriter = replaceManagedPolicySnapshot,
@@ -240,6 +241,7 @@ class EnterpriseRuntime {
     this.authStore = authStore
     this.client = client || (this.enabled && this.gatewayUrl ? createEnterpriseGatewayClient({ baseUrl: this.gatewayUrl }) : null)
     this.homeWriter = homeWriter
+    this.managedIdentityBinder = typeof managedIdentityBinder === 'function' ? managedIdentityBinder : null
     this.managedHermesHome = managedHermesHome || ''
     this.policyReader = policyReader
     this.policyWriter = policyWriter
@@ -395,6 +397,7 @@ class EnterpriseRuntime {
     try {
       const bootstrap = await this.client.bootstrap(session.desktopToken)
       hermesHome = this.managedHomeFor({ bootstrap, session })
+      this.bindManagedIdentity({ bootstrap, hermesHome, session })
       const result = this.policyWriter({ bootstrap, hermesHome })
       this.lastPublicState = publicStateWithPolicy(this.lastPublicState, result.policy, {
         status: 'current',
@@ -447,6 +450,12 @@ class EnterpriseRuntime {
     return resolveManagedHermesHome(this.userDataPath, user)
   }
 
+  bindManagedIdentity({ bootstrap = null, hermesHome, session = null } = {}) {
+    const user = bootstrap?.user || bootstrap?.account || session?.user || null
+    this.managedIdentityBinder?.({ hermesHome, user })
+    return hermesHome
+  }
+
   async prepareLaunch({ preferredModel } = {}) {
     if (!this.enabled) {
       return { enabled: false }
@@ -470,9 +479,14 @@ class EnterpriseRuntime {
       runtimeManifestRequestBody({ modelProfiles, preferredModel: effectivePreferredModel })
     )
 
-    const launch = this.homeWriter({
+    const hermesHome = this.bindManagedIdentity({
       bootstrap,
       hermesHome: this.managedHomeFor({ bootstrap, session }),
+      session
+    })
+    const launch = this.homeWriter({
+      bootstrap,
+      hermesHome,
       manifest,
       modelProfiles
     })
@@ -517,9 +531,14 @@ class EnterpriseRuntime {
       runtimeManifestRequestBody({ modelProfiles: profiles, preferredModel: model })
     )
 
-    const launch = this.homeWriter({
+    const hermesHome = this.bindManagedIdentity({
       bootstrap,
       hermesHome: this.managedHomeFor({ bootstrap, session }),
+      session
+    })
+    const launch = this.homeWriter({
+      bootstrap,
+      hermesHome,
       manifest,
       modelProfiles: profiles
     })

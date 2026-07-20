@@ -1,5 +1,6 @@
 const { contextBridge, ipcRenderer, webUtils } = require('electron')
 const { isEnterpriseManagedEnv, redactManagedText } = require('./managed-redaction.cjs')
+const { unwrapProfileIpcResult } = require('./enterprise-managed-profile.cjs')
 
 const ENTERPRISE_MANAGED_OUTPUTS = isEnterpriseManagedEnv(process.env)
 
@@ -11,21 +12,25 @@ function unwrapEnterpriseSkillHub(result) {
   throw error
 }
 
+function invokeManagedProfile(channel, ...args) {
+  return ipcRenderer.invoke(channel, ...args).then(unwrapProfileIpcResult)
+}
+
 contextBridge.exposeInMainWorld('hermesDesktop', {
-  getConnection: profile => ipcRenderer.invoke('hermes:connection', profile),
+  getConnection: profile => invokeManagedProfile('hermes:connection', profile),
   revalidateConnection: () => ipcRenderer.invoke('hermes:connection:revalidate'),
-  touchBackend: profile => ipcRenderer.invoke('hermes:backend:touch', profile),
-  getGatewayWsUrl: profile => ipcRenderer.invoke('hermes:gateway:ws-url', profile),
+  touchBackend: profile => invokeManagedProfile('hermes:backend:touch', profile),
+  getGatewayWsUrl: profile => invokeManagedProfile('hermes:gateway:ws-url', profile),
   openSessionWindow: (sessionId, opts) => ipcRenderer.invoke('hermes:window:openSession', sessionId, opts),
   openNewSessionWindow: () => ipcRenderer.invoke('hermes:window:openNewSession'),
   getBootProgress: () => ipcRenderer.invoke('hermes:boot-progress:get'),
-  getConnectionConfig: profile => ipcRenderer.invoke('hermes:connection-config:get', profile),
-  saveConnectionConfig: payload => ipcRenderer.invoke('hermes:connection-config:save', payload),
-  applyConnectionConfig: payload => ipcRenderer.invoke('hermes:connection-config:apply', payload),
-  testConnectionConfig: payload => ipcRenderer.invoke('hermes:connection-config:test', payload),
-  probeConnectionConfig: remoteUrl => ipcRenderer.invoke('hermes:connection-config:probe', remoteUrl),
-  oauthLoginConnectionConfig: remoteUrl => ipcRenderer.invoke('hermes:connection-config:oauth-login', remoteUrl),
-  oauthLogoutConnectionConfig: remoteUrl => ipcRenderer.invoke('hermes:connection-config:oauth-logout', remoteUrl),
+  getConnectionConfig: profile => invokeManagedProfile('hermes:connection-config:get', profile),
+  saveConnectionConfig: payload => invokeManagedProfile('hermes:connection-config:save', payload),
+  applyConnectionConfig: payload => invokeManagedProfile('hermes:connection-config:apply', payload),
+  testConnectionConfig: payload => invokeManagedProfile('hermes:connection-config:test', payload),
+  probeConnectionConfig: remoteUrl => invokeManagedProfile('hermes:connection-config:probe', remoteUrl),
+  oauthLoginConnectionConfig: remoteUrl => invokeManagedProfile('hermes:connection-config:oauth-login', remoteUrl),
+  oauthLogoutConnectionConfig: remoteUrl => invokeManagedProfile('hermes:connection-config:oauth-logout', remoteUrl),
   enterprise: {
     managed: ENTERPRISE_MANAGED_OUTPUTS,
     cancelWeCom: () => ipcRenderer.invoke('hermes:enterprise:wecom-cancel'),
@@ -55,9 +60,9 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
   redactSensitiveText: value => redactManagedText(value, ENTERPRISE_MANAGED_OUTPUTS),
   profile: {
     get: () => ipcRenderer.invoke('hermes:profile:get'),
-    set: name => ipcRenderer.invoke('hermes:profile:set', name)
+    set: name => invokeManagedProfile('hermes:profile:set', name)
   },
-  api: request => ipcRenderer.invoke('hermes:api', request),
+  api: request => invokeManagedProfile('hermes:api', request),
   notify: payload => ipcRenderer.invoke('hermes:notify', payload),
   requestMicrophoneAccess: () => ipcRenderer.invoke('hermes:requestMicrophoneAccess'),
   readFileDataUrl: filePath => ipcRenderer.invoke('hermes:readFileDataUrl', filePath),

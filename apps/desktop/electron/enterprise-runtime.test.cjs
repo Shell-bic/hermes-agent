@@ -748,3 +748,49 @@ test('enterprise runtime rejects invalid selectModel bootstrap before profiles, 
   )
   assert.deepEqual(calls, ['bootstrap'])
 })
+
+test('enterprise runtime binds managed identity before every managed home write', async () => {
+  const calls = []
+  const runtime = createEnterpriseRuntime({
+    authStore: {
+      readSession: () => ({ desktopToken: 'desktop-token', user: { id: 'user-a' } })
+    },
+    client: {
+      bootstrap: async () => {
+        calls.push('bootstrap')
+        return validBootstrap({ user: { id: 'user-a' } })
+      },
+      modelProfiles: async () => {
+        calls.push('profiles')
+        return { modelProfiles: [] }
+      },
+      runtimeManifest: async () => {
+        calls.push('manifest')
+        return {}
+      }
+    },
+    enabled: true,
+    homeWriter: () => {
+      calls.push('homeWriter')
+      return {}
+    },
+    managedHermesHome: 'managed-home',
+    managedIdentityBinder: identity => {
+      calls.push(['identity', identity])
+      const error = new Error('identity rejected before write')
+      error.code = 'enterprise_profile_not_managed'
+      throw error
+    }
+  })
+
+  await assert.rejects(
+    () => runtime.prepareLaunch(),
+    error => error.code === 'enterprise_profile_not_managed'
+  )
+  assert.deepEqual(calls, [
+    'bootstrap',
+    'profiles',
+    'manifest',
+    ['identity', { hermesHome: 'managed-home', user: { id: 'user-a' } }]
+  ])
+})

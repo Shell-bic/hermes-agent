@@ -95,7 +95,9 @@ const { resolveEnterpriseDesktopConfigPaths } = require('./enterprise-desktop-co
 const { createEnterpriseGatewayClient } = require('./enterprise-gateway-client.cjs')
 const { createEnterpriseRuntime, resolveEnterpriseRuntimeOptions } = require('./enterprise-runtime.cjs')
 const {
-  createEnterpriseManagedProfileGuard
+  createEnterpriseManagedProfileGuard,
+  managedUserId,
+  profileIpcResult
 } = require('./enterprise-managed-profile.cjs')
 const { createEnterpriseSkillHub, publicError: publicEnterpriseSkillHubError } = require('./enterprise-skill-hub.cjs')
 const { createEnterpriseManagedLifecycle } = require('./enterprise-managed-lifecycle.cjs')
@@ -368,19 +370,23 @@ const enterpriseAuthStore = createEnterpriseAuthStore({
 const enterpriseGatewayClient = ENTERPRISE_RUNTIME_OPTIONS.gatewayUrl
   ? createEnterpriseGatewayClient({ baseUrl: ENTERPRISE_RUNTIME_OPTIONS.gatewayUrl })
   : null
+// Enterprise has one immutable managed runtime identity. The user/profile
+// selector and legacy connection files must never be able to turn it into a
+// pool child or a remote profile; secondary windows reuse this primary.
+const enterpriseManagedProfileGuard = createEnterpriseManagedProfileGuard({
+  enabled: ENTERPRISE_RUNTIME_OPTIONS.enabled
+})
 const enterpriseRuntime = createEnterpriseRuntime({
   authStore: enterpriseAuthStore,
   client: enterpriseGatewayClient,
   enabled: ENTERPRISE_RUNTIME_OPTIONS.enabled,
   gatewayUrl: ENTERPRISE_RUNTIME_OPTIONS.gatewayUrl,
+  managedIdentityBinder: ({ hermesHome, user }) => enterpriseManagedProfileGuard.bindIdentity({
+    hermesHome,
+    userId: managedUserId(user)
+  }),
   rememberLog,
   userDataPath: app.getPath('userData')
-})
-// Enterprise has one immutable managed runtime identity. The user/profile
-// selector and legacy connection files must never be able to turn it into a
-// pool child or a remote profile; secondary windows reuse this primary.
-const enterpriseManagedProfileGuard = createEnterpriseManagedProfileGuard({
-  enabled: () => enterpriseRuntime.isEnabled()
 })
 const enterpriseSkillHub = createEnterpriseSkillHub({
   authStore: enterpriseAuthStore,
@@ -5460,6 +5466,7 @@ async function startHermes() {
       source: 'local',
       authMode: 'token',
       token: authToken,
+      ...(enterpriseManaged ? { profile: enterpriseManagedProfileGuard.publicKey() } : {}),
       wsUrl: `ws://127.0.0.1:${port}/api/ws?token=${encodeURIComponent(authToken)}`,
       logs: hermesLog.slice(-80),
       ...getWindowState()
@@ -5838,7 +5845,9 @@ ipcMain.handle('hermes:enterprise:skill-hub:install', async (event, payload) =>
   enterpriseSkillHubIpc(event, () => enterpriseSkillHub.install(payload || {}))
 )
 
-ipcMain.handle('hermes:connection', async (_event, profile) => ensureBackend(profile))
+ipcMain.handle('hermes:connection', async (_event, profile) =>
+  profileIpcResult(() => ensureBackend(profile))
+)
 // Reconnect-after-wake recovery. A REMOTE primary backend has no child process,
 // so the 'exit'/'error' handlers that would clear a dead connectionPromise never
 // fire — once the remote becomes unreachable across a sleep/wake the renderer
@@ -5878,11 +5887,15 @@ ipcMain.handle('hermes:connection:revalidate', async () => {
     return { ok: true, rebuilt: true }
   }
 })
-ipcMain.handle('hermes:backend:touch', async (_event, profile) => {
-  touchPoolBackend(profile)
-  return { ok: true }
-})
-ipcMain.handle('hermes:gateway:ws-url', async (_event, profile) => freshGatewayWsUrl(profile))
+ipcMain.handle('hermes:backend:touch', async (_event, profile) => profileIpcResult(() =>
+  enterpriseManagedProfileGuard.runProfileOperation(profile, resolvedProfile => {
+    touchPoolBackend(resolvedProfile)
+    return { ok: true }
+  })
+))
+ipcMain.handle('hermes:gateway:ws-url', async (_event, profile) =>
+  profileIpcResult(() => freshGatewayWsUrl(profile))
+)
 ipcMain.handle('hermes:window:openSession', async (_event, sessionId, opts) => {
   if (typeof sessionId !== 'string' || !sessionId.trim()) {
     return { ok: false, error: 'invalid-session-id' }
@@ -5950,14 +5963,18 @@ ipcMain.handle('hermes:bootstrap:cancel', async () => {
 ipcMain.handle('hermes:boot-progress:get', async () => bootProgressState)
 ipcMain.handle('hermes:bootstrap:get', async () => getBootstrapState())
 ipcMain.handle('hermes:connection-config:get', async (_event, profile) =>
-  sanitizeDesktopConnectionConfig(readDesktopConnectionConfig(), profile)
+  profileIpcResult(() => enterpriseRuntime.isEnabled()
+    ? enterpriseManagedProfileGuard.managedConnectionConfig(profile)
+    : sanitizeDesktopConnectionConfig(readDesktopConnectionConfig(), profile))
 )
-ipcMain.handle('hermes:connection-config:test', async (_event, payload) => testDesktopConnectionConfig(payload))
-ipcMain.handle('hermes:connection-config:probe', async (_event, rawUrl) => {
+ipcMain.handle('hermes:connection-config:test', async (_event, payload) =>
+  profileIpcResult(() => testDesktopConnectionConfig(payload))
+)
+ipcMain.handle('hermes:connection-config:probe', async (_event, rawUrl) => profileIpcResult(async () => {
   enterpriseManagedProfileGuard.assertRemoteAllowed('connection-config:probe')
   return probeRemoteAuthMode(rawUrl)
-})
-ipcMain.handle('hermes:connection-config:oauth-login', async (_event, rawUrl) => {
+}))
+ipcMain.handle('hermes:connection-config:oauth-login', async (_event, rawUrl) => profileIpcResult(async () => {
   enterpriseManagedProfileGuard.assertRemoteAllowed('connection-config:oauth-login')
   // Open the gateway's OAuth login window and wait for the session cookie to
   // land in the OAuth partition. The caller (settings UI) typically saves the
@@ -5966,8 +5983,8 @@ ipcMain.handle('hermes:connection-config:oauth-login', async (_event, rawUrl) =>
   const baseUrl = normalizeRemoteBaseUrl(rawUrl)
   await openOauthLoginWindow(baseUrl)
   return { ok: true, baseUrl, connected: await hasOauthSessionCookie(baseUrl) }
-})
-ipcMain.handle('hermes:connection-config:oauth-logout', async (_event, rawUrl) => {
+}))
+ipcMain.handle('hermes:connection-config:oauth-logout', async (_event, rawUrl) => profileIpcResult(async () => {
   enterpriseManagedProfileGuard.assertRemoteAllowed('connection-config:oauth-logout')
   const baseUrl = rawUrl ? normalizeRemoteBaseUrl(rawUrl) : ''
   await clearOauthSession(baseUrl || undefined)
@@ -5975,8 +5992,8 @@ ipcMain.handle('hermes:connection-config:oauth-logout', async (_event, rawUrl) =
   // (AT-or-RT) so a logout that left any session cookie behind is reflected
   // as still-connected rather than silently signed-out.
   return { ok: true, connected: baseUrl ? await hasLiveOauthSession(baseUrl) : false }
-})
-ipcMain.handle('hermes:connection-config:save', async (_event, payload) => {
+}))
+ipcMain.handle('hermes:connection-config:save', async (_event, payload) => profileIpcResult(async () => {
   if (enterpriseRuntime.isEnabled()) {
     enterpriseManagedProfileGuard.assertRemoteAllowed('connection-config:save', payload?.profile)
   }
@@ -5985,8 +6002,8 @@ ipcMain.handle('hermes:connection-config:save', async (_event, payload) => {
   writeDesktopConnectionConfig(config)
 
   return sanitizeDesktopConnectionConfig(config, payload?.profile)
-})
-ipcMain.handle('hermes:connection-config:apply', async (_event, payload) => {
+}))
+ipcMain.handle('hermes:connection-config:apply', async (_event, payload) => profileIpcResult(async () => {
   if (enterpriseRuntime.isEnabled()) {
     enterpriseManagedProfileGuard.assertRemoteAllowed('connection-config:apply', payload?.profile)
   }
@@ -6009,12 +6026,12 @@ ipcMain.handle('hermes:connection-config:apply', async (_event, payload) => {
   }
 
   return sanitizeDesktopConnectionConfig(config, payload?.profile)
-})
+}))
 
 ipcMain.handle('hermes:profile:get', async () => ({
-  profile: enterpriseRuntime.isEnabled() ? enterpriseManagedProfileGuard.managedKey() : readActiveDesktopProfile()
+  profile: enterpriseRuntime.isEnabled() ? enterpriseManagedProfileGuard.publicKey() : readActiveDesktopProfile()
 }))
-ipcMain.handle('hermes:profile:set', async (_event, name) => {
+ipcMain.handle('hermes:profile:set', async (_event, name) => profileIpcResult(async () => {
   enterpriseManagedProfileGuard.assertProfileMutation('profile:set', name)
   const next = writeActiveDesktopProfile(name)
 
@@ -6025,7 +6042,7 @@ ipcMain.handle('hermes:profile:set', async (_event, name) => {
   mainWindow?.reload()
 
   return { profile: next }
-})
+}))
 
 ipcMain.on('hermes:previewShortcutActive', (_event, active) => {
   previewShortcutActive = Boolean(active)
@@ -6170,16 +6187,7 @@ async function mergeRemoteProfileSessions(searchParams, remoteProfiles) {
   return { ...base, sessions: merged.slice(offset, offset + limit), total, profile_totals: profileTotals }
 }
 
-ipcMain.handle('hermes:api', async (_event, request) => {
-  if (enterpriseRuntime.isEnabled()) {
-    const method = String(request?.method || 'GET').toUpperCase()
-    const requestPath = String(request?.path || '')
-    if (method === 'DELETE' && /^\/api\/profiles(?:[/?#]|$)/.test(requestPath)) {
-      enterpriseManagedProfileGuard.assertProfileMutation('profile:delete', requestPath)
-    } else {
-      enterpriseManagedProfileGuard.resolve(request?.profile)
-    }
-  }
+async function handleHermesApiRequest(request) {
   const pendingEnterpriseResponse = enterprisePendingApiResponse(request)
   if (pendingEnterpriseResponse !== undefined) {
     return pendingEnterpriseResponse
@@ -6220,7 +6228,11 @@ ipcMain.handle('hermes:api', async (_event, request) => {
     body: request?.body,
     timeoutMs
   })
-})
+}
+
+ipcMain.handle('hermes:api', async (_event, request) =>
+  profileIpcResult(() => enterpriseManagedProfileGuard.handleApiRequest(request, handleHermesApiRequest))
+)
 
 ipcMain.handle('hermes:notify', (_event, payload) => {
   if (!Notification.isSupported()) return false
