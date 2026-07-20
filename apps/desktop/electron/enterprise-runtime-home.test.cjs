@@ -240,6 +240,30 @@ test('managed runtime home writes company-gateway config and token env only in p
   assert.deepEqual(policy.uiPolicy, { defaultLocale: 'zh', allowLanguageChange: true, lockedLocale: false })
 })
 
+test('managed policy LKG is persisted with and read only for the same enterprise user id', t => {
+  const hermesHome = fs.mkdtempSync(path.join(os.tmpdir(), 'hermes-enterprise-lkg-user-'))
+  t.after(() => fs.rmSync(hermesHome, { force: true, recursive: true }))
+
+  writeManagedRuntimeHome({
+    bootstrap: { user: { id: 'User-A', displayName: 'Ada' } },
+    hermesHome,
+    manifest: manifest()
+  })
+
+  const persisted = JSON.parse(fs.readFileSync(path.join(hermesHome, 'enterprise-policy.json'), 'utf8'))
+  assert.equal(persisted.enterpriseUserId, 'user-a')
+  assert.equal(readManagedPolicySnapshot({ expectedUserId: 'USER-A', hermesHome }).valid, true)
+  assert.deepEqual(
+    readManagedPolicySnapshot({ expectedUserId: 'user-b', hermesHome }),
+    {
+      policy: null,
+      policyPath: path.join(hermesHome, 'enterprise-policy.json'),
+      reason: 'user_mismatch',
+      valid: false
+    }
+  )
+})
+
 test('managed policy refresh atomically replaces only enterprise-policy.json', () => {
   const hermesHome = fs.mkdtempSync(path.join(os.tmpdir(), 'hermes-enterprise-policy-refresh-'))
   writeManagedRuntimeHome({

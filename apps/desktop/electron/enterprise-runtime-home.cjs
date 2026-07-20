@@ -142,6 +142,16 @@ function enterpriseUserPathSegment(user) {
   return safe
 }
 
+function enterpriseUserId(user) {
+  if (!user || typeof user !== 'object' || Array.isArray(user)) {
+    return null
+  }
+
+  const raw = user.id || user.userId || user.desktopUserId || ''
+  const value = String(raw || '').trim().toLowerCase()
+  return value && value.length <= 256 && !hasControlCharacters(value) ? value : null
+}
+
 function normalizeGatewayApiBaseUrl(rawUrl) {
   const value = String(rawUrl || '').trim().replace(/\/+$/, '')
 
@@ -584,6 +594,15 @@ function isValidManagedPolicySnapshot(policy, { bootstrapContract = false } = {}
     return false
   }
 
+  const boundUserId = policy.enterpriseUserId == null ? null : String(policy.enterpriseUserId).trim().toLowerCase()
+  const payloadUserId = enterpriseUserId(policy.user)
+  if (
+    (boundUserId && (!hasSafePolicyMetadataValue(boundUserId, 256) || (payloadUserId && boundUserId !== payloadUserId))) ||
+    (policy.enterpriseUserId != null && !boundUserId)
+  ) {
+    return false
+  }
+
   if (!hasValidRolePolicyValues(policy.lockedSurfaces)) {
     return false
   }
@@ -634,7 +653,7 @@ function validateManagedBootstrap(bootstrap) {
   return bootstrap
 }
 
-function readManagedPolicySnapshot({ fsImpl = fs, hermesHome } = {}) {
+function readManagedPolicySnapshot({ expectedUserId = null, fsImpl = fs, hermesHome } = {}) {
   const policyPath = path.join(String(hermesHome || ''), 'enterprise-policy.json')
 
   if (!hermesHome || !fsImpl.existsSync(policyPath)) {
@@ -644,9 +663,17 @@ function readManagedPolicySnapshot({ fsImpl = fs, hermesHome } = {}) {
   try {
     const policy = JSON.parse(fsImpl.readFileSync(policyPath, 'utf8'))
 
-    return isValidManagedPolicySnapshot(policy)
-      ? { policy, policyPath, reason: null, valid: true }
-      : { policy: null, policyPath, reason: 'invalid', valid: false }
+    if (!isValidManagedPolicySnapshot(policy)) {
+      return { policy: null, policyPath, reason: 'invalid', valid: false }
+    }
+
+    const expected = String(expectedUserId || '').trim().toLowerCase()
+    const actual = String(policy.enterpriseUserId || enterpriseUserId(policy.user) || '').trim().toLowerCase()
+    if (expected && (!actual || actual !== expected)) {
+      return { policy: null, policyPath, reason: 'user_mismatch', valid: false }
+    }
+
+    return { policy, policyPath, reason: null, valid: true }
   } catch {
     return { policy: null, policyPath, reason: 'invalid', valid: false }
   }
@@ -688,6 +715,7 @@ function buildRefreshedPolicySnapshot({ bootstrap, currentPolicy = null } = {}) 
     currentModel: base.currentModel || null,
     currentModelProfileId: base.currentModelProfileId || null,
     defaultModel: base.defaultModel || null,
+    enterpriseUserId: enterpriseUserId(bootstrap.user || bootstrap.account),
     generatedAt: metadata.generatedAt,
     lockedSurfaces: [...bootstrap.lockedSurfaces],
     manifestId: base.manifestId || null,
@@ -863,6 +891,7 @@ function buildPolicySnapshot({ bootstrap = null, manifest = null, modelProfiles 
     currentModel: publicState.currentModel,
     currentModelProfileId: publicState.currentModelProfileId,
     defaultModel: publicState.defaultModel,
+    enterpriseUserId: enterpriseUserId(bootstrap?.user || bootstrap?.account),
     lockedSurfaces: publicState.lockedSurfaces,
     manifestId: manifest?.manifestId || null,
     modelProfiles: publicState.modelProfiles,
@@ -949,6 +978,7 @@ module.exports = {
   buildManagedConfigYaml,
   buildPolicySnapshot,
   buildRefreshedPolicySnapshot,
+  enterpriseUserId,
   enterpriseUserPathSegment,
   normalizeGatewayApiBaseUrl,
   normalizeEnterpriseUiPolicy,

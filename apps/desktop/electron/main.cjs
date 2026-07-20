@@ -376,15 +376,24 @@ const enterpriseGatewayClient = ENTERPRISE_RUNTIME_OPTIONS.gatewayUrl
 const enterpriseManagedProfileGuard = createEnterpriseManagedProfileGuard({
   enabled: ENTERPRISE_RUNTIME_OPTIONS.enabled
 })
+let enterpriseLifecycle = null
 const enterpriseRuntime = createEnterpriseRuntime({
   authStore: enterpriseAuthStore,
   client: enterpriseGatewayClient,
   enabled: ENTERPRISE_RUNTIME_OPTIONS.enabled,
   gatewayUrl: ENTERPRISE_RUNTIME_OPTIONS.gatewayUrl,
+  getLifecycle: () => enterpriseLifecycle,
   managedIdentityBinder: ({ hermesHome, user }) => enterpriseManagedProfileGuard.bindIdentity({
     hermesHome,
     userId: managedUserId(user)
   }),
+  onTerminalAuth: async ({ reasonCode, terminalState = 'unauthenticated' }) => {
+    if (!enterpriseLifecycle) return
+    const state = enterpriseLifecycle.getSnapshot().state
+    if (state === 'running' || state === 'recovering') {
+      await enterpriseLifecycle.revoke({ reasonCode, terminalState })
+    }
+  },
   rememberLog,
   userDataPath: app.getPath('userData')
 })
@@ -935,7 +944,6 @@ let primaryStartTicket = null
 // with no named profiles never populates this map, so their experience is
 // byte-for-byte the single-backend behavior.
 const backendPool = new Map() // profile -> { process, port, token, connectionPromise, lastActiveAt }
-let enterpriseLifecycle = null
 const enterpriseBackendOwnership = createEnterpriseBackendOwnership({
   clearOwnedProcess: (owner, capturedProcess) => {
     if (owner.key === 'primary') {

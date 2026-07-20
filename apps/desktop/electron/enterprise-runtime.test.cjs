@@ -28,7 +28,7 @@ function validBootstrap(overrides = {}) {
     lockedSurfaces: ['skills'],
     policyHash,
     policyVersion,
-    user: { displayName: 'Ada' },
+    user: { id: 'user-a', displayName: 'Ada' },
     ...overrides,
     toolPolicySnapshot: {
       capabilityFlags: [],
@@ -249,10 +249,10 @@ test('enterprise runtime accepts a WeCom session through the same private sessio
   const state = await runtime.acceptLoginSession({
     desktopToken: 'dsk_secret',
     expiresAt: '2099-07-13T00:00:00Z',
-    user: { displayName: 'Ada' }
+    user: { id: 'user-a', displayName: 'Ada' }
   })
   assert.equal(state.authenticated, true)
-  assert.deepEqual(state.user, { displayName: 'Ada' })
+  assert.deepEqual(state.user, { id: 'user-a', displayName: 'Ada' })
   assert.equal(JSON.stringify(state).includes('dsk_secret'), false)
   assert.equal(writes.length, 1)
 })
@@ -416,7 +416,7 @@ test('enterprise policy refresh uses authenticated bootstrap and exposes current
     role: { name: 'Employee' },
     toolPolicySnapshot: { generatedAt: '2026-07-14T08:00:00Z', policyHash: 'hash-2', policyVersion: 'pv-2' },
     uiPolicy: { defaultLocale: 'zh', allowLanguageChange: false, lockedLocale: true },
-    user: { displayName: 'Ada' }
+    user: { id: 'user-a', displayName: 'Ada' }
   }
   const runtime = createEnterpriseRuntime({
     authStore: { readSession: () => ({ desktopToken: 'desktop-token', user: { displayName: 'Ada' } }) },
@@ -494,24 +494,27 @@ test('invalid policy refresh bootstrap cannot rebind managed identity or select 
 
   const state = await runtime.refreshPolicy()
 
-  assert.equal(state.policyRefreshStatus, 'failed')
+  assert.equal(state.status, 'error')
+  assert.equal(state.policyRefreshStatus, 'idle')
   assert.deepEqual(calls, ['bootstrap'])
-  assert.equal(lkgHome, safeHome)
+  assert.equal(lkgHome, null)
   assert.deepEqual(guard.identity(), originalIdentity)
 })
 
 test('enterprise policy refresh retains last-known-good on failure and fails closed without one', async () => {
   const cachedPolicy = {
+    enterpriseUserId: 'user-a',
     generatedAt: '2026-07-13T08:00:00Z',
     lockedSurfaces: ['skills'],
     policyHash: 'hash-lkg',
     policyVersion: 'pv-lkg',
-    toolPolicySnapshot: { generatedAt: '2026-07-13T08:00:00Z', policyHash: 'hash-lkg', policyVersion: 'pv-lkg' }
+    toolPolicySnapshot: { generatedAt: '2026-07-13T08:00:00Z', policyHash: 'hash-lkg', policyVersion: 'pv-lkg' },
+    user: { id: 'user-a' }
   }
   let hasCachedPolicy = true
   const logs = []
   const runtime = createEnterpriseRuntime({
-    authStore: { readSession: () => ({ desktopToken: 'desktop-token' }) },
+    authStore: { readSession: () => ({ desktopToken: 'desktop-token', user: { id: 'user-a' } }) },
     client: {
       bootstrap: async () => {
         const error = new Error('server echoed desktop-token')
@@ -562,7 +565,7 @@ test('enterprise policy refresh is single-flight across concurrent renderer requ
     toolPolicySnapshot: { generatedAt: '2026-07-14T08:00:00Z', policyHash: 'hash-concurrent', policyVersion: 'pv-concurrent' }
   }
   const runtime = createEnterpriseRuntime({
-    authStore: { readSession: () => ({ desktopToken: 'desktop-token' }) },
+    authStore: { readSession: () => ({ desktopToken: 'desktop-token', user: { id: 'user-a' } }) },
     client: {
       bootstrap: async () => {
         bootstrapCalls += 1
