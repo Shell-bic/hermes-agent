@@ -26,10 +26,51 @@ from __future__ import annotations
 import builtins
 import io
 import contextlib
+import socket
+from pathlib import Path
 
 import pytest
 
 from hermes_cli import auth as auth_mod
+
+
+@pytest.fixture
+def xai_oauth_external_guard(tmp_path, monkeypatch, _hermetic_environment):
+    """Fail if a loopback unit test escapes to user auth, browser, or network."""
+    user_home = tmp_path / "user-home"
+    local_app_data = user_home / "AppData" / "Local"
+    hermes_home = local_app_data / "hermes-test"
+    hermes_home.mkdir(parents=True)
+
+    monkeypatch.setenv("HOME", str(user_home))
+    monkeypatch.setenv("USERPROFILE", str(user_home))
+    monkeypatch.setenv("LOCALAPPDATA", str(local_app_data))
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setattr(Path, "home", lambda: user_home)
+
+    calls = {"browser": 0, "network": 0}
+
+    def _blocked(kind):
+        def _fail(*_args, **_kwargs):
+            calls[kind] += 1
+            pytest.fail(f"xAI OAuth unit test attempted real {kind} access")
+
+        return _fail
+
+    monkeypatch.setattr(auth_mod.webbrowser, "open", _blocked("browser"))
+    monkeypatch.setattr(auth_mod.httpx, "get", _blocked("network"))
+    monkeypatch.setattr(auth_mod.httpx, "post", _blocked("network"))
+    monkeypatch.setattr(socket, "create_connection", _blocked("network"))
+    monkeypatch.setattr(socket.socket, "connect", _blocked("network"))
+    monkeypatch.setattr(socket.socket, "connect_ex", _blocked("network"))
+
+    def assert_isolated():
+        assert calls == {"browser": 0, "network": 0}
+        assert Path.home() == user_home
+        assert auth_mod._auth_file_path().parent == hermes_home
+
+    yield assert_isolated
+    assert_isolated()
 
 
 # ---------------------------------------------------------------------------
@@ -464,7 +505,10 @@ def test_xai_loopback_login_manual_paste_missing_code_raises(monkeypatch):
     assert exc.value.code == "xai_code_missing"
 
 
-def test_xai_loopback_login_timeout_falls_back_to_manual_paste(monkeypatch):
+def test_xai_loopback_login_timeout_falls_back_to_manual_paste(
+    monkeypatch,
+    xai_oauth_external_guard,
+):
     """Loopback timeout should accept a bare Grok Build code paste."""
     monkeypatch.setattr(
         auth_mod, "_xai_oauth_discovery",
@@ -548,7 +592,10 @@ def test_xai_loopback_login_timeout_falls_back_to_manual_paste(monkeypatch):
 
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
-        creds = auth_mod._xai_oauth_loopback_login(manual_paste=False)
+        creds = auth_mod._xai_oauth_loopback_login(
+            manual_paste=False,
+            open_browser=False,
+        )
 
     rendered = buf.getvalue()
     assert "xAI loopback callback timed out." in rendered
@@ -556,6 +603,7 @@ def test_xai_loopback_login_timeout_falls_back_to_manual_paste(monkeypatch):
     assert captured["prompt_calls"] == 1
     assert creds["tokens"]["access_token"] == "at-timeout"
     assert creds["tokens"]["refresh_token"] == "rt-timeout"
+    xai_oauth_external_guard()
 
 
 def test_xai_wait_for_callback_accepts_ready_stdin_code(monkeypatch):
@@ -600,7 +648,10 @@ def test_xai_wait_for_callback_accepts_ready_stdin_code(monkeypatch):
     assert thread.joined is True
 
 
-def test_xai_loopback_login_timeout_noninteractive_reraises(monkeypatch):
+def test_xai_loopback_login_timeout_noninteractive_reraises(
+    monkeypatch,
+    xai_oauth_external_guard,
+):
     """Non-interactive stdin must keep the original timeout error."""
     monkeypatch.setattr(
         auth_mod, "_xai_oauth_discovery",
@@ -659,8 +710,12 @@ def test_xai_loopback_login_timeout_noninteractive_reraises(monkeypatch):
 
     with contextlib.redirect_stdout(io.StringIO()):
         with pytest.raises(auth_mod.AuthError) as exc:
-            auth_mod._xai_oauth_loopback_login(manual_paste=False)
+            auth_mod._xai_oauth_loopback_login(
+                manual_paste=False,
+                open_browser=False,
+            )
     assert exc.value.code == "xai_callback_timeout"
+    xai_oauth_external_guard()
 
 
 # ---------------------------------------------------------------------------
