@@ -206,3 +206,12 @@ test('chatWindowWebPreferences allows a dev sandbox override', () => {
   assert.equal(prefs.sandbox, false)
   assert.equal(prefs.nodeIntegration, false)
 })
+
+test('chatWindowWebPreferences forwards only explicit non-empty renderer arguments', () => {
+  const prefs = chatWindowWebPreferences('/some/preload.cjs', {
+    additionalArguments: ['--hermes-enterprise-managed=1', '', 42]
+  })
+
+  assert.deepEqual(prefs.additionalArguments, ['--hermes-enterprise-managed=1'])
+  assert.equal('additionalArguments' in chatWindowWebPreferences('/some/preload.cjs'), false)
+})

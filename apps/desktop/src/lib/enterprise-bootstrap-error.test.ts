@@ -65,6 +65,16 @@ describe('enterprise bootstrap public error contract', () => {
       envelope('enterprise_runtime_stop_failed', 'retry-stop', 403, message)
     )).toBeNull()
   })
+
+  it('accepts only the fixed desktop session 401 sign-in contract', () => {
+    const contract = bootstrapErrors.desktop_session_required
+    const valid = envelope('desktop_session_required', 'sign-in', 401, contract.message)
+
+    expect(enterprisePublicErrorFromUnknown(valid)).toEqual(valid)
+    expect(enterprisePublicErrorFromUnknown({ ...valid, httpStatus: 403 })).toBeNull()
+    expect(enterprisePublicErrorFromUnknown({ ...valid, recoveryKind: 'retry' })).toBeNull()
+    expect(enterprisePublicErrorFromUnknown({ ...valid, message: 'Session expired for dsk_private' })).toBeNull()
+  })
 })
 
 const RUNTIME_STOP_MESSAGE = 'Hermes could not stop safely. Retry the stop before continuing.'

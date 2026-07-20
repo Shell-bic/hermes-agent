@@ -85,6 +85,22 @@ afterEach(() => {
 })
 
 describe('EnterpriseLoginOverlay', () => {
+  it('takes over after authoritative refresh replaces a stale authenticated state', async () => {
+    $enterprise.set({
+      ...enterpriseState,
+      authenticated: true,
+      status: 'authenticated'
+    })
+    vi.mocked(window.hermesDesktop.enterprise.status).mockResolvedValue(enterpriseState)
+
+    renderOverlay('en')
+
+    expect(await screen.findByRole('heading', { name: 'Enterprise sign in' })).toBeTruthy()
+    expect($enterprise.get()).toMatchObject({ authenticated: false, enabled: true, status: 'unauthenticated' })
+    expect(window.hermesDesktop.enterprise.loginMethods).toHaveBeenCalledTimes(1)
+    expect(window.hermesDesktop.enterprise.login).not.toHaveBeenCalled()
+  })
+
   it('defaults to the unified WeCom QR page and keeps password as an alternate method', async () => {
     renderOverlay('zh')
 

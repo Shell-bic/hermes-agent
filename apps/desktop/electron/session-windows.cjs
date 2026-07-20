@@ -23,8 +23,12 @@ const SESSION_WINDOW_MIN_HEIGHT = 620
 // because it depends on the Electron entry's __dirname.
 function chatWindowWebPreferences(preloadPath, options = {}) {
   const sandbox = options.sandbox !== false
+  const additionalArguments = Array.isArray(options.additionalArguments)
+    ? options.additionalArguments.filter(argument => typeof argument === 'string' && argument.length > 0)
+    : []
 
   return {
+    ...(additionalArguments.length > 0 ? { additionalArguments } : {}),
     preload: preloadPath,
     contextIsolation: true,
     webviewTag: true,

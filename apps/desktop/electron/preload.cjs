@@ -1,10 +1,13 @@
 const { contextBridge, ipcRenderer, webUtils } = require('electron')
-const { isEnterpriseManagedEnv, redactManagedText } = require('./managed-redaction.cjs')
+const { isEnterpriseManagedRenderer, redactManagedText } = require('./managed-redaction.cjs')
 const { createManagedProfileInvoker } = require('./enterprise-managed-profile.cjs')
 const { unwrapEnterprisePublicResult } = require('./enterprise-public-error.cjs')
 const { WINDOW_CONNECTION_CHANNELS } = require('./enterprise-window-connections.cjs')
 
-const ENTERPRISE_MANAGED_OUTPUTS = isEnterpriseManagedEnv(process.env)
+// Machine deployment config is resolved in the main process and passed as an
+// exact, immutable renderer argument. Environment detection remains a legacy
+// fallback for direct development launches.
+const ENTERPRISE_MANAGED_OUTPUTS = isEnterpriseManagedRenderer(process.argv, process.env)
 
 function unwrapEnterpriseSkillHub(result) {
   return unwrapEnterprisePublicResult(result)

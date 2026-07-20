@@ -4,6 +4,21 @@
     "message": "Contact an administrator to assign an active enterprise role.",
     "recoveryKind": "refresh-policy"
   },
+  "desktop_session_required": {
+    "httpStatuses": [401],
+    "message": "Sign in to your enterprise account and try again.",
+    "recoveryKind": "sign-in"
+  },
+  "enterprise_backend_exited": {
+    "httpStatuses": [null],
+    "message": "Hermes backend exited unexpectedly. Try again.",
+    "recoveryKind": "retry"
+  },
+  "enterprise_backend_start_failed": {
+    "httpStatuses": [null],
+    "message": "Hermes backend could not start. Try again.",
+    "recoveryKind": "retry"
+  },
   "desktop_bootstrap_contract_header_invalid": {
     "httpStatuses": [400],
     "message": "The enterprise Gateway rejected the Desktop compatibility request. Contact an administrator.",

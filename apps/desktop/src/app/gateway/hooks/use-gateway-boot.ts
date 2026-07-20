@@ -14,6 +14,7 @@ import {
   failDesktopBootWithEnterpriseError,
   setDesktopBootStep
 } from '@/store/boot'
+import { refreshEnterpriseState } from '@/store/enterprise'
 import {
   $gateway,
   beginGatewayRuntime,
@@ -100,11 +101,16 @@ export function useGatewayBoot({
     }
 
     if (!enabled) {
-      const offEnterpriseRuntimeRevoked = desktop.onEnterpriseRuntimeRevoked?.(() => {
+      const offEnterpriseRuntimeRevoked = desktop.onEnterpriseRuntimeRevoked?.(async () => {
         runtimeRevokeObserved = true
         revokeGatewayRuntime()
         publish(null)
         callbacksRef.current.onGatewayReady(null)
+        const state = await refreshEnterpriseState().catch(() => null)
+        if (!cancelled && state?.enabled && !state.authenticated) {
+          completeDesktopBoot('Waiting for enterprise sign-in')
+          setSessionsLoading(false)
+        }
       })
       completeDesktopBoot('Waiting for enterprise sign-in')
       setSessionsLoading(false)
@@ -132,6 +138,7 @@ export function useGatewayBoot({
     let reconnectAttempt = 0
     let reconnectFailureCount = 0
     let reconnectFailureSurfaced = false
+    let sessionRequiredRefresh: Promise<boolean> | null = null
     // Surface "sign in again" once per disconnect episode, not on every backoff
     // tick — a stale OAuth ticket fails every attempt and would otherwise stack
     // identical error toasts (and their haptics). Reset on the next clean open.
@@ -147,6 +154,59 @@ export function useGatewayBoot({
         clearTimeout(reconnectTimer)
         reconnectTimer = null
       }
+    }
+
+    const handOffEnterpriseSessionRequired = (error: unknown, forceRefresh = false): Promise<boolean> => {
+      const enterpriseError = enterprisePublicErrorFromUnknown(error)
+
+      if (!forceRefresh && (
+        enterpriseError?.errorCode !== 'desktop_session_required' ||
+        enterpriseError.httpStatus !== 401 ||
+        enterpriseError.recoveryKind !== 'sign-in'
+      )) {
+        return Promise.resolve(false)
+      }
+
+      if (sessionRequiredRefresh) {
+        return sessionRequiredRefresh
+      }
+
+      // A terminal managed 401 is an authentication-state transition, not a
+      // backend/bootstrap failure. Stop this runtime generation before asking
+      // main for the authoritative public state. The resulting unauthenticated
+      // store state remounts this hook disabled and lets EnterpriseLoginOverlay
+      // take ownership without a reconnect/retry loop.
+      runtimeRevokeObserved = true
+      runtimeRevoked = true
+      bootCompleted = false
+      clearReconnectTimer()
+      if (keepaliveTimer !== null) {
+        clearInterval(keepaliveTimer)
+        keepaliveTimer = null
+      }
+      revokeGatewayRuntime()
+      publish(null)
+      callbacksRef.current.onGatewayReady(null)
+
+      const refresh = refreshEnterpriseState()
+        .then(state => {
+          if (!cancelled && state.enabled && !state.authenticated) {
+            completeDesktopBoot('Waiting for enterprise sign-in')
+            setSessionsLoading(false)
+            return true
+          }
+
+          return false
+        })
+        .catch(() => false)
+      sessionRequiredRefresh = refresh
+      void refresh.finally(() => {
+        if (sessionRequiredRefresh === refresh) {
+          sessionRequiredRefresh = null
+        }
+      })
+
+      return refresh
     }
 
     const attemptReconnect = async () => {
@@ -193,6 +253,10 @@ export function useGatewayBoot({
         await callbacksRef.current.refreshHermesConfig().catch(() => undefined)
         await callbacksRef.current.refreshSessions().catch(() => undefined)
       } catch (err) {
+        if (await handOffEnterpriseSessionRequired(err)) {
+          return
+        }
+
         // OAuth session expired mid-reconnect: surface the actionable "sign in
         // again" message once instead of silently looping the backoff against a
         // ticket that can never succeed. Transport failures fall through to the
@@ -269,18 +333,8 @@ export function useGatewayBoot({
     // Secondary (background-profile) sockets funnel into the same handler.
     configureGatewayRegistry({ onEvent: event => callbacksRef.current.handleGatewayEvent(event) })
 
-    const offEnterpriseRuntimeRevoked = desktop.onEnterpriseRuntimeRevoked?.(() => {
-      runtimeRevokeObserved = true
-      runtimeRevoked = true
-      bootCompleted = false
-      clearReconnectTimer()
-      if (keepaliveTimer !== null) {
-        clearInterval(keepaliveTimer)
-        keepaliveTimer = null
-      }
-      revokeGatewayRuntime()
-      publish(null)
-      callbacksRef.current.onGatewayReady(null)
+    const offEnterpriseRuntimeRevoked = desktop.onEnterpriseRuntimeRevoked?.(async () => {
+      await handOffEnterpriseSessionRequired(null, true)
     })
 
     const offState = gateway.onState(st => {
@@ -450,6 +504,10 @@ export function useGatewayBoot({
         completeDesktopBoot()
         bootCompleted = true
       } catch (err) {
+        if (!cancelled && await handOffEnterpriseSessionRequired(err)) {
+          return
+        }
+
         if (!cancelled && !runtimeRevoked) {
           const message = err instanceof Error ? err.message : String(err)
           const enterpriseError = enterprisePublicErrorFromUnknown(err)

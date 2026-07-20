@@ -53,7 +53,11 @@ const { readDirForIpc } = require('./fs-read-dir.cjs')
 const { gitRootForIpc } = require('./git-root.cjs')
 const { worktreesForIpc } = require('./git-worktrees.cjs')
 const { requirePtyAllowed } = require('./pty-policy.cjs')
-const { isEnterpriseManagedEnv, redactManagedText } = require('./managed-redaction.cjs')
+const {
+  ENTERPRISE_MANAGED_RENDERER_ARGUMENT,
+  isEnterpriseManagedEnv,
+  redactManagedText
+} = require('./managed-redaction.cjs')
 const { OFFICIAL_REPO_HTTPS_URL, isOfficialSshRemote } = require('./update-remote.cjs')
 const { runRebuildWithRetry } = require('./update-rebuild.cjs')
 const {
@@ -119,6 +123,12 @@ const {
 const { registerEnterpriseSkillHubIpc } = require('./enterprise-skill-hub-ipc.cjs')
 const { createEnterpriseManagedLifecycle } = require('./enterprise-managed-lifecycle.cjs')
 const { createEnterpriseManagedRecoveryActions } = require('./enterprise-managed-recovery-actions.cjs')
+const {
+  errorFromEnterprisePublicError,
+  fixedManagedFailure,
+  normalizeManagedBackendExit,
+  normalizeManagedBootProgress
+} = require('./enterprise-managed-backend-failure.cjs')
 const {
   createEnterprisePublicError,
   enterprisePublicFailure,
@@ -393,6 +403,9 @@ const ENTERPRISE_RUNTIME_OPTIONS = resolveEnterpriseRuntimeOptions(process.env, 
   })
 })
 const ENTERPRISE_MANAGED_OUTPUTS = ENTERPRISE_RUNTIME_OPTIONS.enabled || isEnterpriseManagedEnv(process.env)
+const ENTERPRISE_RENDERER_ARGUMENTS = ENTERPRISE_RUNTIME_OPTIONS.enabled
+  ? [ENTERPRISE_MANAGED_RENDERER_ARGUMENT]
+  : []
 const enterpriseAuthStore = createEnterpriseAuthStore({
   filePath: ENTERPRISE_AUTH_STORE_PATH,
   safeStorage
@@ -1418,6 +1431,10 @@ function getBootstrapState() {
 }
 
 function updateBootProgress(update, options = {}) {
+  update = normalizeManagedBootProgress(update, {
+    enabled: ENTERPRISE_RUNTIME_OPTIONS.enabled,
+    lifecycle: enterpriseLifecycle?.getSnapshot()
+  })
   const nextProgressRaw =
     typeof update.progress === 'number' ? clampBootProgress(update.progress) : bootProgressState.progress
   const nextProgress = options.allowDecrease ? nextProgressRaw : Math.max(bootProgressState.progress, nextProgressRaw)
@@ -2134,7 +2151,11 @@ async function recoverBackendAfterMaintenance(result, reasonCode) {
     maintenance: barrier,
     managed,
     markUnauthenticated: () => enterpriseLifecycle.markUnauthenticated({ reasonCode }),
-    onError: error => rememberLog(`[maintenance] backend recovery failed (${reasonCode}): ${error.message}`),
+    onError: error => rememberLog(
+      ENTERPRISE_RUNTIME_OPTIONS.enabled
+        ? '[enterprise-backend] maintenance recovery failed'
+        : `[maintenance] backend recovery failed (${reasonCode}): ${error.message}`
+    ),
     ownership: enterpriseBackendOwnership,
     startBackend: () => startHermes()
   })
@@ -3656,7 +3677,10 @@ function sendBackendExit(payload) {
   if (!mainWindow || mainWindow.isDestroyed()) return
   const { webContents } = mainWindow
   if (!webContents || webContents.isDestroyed()) return
-  webContents.send('hermes:backend-exit', payload)
+  webContents.send('hermes:backend-exit', normalizeManagedBackendExit(payload, {
+    enabled: ENTERPRISE_RUNTIME_OPTIONS.enabled,
+    lifecycle: enterpriseLifecycle?.getSnapshot()
+  }))
 }
 
 function sendClosePreviewRequested() {
@@ -5478,38 +5502,46 @@ async function startHermes() {
       },
       getCurrent: () => hermesProcess,
       onError: error => {
-        rememberLog(`Hermes backend failed to start: ${error.message}`)
+        const failure = enterpriseManaged
+          ? fixedManagedFailure('start', enterpriseLifecycle.getSnapshot())
+          : null
+        const message = failure?.enterpriseError.message || error.message
+        rememberLog(failure?.logMessage || `Hermes backend failed to start: ${message}`)
         updateBootProgress(
-          {
-            error: error.message,
-            message: `Hermes backend failed to start: ${error.message}`,
-            phase: 'backend.error',
-            running: false
-          },
-          { allowDecrease: true }
-        )
-        sendBackendExit({ code: null, signal: null, error: error.message })
-        rejectBackendStart?.(error)
-      },
-      onExit: (code, signal) => {
-        rememberLog(`Hermes backend exited (${signal || code})`)
-        sendBackendExit({ code, signal })
-        if (!backendReady) {
-          const message = `Hermes backend exited before it became ready (${signal || code}).`
-          updateBootProgress(
-            {
+          failure?.bootUpdate || {
               error: message,
-              message,
+              message: `Hermes backend failed to start: ${message}`,
               phase: 'backend.error',
               running: false
             },
+          { allowDecrease: true }
+        )
+        sendBackendExit(failure?.exitPayload || { code: null, signal: null, error: message })
+        rejectBackendStart?.(failure?.error || error)
+      },
+      onExit: (code, signal) => {
+        const failure = enterpriseManaged
+          ? fixedManagedFailure('exit', enterpriseLifecycle.getSnapshot())
+          : null
+        const safeExitMessage = failure?.enterpriseError.message || `Hermes backend exited (${signal || code})`
+        rememberLog(failure?.logMessage || safeExitMessage)
+        sendBackendExit(failure?.exitPayload || { code, signal })
+        if (!backendReady) {
+          const message = failure?.enterpriseError.message || `Hermes backend exited before it became ready (${signal || code}).`
+          updateBootProgress(
+            failure?.bootUpdate || {
+                error: message,
+                message,
+                phase: 'backend.error',
+                running: false
+              },
             { allowDecrease: true }
           )
-          rejectBackendStart?.(
-            new Error(
-              `Hermes backend exited before it became ready (${signal || code}). Log: ${DESKTOP_LOG_PATH}\n${recentHermesLog()}`
-            )
-          )
+          rejectBackendStart?.(failure
+            ? failure.error
+            : new Error(
+                `Hermes backend exited before it became ready (${signal || code}). Log: ${DESKTOP_LOG_PATH}\n${recentHermesLog()}`
+              ))
         }
       }
     })
@@ -5590,7 +5622,7 @@ async function startHermes() {
       { allowDecrease: true }
     )
     if (connectionPromise === ownedConnectionPromise) connectionPromise = null
-    throw error
+    throw enterpriseError ? errorFromEnterprisePublicError(enterpriseError) : error
   })
   connectionPromise = ownedConnectionPromise
   enterpriseBackendOwnership.trackStart(ticket, ownedConnectionPromise)
@@ -5661,6 +5693,7 @@ function spawnSecondaryWindow({ sessionId, watch, newSession } = {}) {
     show: false,
     backgroundColor: getWindowBackgroundColor(),
     webPreferences: chatWindowWebPreferences(path.join(__dirname, 'preload.cjs'), {
+      additionalArguments: ENTERPRISE_RENDERER_ARGUMENTS,
       sandbox: !DISABLE_RENDERER_SANDBOX
     })
   })
@@ -5734,6 +5767,7 @@ function createWindow() {
     // a requestAnimationFrame-gated flush that Chromium pauses for blurred
     // windows, stalling the live answer until refocus. See session-windows.cjs.
     webPreferences: chatWindowWebPreferences(path.join(__dirname, 'preload.cjs'), {
+      additionalArguments: ENTERPRISE_RENDERER_ARGUMENTS,
       sandbox: !DISABLE_RENDERER_SANDBOX
     })
   })
@@ -5830,7 +5864,7 @@ function createWindow() {
 
     const state = await enterpriseRuntime.refreshPublicState()
     if (state.authenticated) {
-      startHermes().catch(error => rememberLog(error.stack || error.message))
+      startHermes().catch(() => rememberLog('[enterprise-backend] startup failed'))
     }
   })
 }

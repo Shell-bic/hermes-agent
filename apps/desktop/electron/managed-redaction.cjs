@@ -1,6 +1,7 @@
 const REDACTED = '[REDACTED]'
 
 const ENTERPRISE_TRUTHY = new Set(['1', 'true', 'yes', 'on'])
+const ENTERPRISE_MANAGED_RENDERER_ARGUMENT = '--hermes-enterprise-managed=1'
 const SECRET_TOKEN_RE = /\b(?:(?:gw_|adm_|dsk_)[A-Za-z0-9._~-]+|sk-[A-Za-z0-9._~-]+)/
 const SENSITIVE_ENV_TEXT_RE = new RegExp(
   String.raw`(?:^|[\r\n\s"'\x60])(?:COMPANY_GATEWAY_TOKEN|HERMES_DASHBOARD_SESSION_TOKEN|DESKTOP_TOKEN|[A-Z0-9_]*(?:API_KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL))\s*[:=]\s*\S+`,
@@ -24,6 +25,10 @@ function isEnterpriseManagedEnv(env = process.env) {
   const gatewayUrl = String(env.HERMES_ENTERPRISE_GATEWAY_URL || env.HERMES_DESKTOP_ENTERPRISE_GATEWAY_URL || '').trim()
 
   return explicitManaged || enterpriseDesktop || gatewayUrl.length > 0
+}
+
+function isEnterpriseManagedRenderer(argv = process.argv, env = process.env) {
+  return argv.includes(ENTERPRISE_MANAGED_RENDERER_ARGUMENT) || isEnterpriseManagedEnv(env)
 }
 
 function decodedLooksSensitive(decoded) {
@@ -106,8 +111,10 @@ function redactManagedText(value, managed = isEnterpriseManagedEnv()) {
 }
 
 module.exports = {
+  ENTERPRISE_MANAGED_RENDERER_ARGUMENT,
   REDACTED,
   isEnterpriseManagedEnv,
+  isEnterpriseManagedRenderer,
   redactEncodedSecrets,
   redactManagedText,
   redactSensitiveText

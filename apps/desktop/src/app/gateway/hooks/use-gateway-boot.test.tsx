@@ -1,8 +1,10 @@
 import { act, cleanup, render } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
+import type { EnterpriseDesktopState } from '@/global'
 import { translateNow } from '@/i18n'
 import { $desktopBoot } from '@/store/boot'
+import { $enterprise, INITIAL_ENTERPRISE_STATE } from '@/store/enterprise'
 import { beginGatewayRuntime, ensureGatewayForProfile } from '@/store/gateway'
 import { $gatewayState } from '@/store/session'
 
@@ -88,16 +90,23 @@ function fakeDesktop(authMode: 'oauth' | 'token' = 'token') {
   let runtimeRevokeCallback: (() => Promise<void> | void) | null = null
 
   return {
+    applyConnectionConfig: vi.fn(async () => undefined),
     enterprise: {
       lifecycleStatus: vi.fn(async () => ({
         authEpoch: 0,
         lifecycleEpoch: 0,
         reasonCode: 'ready',
         state: 'running' as 'blocked' | 'recovering' | 'revoking' | 'running' | 'stop_failed' | 'unauthenticated'
+      })),
+      status: vi.fn(async (): Promise<EnterpriseDesktopState> => ({
+        ...INITIAL_ENTERPRISE_STATE,
+        enabled: false,
+        status: 'disabled'
       }))
     },
     getConnection: vi.fn(async (_profile?: string | null) => conn),
     getGatewayWsUrl: vi.fn(async () => conn.wsUrl),
+    revalidateConnection: vi.fn(async () => ({ ok: true, rebuilt: false })),
     getBootProgress: vi.fn(async () => ({
       error: null,
       fakeMode: false,
@@ -117,10 +126,26 @@ function fakeDesktop(authMode: 'oauth' | 'token' = 'token') {
     }),
     onPowerResume: vi.fn(() => () => undefined),
     onWindowStateChanged: vi.fn(() => () => undefined),
+    oauthLoginConnectionConfig: vi.fn(async () => ({ connected: false })),
     touchBackend: vi.fn(async () => undefined),
     profile: { get: vi.fn(async () => ({ profile: 'default' })) },
-    revokeRuntime: async () => runtimeRevokeCallback?.()
+    repairBootstrap: vi.fn(async () => ({ ok: true })),
+    resetBootstrap: vi.fn(async () => ({ ok: true })),
+    revokeRuntime: async () => runtimeRevokeCallback?.(),
+    updates: { check: vi.fn(async () => ({ supported: true })) }
   }
+}
+
+function sessionRequiredError() {
+  return Object.assign(new Error('Sign in to your enterprise account and try again.'), {
+    code: 'desktop_session_required',
+    envelope: 'enterprise-public-error.v1' as const,
+    errorCode: 'desktop_session_required',
+    httpStatus: 401,
+    lifecycleEpoch: 9,
+    recoveryKind: 'sign-in' as const,
+    status: 401
+  })
 }
 
 function Harness() {
@@ -157,7 +182,14 @@ beforeEach(() => {
   ;(globalThis as { WebSocket: unknown }).WebSocket = FakeWebSocket
   ;(window as { hermesDesktop?: unknown }).hermesDesktop = fakeDesktop()
   $gatewayState.set('idle')
+  $enterprise.set({
+    ...INITIAL_ENTERPRISE_STATE,
+    authenticated: true,
+    enabled: true,
+    status: 'authenticated'
+  })
   $desktopBoot.set({
+    enterpriseManaged: true,
     error: null,
     fakeMode: false,
     message: '',
@@ -174,6 +206,7 @@ afterEach(() => {
   vi.useRealTimers()
   ;(globalThis as { WebSocket: unknown }).WebSocket = originalWebSocket
   delete (window as { hermesDesktop?: unknown }).hermesDesktop
+  $enterprise.set(INITIAL_ENTERPRISE_STATE)
 })
 
 // Let pending microtasks (awaits) AND the queued 0ms socket open/error fire.
@@ -193,6 +226,110 @@ async function advanceBackoff() {
 }
 
 describe('useGatewayBoot remote reconnect loop (real hook, fake socket)', () => {
+  it('hands a terminal managed 401 to authoritative enterprise state without boot recovery actions', async () => {
+    const desktop = fakeDesktop()
+    desktop.getConnection = vi.fn(async () => {
+      throw sessionRequiredError()
+    })
+    desktop.enterprise.status.mockResolvedValue({
+      ...INITIAL_ENTERPRISE_STATE,
+      authenticated: false,
+      enabled: true,
+      status: 'unauthenticated'
+    })
+    ;(window as { hermesDesktop?: unknown }).hermesDesktop = desktop
+
+    render(<Harness />)
+    await flushAsync()
+
+    expect(desktop.enterprise.status).toHaveBeenCalledTimes(1)
+    expect($enterprise.get()).toMatchObject({ authenticated: false, enabled: true, status: 'unauthenticated' })
+    expect($desktopBoot.get()).toMatchObject({ error: null, running: false, visible: false })
+    expect($gatewayState.get()).toBe('closed')
+    expect(FakeWebSocket.instances).toHaveLength(0)
+    expect(desktop.revalidateConnection).not.toHaveBeenCalled()
+    expect(desktop.applyConnectionConfig).not.toHaveBeenCalled()
+    expect(desktop.oauthLoginConnectionConfig).not.toHaveBeenCalled()
+    expect(desktop.repairBootstrap).not.toHaveBeenCalled()
+    expect(desktop.resetBootstrap).not.toHaveBeenCalled()
+    expect(desktop.updates.check).not.toHaveBeenCalled()
+  })
+
+  it('uses the same single-flight sign-in handoff when runtime revocation wins the race with the 401 catch', async () => {
+    let rejectConnection: (error: Error) => void = () => undefined
+    let releaseStatus: (() => void) | null = null
+    const desktop = fakeDesktop()
+    desktop.getConnection = vi.fn(
+      () => new Promise((_resolve, reject) => {
+        rejectConnection = reject
+      })
+    )
+    desktop.enterprise.status.mockImplementation(
+      () => new Promise(resolve => {
+        releaseStatus = () => resolve({
+          ...INITIAL_ENTERPRISE_STATE,
+          authenticated: false,
+          enabled: true,
+          status: 'unauthenticated'
+        })
+      })
+    )
+    ;(window as { hermesDesktop?: unknown }).hermesDesktop = desktop
+
+    render(<Harness />)
+    await flushAsync()
+    await act(async () => {
+      const revocation = desktop.revokeRuntime()
+      rejectConnection(sessionRequiredError())
+      releaseStatus?.()
+      await revocation
+      await vi.advanceTimersByTimeAsync(0)
+    })
+
+    expect(desktop.enterprise.status).toHaveBeenCalledTimes(1)
+    expect($enterprise.get()).toMatchObject({ authenticated: false, enabled: true, status: 'unauthenticated' })
+    expect($desktopBoot.get()).toMatchObject({ error: null, running: false, visible: false })
+    await act(async () => vi.advanceTimersByTimeAsync(60_000))
+    expect(desktop.getConnection).toHaveBeenCalledTimes(1)
+    expect(FakeWebSocket.instances).toHaveLength(0)
+  })
+
+  it('does not let an earlier blocked revocation suppress a later terminal 401 refresh', async () => {
+    let rejectConnection: (error: Error) => void = () => undefined
+    const desktop = fakeDesktop()
+    desktop.getConnection = vi.fn(
+      () => new Promise((_resolve, reject) => {
+        rejectConnection = reject
+      })
+    )
+    desktop.enterprise.status
+      .mockResolvedValueOnce({
+        ...INITIAL_ENTERPRISE_STATE,
+        authenticated: true,
+        enabled: true,
+        status: 'authenticated'
+      })
+      .mockResolvedValueOnce({
+        ...INITIAL_ENTERPRISE_STATE,
+        authenticated: false,
+        enabled: true,
+        status: 'unauthenticated'
+      })
+    ;(window as { hermesDesktop?: unknown }).hermesDesktop = desktop
+
+    render(<Harness />)
+    await flushAsync()
+    await act(async () => {
+      await desktop.revokeRuntime()
+      rejectConnection(sessionRequiredError())
+      await vi.advanceTimersByTimeAsync(0)
+    })
+
+    expect(desktop.enterprise.status).toHaveBeenCalledTimes(2)
+    expect($enterprise.get()).toMatchObject({ authenticated: false, status: 'unauthenticated' })
+    expect($desktopBoot.get()).toMatchObject({ error: null, visible: false })
+  })
+
   it('enterprise sign-in wait dismisses the boot overlay so the login form can render', () => {
     render(<DisabledHarness />)
 

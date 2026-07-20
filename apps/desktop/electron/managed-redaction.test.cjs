@@ -3,7 +3,13 @@ const fs = require('node:fs')
 const path = require('node:path')
 const test = require('node:test')
 
-const { REDACTED, isEnterpriseManagedEnv, redactManagedText } = require('./managed-redaction.cjs')
+const {
+  ENTERPRISE_MANAGED_RENDERER_ARGUMENT,
+  REDACTED,
+  isEnterpriseManagedEnv,
+  isEnterpriseManagedRenderer,
+  redactManagedText
+} = require('./managed-redaction.cjs')
 
 const FAKE_SECRETS = [
   'gw_FAKE_gateway_1234567890',
@@ -19,6 +25,12 @@ test('managed mode is enabled by every immutable enterprise launch signal', () =
   assert.equal(isEnterpriseManagedEnv({ HERMES_DESKTOP_ENTERPRISE_GATEWAY_URL: 'https://gateway.invalid' }), true)
   assert.equal(isEnterpriseManagedEnv({ HERMES_ENTERPRISE_MANAGED: '0' }), false)
   assert.equal(isEnterpriseManagedEnv({}), false)
+})
+
+test('machine-config managed renderer argument wins when the legacy environment is false', () => {
+  assert.equal(isEnterpriseManagedRenderer([ENTERPRISE_MANAGED_RENDERER_ARGUMENT], {}), true)
+  assert.equal(isEnterpriseManagedRenderer([], {}), false)
+  assert.equal(isEnterpriseManagedRenderer([], { HERMES_ENTERPRISE_MANAGED: 'true' }), true)
 })
 
 test('managed redactor removes complete fake tokens and URL query credentials', () => {
@@ -52,7 +64,10 @@ test('desktop sinks and preload bridge wire the managed redactor at their final 
   assert.match(main, /function rememberLog\(chunk\)[\s\S]{0,160}redactManagedText\(chunk, ENTERPRISE_MANAGED_OUTPUTS\)/)
   assert.match(main, /title: redactManagedText\(payload\?\.title \|\| 'Hermes', ENTERPRISE_MANAGED_OUTPUTS\)/)
   assert.match(main, /body: redactManagedText\(payload\?\.body \|\| '', ENTERPRISE_MANAGED_OUTPUTS\)/)
+  assert.match(main, /ENTERPRISE_RENDERER_ARGUMENTS\s*=\s*ENTERPRISE_RUNTIME_OPTIONS\.enabled/)
+  assert.equal((main.match(/additionalArguments: ENTERPRISE_RENDERER_ARGUMENTS/g) || []).length, 2)
   assert.match(preload, /managed: ENTERPRISE_MANAGED_OUTPUTS/)
+  assert.match(preload, /isEnterpriseManagedRenderer\(process\.argv, process\.env\)/)
   assert.match(preload, /redactSensitiveText: value => redactManagedText\(value, ENTERPRISE_MANAGED_OUTPUTS\)/)
 })
 
