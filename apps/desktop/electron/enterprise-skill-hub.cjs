@@ -738,6 +738,126 @@ class EnterpriseSkillHub {
     )
   }
 
+  async currentInstallDetail(operation, token, active, expected = null) {
+    encodePathSegment(operation.key, 'Skill key')
+    const detail = normalizeCatalogItem(
+      await this.client.skillHubSkill(token, operation.key, { signal: active?.signal })
+    )
+    active?.checkpoint()
+    if (
+      detail.key !== operation.key ||
+      detail.currentRevision !== operation.revision ||
+      detail.artifactSha256 !== operation.artifactSha256 ||
+      (expected && (
+        detail.artifactSizeBytes !== expected.artifactSizeBytes ||
+        detail.policyStatus !== expected.policyStatus
+      ))
+    ) {
+      throw new EnterpriseSkillHubError(
+        'package_revision_changed',
+        'The enterprise skill package changed before installation. Refresh and try again.',
+        { status: 409 }
+      )
+    }
+    validSha(detail.artifactSha256, 'Catalog artifact SHA-256')
+    if (!detail.artifactSizeBytes) {
+      throw new EnterpriseSkillHubError(
+        'artifact_metadata_invalid',
+        'The catalog package size is missing or invalid.'
+      )
+    }
+    if (detail.policyStatus === 'blocked' || detail.policyStatus === 'restricted') {
+      throw new EnterpriseSkillHubError(
+        'skill_policy_denied',
+        detail.policyReason || 'Enterprise policy no longer allows this skill to be installed.',
+        { status: 403 }
+      )
+    }
+    return detail
+  }
+
+  async stageLocalOperation(operation, detail, token, active) {
+    const tempRoot = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'hermes-enterprise-skill-'))
+    const artifactPath = path.join(tempRoot, 'artifact.zip')
+    try {
+      const download = await this.client.downloadSkillPackage(token, operation.key, operation.revision, {
+        signal: active?.signal
+      })
+      active?.checkpoint()
+      const verified = await writeVerifiedArtifact({
+        response: download,
+        destination: artifactPath,
+        expectedSha256: operation.artifactSha256,
+        expectedSize: detail.artifactSizeBytes,
+        maxArtifactBytes: this.maxArtifactBytes,
+        signal: active?.signal,
+        checkpoint: active?.checkpoint
+      })
+      active?.checkpoint()
+      const stageBody = fs.createReadStream(artifactPath)
+      let stagedResponse
+      try {
+        stagedResponse = await this.localRequest(
+          this.localOperationPath(operation, '/stage'),
+          {
+            body: stageBody,
+            duplex: 'half',
+            headers: {
+              'Content-Length': String(verified.artifactSizeBytes),
+              'Content-Type': 'application/zip',
+              'X-Hermes-Artifact-Sha256': verified.artifactSha256,
+              ...this.localOperationHeaders(operation),
+              'X-Hermes-Operation-Expires-At': operation.expiresAt
+            },
+            method: 'POST'
+          },
+          active
+        )
+      } finally {
+        stageBody.destroy()
+      }
+      const staged = await readJsonResponse(stagedResponse, {
+        checkpoint: active?.checkpoint,
+        signal: active?.signal
+      })
+      if (staged?.state !== 'staged' || staged?.operationId !== operation.operationId) {
+        throw new EnterpriseSkillHubError(
+          'local_stage_response_invalid',
+          'The local Hermes backend did not durably stage the install operation.'
+        )
+      }
+      return staged
+    } finally {
+      await fs.promises.rm(tempRoot, { force: true, recursive: true }).catch(() => undefined)
+    }
+  }
+
+  async resumePendingOperation(operation, active) {
+    const token = requireDesktopToken(this.authStore)
+    const detail = await this.currentInstallDetail(operation, token, active)
+    let localStatus = null
+    try {
+      localStatus = await this.localOperationStatus(operation, active)
+    } catch (error) {
+      if (String(error?.code || error?.errorCode || '') !== 'install_operation_not_found') throw error
+    }
+    if (!localStatus) {
+      await this.stageLocalOperation(operation, detail, token, active)
+    } else if (localStatus.state !== 'staged') {
+      return safeOperation(operation, 'reconciling')
+    }
+    await this.currentInstallDetail(operation, token, active, detail)
+    const committed = normalizeGatewayInstallResponse(
+      await this.client.commitSkillInstallOperation(token, operation.operationId, { signal: active?.signal }),
+      operation
+    )
+    active?.checkpoint()
+    const installed = await this.materializeLocalOperation(operation, committed, active)
+    active?.checkpoint()
+    this.operationStore.clear()
+    return { installed, operation: safeOperation(operation, 'materialized') }
+  }
+
   recoverPendingOperation(options = {}) {
     if (this.recoveryFlight) return this.recoveryFlight
     const promise = this.runOperation('enterprise:skill-hub:recover', active =>
@@ -850,7 +970,26 @@ class EnterpriseSkillHub {
         this.operationStore.clear()
         throw terminalCause
       }
-      return safeOperation(stored, 'reconciling')
+      if (terminalCause) return safeOperation(stored, 'reconciling')
+      try {
+        return await this.resumePendingOperation(stored, active)
+      } catch (error) {
+        if (isLifecycleCancellation(error)) throw error
+        if (error?.code === 'desktop_session_required' || isTransientRecoveryError(error)) {
+          return safeOperation(stored, 'reconciling')
+        }
+        try {
+          await this.abortLocalOperation(stored, active)
+        } catch (localError) {
+          if (localError?.code !== 'install_operation_not_found') {
+            if (isTransientRecoveryError(localError)) return safeOperation(stored, 'reconciling')
+            throw localError
+          }
+        }
+        active?.checkpoint()
+        this.operationStore.clear()
+        throw error
+      }
     }
 
     if (gatewayOperation.operation.status !== 'expired') {
@@ -1063,96 +1202,17 @@ class EnterpriseSkillHub {
       storedOperation = this.operationStore.writeOperation({ ...intent, ...operation, reconciliationToken })
 
       active.checkpoint()
-      const tempRoot = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'hermes-enterprise-skill-'))
-      const artifactPath = path.join(tempRoot, 'artifact.zip')
-      try {
-        const download = await this.client.downloadSkillPackage(token, detail.key, requestedRevision, {
-          signal: active.signal
-        })
-        active.checkpoint()
-        const verified = await writeVerifiedArtifact({
-          response: download,
-          destination: artifactPath,
-          expectedSha256,
-          expectedSize: detail.artifactSizeBytes,
-          maxArtifactBytes: this.maxArtifactBytes,
-          signal: active.signal,
-          checkpoint: active.checkpoint
-        })
-        active.checkpoint()
-        const stagePath = this.localOperationPath(operation, '/stage')
-        const stageBody = fs.createReadStream(artifactPath)
-        let stagedResponse
-        try {
-          stagedResponse = await this.localRequest(
-            stagePath,
-            {
-              body: stageBody,
-              duplex: 'half',
-              headers: {
-                'Content-Length': String(verified.artifactSizeBytes),
-                'Content-Type': 'application/zip',
-                'X-Hermes-Artifact-Sha256': verified.artifactSha256,
-                'X-Hermes-Client-Operation-Id': operation.clientOperationId,
-                'X-Hermes-Install-Authorization-Hash': operation.installAuthorizationHash,
-                'X-Hermes-Desktop-User-Id': operation.desktopUserId,
-                'X-Hermes-Materialization-Binding-Schema-Version': String(operation.materializationBindingSchemaVersion),
-                'X-Hermes-Materialized-Content-Hash': operation.materializedContentHash,
-                'X-Hermes-Materialization-Recovery-Expires-At': operation.materializationRecoveryExpiresAt,
-                ...(operation.tenantId ? { 'X-Hermes-Tenant-Id': operation.tenantId } : {}),
-                'X-Hermes-Operation-Expires-At': operation.expiresAt
-              },
-              method: 'POST'
-            },
-            active
-          )
-        } finally {
-          stageBody.destroy()
-        }
-        const staged = await readJsonResponse(stagedResponse, {
-          checkpoint: active.checkpoint,
-          signal: active.signal
-        })
-        if (staged?.state !== 'staged' || staged?.operationId !== operation.operationId) {
-          throw new EnterpriseSkillHubError(
-            'local_stage_response_invalid',
-            'The local Hermes backend did not durably stage the install operation.'
-          )
-        }
-        const latest = normalizeCatalogItem(await this.client.skillHubSkill(token, key, { signal: active.signal }))
-        active.checkpoint()
-        if (
-          latest.key !== detail.key ||
-          latest.currentRevision !== requestedRevision ||
-          latest.artifactSha256 !== expectedSha256 ||
-          latest.artifactSizeBytes !== detail.artifactSizeBytes ||
-          latest.policyStatus !== detail.policyStatus
-        ) {
-          throw new EnterpriseSkillHubError(
-            'package_revision_changed',
-            'The enterprise skill package changed before installation. Refresh and try again.',
-            { status: 409 }
-          )
-        }
-        if (latest.policyStatus === 'blocked' || latest.policyStatus === 'restricted') {
-          throw new EnterpriseSkillHubError(
-            'skill_policy_denied',
-            'Enterprise policy no longer allows this skill to be installed.',
-            { status: 403 }
-          )
-        }
-        const committed = normalizeGatewayInstallResponse(
-          await this.client.commitSkillInstallOperation(token, operation.operationId, { signal: active.signal }),
-          operation
-        )
-        active.checkpoint()
-        const installed = await this.materializeLocalOperation(operation, committed, active)
-        active.checkpoint()
-        this.operationStore.clear()
-        return { committed, detail, installed, operation }
-      } finally {
-        await fs.promises.rm(tempRoot, { force: true, recursive: true }).catch(() => undefined)
-      }
+      await this.stageLocalOperation(operation, detail, token, active)
+      await this.currentInstallDetail(operation, token, active, detail)
+      const committed = normalizeGatewayInstallResponse(
+        await this.client.commitSkillInstallOperation(token, operation.operationId, { signal: active.signal }),
+        operation
+      )
+      active.checkpoint()
+      const installed = await this.materializeLocalOperation(operation, committed, active)
+      active.checkpoint()
+      this.operationStore.clear()
+      return { committed, detail, installed, operation }
     })
     } catch (error) {
       if (!storedOperation) throw error

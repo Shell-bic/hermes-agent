@@ -142,29 +142,31 @@ function createHarness({
     async commitSkillInstallOperation(token, _operationId) {
       gatewayTokens.push(token)
       onCommit?.()
+      const currentOperation = operationStore.readOperation()
       return {
         operation: {
           ...operationBase,
-          clientOperationId: storedOperation.clientOperationId,
+          clientOperationId: currentOperation.clientOperationId,
           status: 'commit-authorized',
-          skillKey: storedOperation.key,
-          packageRevision: storedOperation.revision,
-          artifactSha256: storedOperation.artifactSha256,
-          installAuthorizationHash: storedOperation.installAuthorizationHash
+          skillKey: currentOperation.key,
+          packageRevision: currentOperation.revision,
+          artifactSha256: currentOperation.artifactSha256,
+          installAuthorizationHash: currentOperation.installAuthorizationHash
         },
         materializationReceipt: 'header.payload.signature'
       }
     },
     async getSkillInstallOperation() {
+      const currentOperation = operationStore.readOperation()
       return {
         operation: {
           ...operationBase,
-          clientOperationId: storedOperation.clientOperationId,
+          clientOperationId: currentOperation.clientOperationId,
           status: 'pending',
-          skillKey: storedOperation.key,
-          packageRevision: storedOperation.revision,
-          artifactSha256: storedOperation.artifactSha256,
-          installAuthorizationHash: storedOperation.installAuthorizationHash
+          skillKey: currentOperation.key,
+          packageRevision: currentOperation.revision,
+          artifactSha256: currentOperation.artifactSha256,
+          installAuthorizationHash: currentOperation.installAuthorizationHash
         },
         materializationReceipt: null
       }
@@ -179,7 +181,7 @@ function createHarness({
       if (String(url).endsWith(INSTALLED_PATH)) {
         return jsonResponse({ items: [] })
       }
-      if (String(url).includes('/install-operations/') && init.method === 'GET') {
+      if (String(url).includes('/install-operations/') && (!init.method || init.method === 'GET')) {
         return jsonResponse({ operationId: operationBase.operationId, state: 'staged' })
       }
       if (String(url).includes('/install-operations/') && String(url).includes('/abort')) {
@@ -832,15 +834,117 @@ test('create response loss replays the identical clientOperationId and preserves
   assert.equal(store.readOperation().reconciliationToken, 'srt_test-recovery')
 })
 
-test('commit-in-flight pending recovery keeps the SRT and local staged operation', async () => {
+test('pending recovery advances an already-staged operation through commit and materialize', async () => {
   const store = memoryStore(createdStoredOperation())
   const { hub, localRequests } = createHarness({ operationStore: store })
 
   const result = await hub.recoverPendingOperation()
 
-  assert.equal(result.state, 'reconciling')
-  assert.equal(store.readOperation().reconciliationToken, 'srt_test-recovery')
+  assert.equal(result.operation.state, 'materialized')
+  assert.equal(result.installed.state, 'installed')
+  assert.equal(store.readOperation(), null)
   assert.equal(localRequests.some(request => request.url.includes('/abort')), false)
+  assert.equal(localRequests.some(request => request.url.includes('/materialize')), true)
+})
+
+test('created pending recovery restages a missing local operation and completes safely', async () => {
+  const body = Buffer.from('enterprise-skill-zip')
+  const item = catalogItem(body)
+  const store = memoryStore(createdStoredOperation())
+  const before = tempEntries()
+  let commits = 0
+  let downloads = 0
+  let materializes = 0
+  let stages = 0
+  let statusReads = 0
+  const { hub } = createHarness({
+    body,
+    detail: item,
+    operationStore: store,
+    onCommit: () => { commits += 1 },
+    onDownload: () => { downloads += 1 },
+    localFetch: async (url, init = {}) => {
+      if ((!init.method || init.method === 'GET') && String(url).includes('/install-operations/')) {
+        statusReads += 1
+        return jsonResponse({ code: 'install_operation_not_found' }, 404)
+      }
+      if (String(url).includes('/stage')) {
+        stages += 1
+        const chunks = []
+        for await (const chunk of init.body) chunks.push(Buffer.from(chunk))
+        assert.deepEqual(Buffer.concat(chunks), body)
+        assert.equal(init.headers['X-Hermes-Artifact-Sha256'], item.artifactSha256)
+        assert.equal(init.headers['X-Hermes-Client-Operation-Id'], 'desktop-operation-recovery')
+        return jsonResponse({ operationId: createdStoredOperation().operationId, state: 'staged' })
+      }
+      if (String(url).includes('/materialize')) {
+        materializes += 1
+        return jsonResponse({
+          artifactSha256: item.artifactSha256,
+          key: item.key,
+          name: item.name,
+          revision: item.currentRevision,
+          state: 'installed'
+        })
+      }
+      throw new Error(`unexpected local request: ${url}`)
+    }
+  })
+
+  const result = await hub.recoverPendingOperation()
+
+  assert.equal(result.operation.state, 'materialized')
+  assert.equal(result.installed.key, item.key)
+  assert.equal(statusReads, 1)
+  assert.equal(downloads, 1)
+  assert.equal(stages, 1)
+  assert.equal(commits, 1)
+  assert.equal(materializes, 1)
+  assert.equal(store.readOperation(), null)
+  assert.deepEqual(
+    [...tempEntries()].filter(name => !before.has(name)),
+    []
+  )
+})
+
+test('pending restage aborts and clears only after catalog drift is confirmed', async () => {
+  const body = Buffer.from('enterprise-skill-zip')
+  const item = catalogItem(body)
+  const changed = { ...item, currentRevision: item.currentRevision + 1 }
+  const store = memoryStore(createdStoredOperation())
+  let aborts = 0
+  let commits = 0
+  let materializes = 0
+  const { hub } = createHarness({
+    body,
+    details: [item, changed],
+    operationStore: store,
+    onCommit: () => { commits += 1 },
+    localFetch: async (url, init = {}) => {
+      if ((!init.method || init.method === 'GET') && String(url).includes('/install-operations/')) {
+        return jsonResponse({ code: 'install_operation_not_found' }, 404)
+      }
+      if (String(url).includes('/stage')) {
+        for await (const chunk of init.body) assert.ok(chunk)
+        return jsonResponse({ operationId: createdStoredOperation().operationId, state: 'staged' })
+      }
+      if (String(url).includes('/abort')) {
+        aborts += 1
+        return jsonResponse({ state: 'aborted', targetAbsent: true })
+      }
+      if (String(url).includes('/materialize')) materializes += 1
+      throw new Error(`unexpected local request: ${url}`)
+    }
+  })
+
+  await assert.rejects(
+    hub.recoverPendingOperation(),
+    error => error.code === 'package_revision_changed' && error.status === 409
+  )
+  assert.equal(aborts, 1)
+  assert.equal(commits, 0)
+  assert.equal(materializes, 0)
+  assert.equal(store.readOperation(), null)
 })
 
 test('recovery uses one lifecycle lease and revocation prevents post-response persistence', async () => {
