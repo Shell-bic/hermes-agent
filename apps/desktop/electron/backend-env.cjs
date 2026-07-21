@@ -13,6 +13,7 @@ const POSIX_SANE_PATH_ENTRIES = Object.freeze([
   '/sbin',
   '/bin'
 ])
+const LOCAL_DEVELOPMENT_SKILL_RECEIPT_ENV = 'HERMES_ENTERPRISE_ALLOW_LOCAL_DEVELOPMENT_SKILL_RECEIPTS'
 
 function delimiterForPlatform(platform = process.platform) {
   return platform === 'win32' ? ';' : ':'
@@ -78,6 +79,7 @@ function normalizeHermesHomeRoot(hermesHome, { pathModule = pathModuleForPlatfor
 }
 
 function buildDesktopBackendEnv({
+  allowLocalDevelopmentSkillReceipts = false,
   hermesHome,
   pythonPathEntries = [],
   venvRoot,
@@ -97,11 +99,13 @@ function buildDesktopBackendEnv({
       currentPath: currentPathValue(currentEnv, platform),
       platform,
       pathModule
-    })
+    }),
+    ...(allowLocalDevelopmentSkillReceipts ? { [LOCAL_DEVELOPMENT_SKILL_RECEIPT_ENV]: '1' } : {})
   }
 }
 
 module.exports = {
+  LOCAL_DEVELOPMENT_SKILL_RECEIPT_ENV,
   POSIX_SANE_PATH_ENTRIES,
   appendUniquePathEntries,
   buildDesktopBackendEnv,

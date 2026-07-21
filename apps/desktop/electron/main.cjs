@@ -2725,6 +2725,7 @@ function createPythonBackend(root, label, dashboardArgs, options = {}) {
     command: python,
     args: ['-m', 'hermes_cli.main', ...dashboardArgs],
     env: buildDesktopBackendEnv({
+      allowLocalDevelopmentSkillReceipts: !IS_PACKAGED,
       hermesHome: HERMES_HOME,
       pythonPathEntries: [root],
       venvRoot: path.join(root, 'venv')

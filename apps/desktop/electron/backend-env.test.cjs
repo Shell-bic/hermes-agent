@@ -3,6 +3,7 @@ const assert = require('node:assert/strict')
 const path = require('node:path')
 
 const {
+  LOCAL_DEVELOPMENT_SKILL_RECEIPT_ENV,
   POSIX_SANE_PATH_ENTRIES,
   appendUniquePathEntries,
   buildDesktopBackendEnv,
@@ -10,6 +11,23 @@ const {
   normalizeHermesHomeRoot,
   pathEnvKey
 } = require('./backend-env.cjs')
+
+test('desktop backend env injects the receipt gate only when explicitly enabled for development source', () => {
+  const development = buildDesktopBackendEnv({
+    allowLocalDevelopmentSkillReceipts: true,
+    currentEnv: {},
+    platform: 'linux',
+    pathModule: path.posix
+  })
+  const productionOrExisting = buildDesktopBackendEnv({
+    currentEnv: {},
+    platform: 'linux',
+    pathModule: path.posix
+  })
+
+  assert.equal(development[LOCAL_DEVELOPMENT_SKILL_RECEIPT_ENV], '1')
+  assert.equal(Object.hasOwn(productionOrExisting, LOCAL_DEVELOPMENT_SKILL_RECEIPT_ENV), false)
+})
 
 test('desktop backend PATH adds Hermes-managed bins and missing POSIX sane entries', () => {
   const result = buildDesktopBackendPath({
