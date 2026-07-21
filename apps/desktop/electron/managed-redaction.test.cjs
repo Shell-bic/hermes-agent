@@ -2,6 +2,7 @@ const assert = require('node:assert/strict')
 const fs = require('node:fs')
 const path = require('node:path')
 const test = require('node:test')
+const vm = require('node:vm')
 
 const { REDACTED, isEnterpriseManagedEnv, redactManagedText } = require('./managed-redaction.cjs')
 
@@ -52,8 +53,51 @@ test('desktop sinks and preload bridge wire the managed redactor at their final 
   assert.match(main, /function rememberLog\(chunk\)[\s\S]{0,160}redactManagedText\(chunk, ENTERPRISE_MANAGED_OUTPUTS\)/)
   assert.match(main, /title: redactManagedText\(payload\?\.title \|\| 'Hermes', ENTERPRISE_MANAGED_OUTPUTS\)/)
   assert.match(main, /body: redactManagedText\(payload\?\.body \|\| '', ENTERPRISE_MANAGED_OUTPUTS\)/)
+  assert.match(main, /ipcMain\.on\('hermes:managed-output-redaction:enabled'/)
+  assert.match(main, /ipcMain\.on\('hermes:managed-output-redaction:redact'/)
   assert.match(preload, /managed: ENTERPRISE_MANAGED_OUTPUTS/)
-  assert.match(preload, /redactSensitiveText: value => redactManagedText\(value, ENTERPRISE_MANAGED_OUTPUTS\)/)
+  assert.match(preload, /redactSensitiveText: value => redactManagedText\(value\)/)
+})
+
+test('sandboxed preload loads only Electron and delegates redaction to the main process', () => {
+  const preloadPath = path.join(__dirname, 'preload.cjs')
+  const preload = fs.readFileSync(preloadPath, 'utf8')
+  const exposed = {}
+  const syncCalls = []
+  const ipcRenderer = {
+    invoke() {},
+    on() {},
+    removeListener() {},
+    send() {},
+    sendSync(channel, value) {
+      syncCalls.push([channel, value])
+      if (channel === 'hermes:managed-output-redaction:enabled') return true
+      if (channel === 'hermes:managed-output-redaction:redact') return `redacted:${String(value ?? '')}`
+      throw new Error(`Unexpected synchronous IPC channel: ${channel}`)
+    }
+  }
+
+  vm.runInNewContext(preload, {
+    require(specifier) {
+      assert.equal(specifier, 'electron')
+      return {
+        contextBridge: {
+          exposeInMainWorld(name, value) {
+            exposed[name] = value
+          }
+        },
+        ipcRenderer,
+        webUtils: { getPathForFile: () => '' }
+      }
+    }
+  }, { filename: preloadPath })
+
+  assert.equal(exposed.hermesDesktop.enterprise.managed, true)
+  assert.equal(exposed.hermesDesktop.redactSensitiveText('gw_FAKE'), 'redacted:gw_FAKE')
+  assert.deepEqual(syncCalls, [
+    ['hermes:managed-output-redaction:enabled', undefined],
+    ['hermes:managed-output-redaction:redact', 'gw_FAKE']
+  ])
 })
 
 test('managed redactor removes one-layer encoded fake tokens and sensitive env text', () => {

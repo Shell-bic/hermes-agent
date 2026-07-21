@@ -36,6 +36,16 @@ test('Desktop validators consume the shared valid request, transaction, and bind
   assert.doesNotThrow(() => validateWeComBotBinding(fixture('valid', 'binding-connected.json')))
 })
 
+test('Desktop-hosted runtime accepts verified connected bindings while the local Bot process is offline', () => {
+  const binding = {
+    ...fixture('valid', 'binding-connected.json'),
+    connectionStatus: 'offline'
+  }
+
+  assert.throws(() => validateWeComBotBinding(binding), error => error?.code === 'binding_connected_state_invalid')
+  assert.doesNotThrow(() => validateWeComBotBinding(binding, { allowDesktopHostedOffline: true }))
+})
+
 for (const fileName of [
   'transaction-request-wrong-version.json',
   'transaction-request-empty-capabilities.json',

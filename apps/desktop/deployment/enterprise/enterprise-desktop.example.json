@@ -1,5 +1,6 @@
 {
   "schemaVersion": 1,
   "enabled": true,
-  "gatewayUrl": "https://gateway.example.com"
+  "gatewayUrl": "https://gateway.example.com",
+  "weComGatewayRunnerExperiment": false
 }

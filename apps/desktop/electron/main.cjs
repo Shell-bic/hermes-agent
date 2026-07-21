@@ -97,6 +97,14 @@ const { createEnterpriseSkillHub, publicError: publicEnterpriseSkillHubError } =
 const { isTrustedRendererUrl } = require('./renderer-trust.cjs')
 const { createEnterpriseWeComController } = require('./enterprise-wecom-controller.cjs')
 const { createEnterpriseWeComView } = require('./enterprise-wecom-view.cjs')
+const { createEnterpriseWeComBotController } = require('./enterprise-wecom-bot-controller.cjs')
+const { createEnterpriseWeComBotView } = require('./enterprise-wecom-bot-view.cjs')
+const {
+  createEnterpriseWeComGatewayRunnerExperiment,
+  scrubWeComChildEnv
+} = require('./enterprise-wecom-gateway-runner.cjs')
+const { createEnterpriseWeComRuntimeControlClient } = require('./enterprise-wecom-runtime-control.cjs')
+const { createEnterpriseWeComRelay } = require('./enterprise-wecom-relay.cjs')
 
 let nodePty = null
 let nodePtyDir = null
@@ -355,6 +363,13 @@ const ENTERPRISE_RUNTIME_OPTIONS = resolveEnterpriseRuntimeOptions(process.env, 
     userDataPath: app.getPath('userData')
   })
 })
+// Branch-only WeCom experiment builds must never repair or update the shared
+// user runtime through the original Hermes `main` channel. Their Python root
+// is supplied explicitly by the experiment launcher, keeping the packaged
+// shell and its runtime on the same dirty worktree snapshot.
+const ENTERPRISE_WECOM_PINNED_RUNTIME =
+  ENTERPRISE_RUNTIME_OPTIONS.weComGatewayRunnerExperiment === true ||
+  process.env.HERMES_DESKTOP_WECOM_GATEWAY_RUNNER_EXPERIMENT === '1'
 const ENTERPRISE_MANAGED_OUTPUTS = ENTERPRISE_RUNTIME_OPTIONS.enabled || isEnterpriseManagedEnv(process.env)
 const enterpriseAuthStore = createEnterpriseAuthStore({
   filePath: ENTERPRISE_AUTH_STORE_PATH,
@@ -885,6 +900,12 @@ function registerMediaProtocol() {
 }
 
 let mainWindow = null
+const enterpriseWeComRuntimeControlToken = crypto.randomBytes(32).toString('base64url')
+let enterpriseWeComRuntimeConnection = null
+const enterpriseWeComRuntimeControl = createEnterpriseWeComRuntimeControlClient({
+  getConnection: async () => enterpriseWeComRuntimeConnection,
+  getRuntimeToken: () => enterpriseWeComRuntimeControlToken
+})
 const enterpriseWeComView = createEnterpriseWeComView({
   WebContentsView,
   getHostWindow: () => mainWindow,
@@ -905,9 +926,51 @@ const enterpriseWeComController = createEnterpriseWeComController({
   rememberLog,
   runtime: enterpriseRuntime
 })
+const enterpriseWeComBotView = createEnterpriseWeComBotView({ BrowserWindow, rememberLog })
+const enterpriseWeComBotController = createEnterpriseWeComBotController({
+  client: enterpriseRuntime.client,
+  desktopHostedRuntime: ENTERPRISE_WECOM_PINNED_RUNTIME,
+  getDesktopToken: () => enterpriseRuntime.getDesktopToken(),
+  onBeforeBotRevoke: bindingId => enterpriseWeComGatewayRunnerExperiment.detach(bindingId),
+  onBindingCompleted: binding => {
+    enterpriseWeComRelay.stop()
+    return enterpriseWeComGatewayRunnerExperiment.attach(binding)
+  },
+  onState: state => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('hermes:enterprise:wecom-bot-state', state)
+    }
+  },
+  view: enterpriseWeComBotView
+})
+const enterpriseWeComGatewayRunnerExperiment = createEnterpriseWeComGatewayRunnerExperiment({
+  client: enterpriseRuntime.client,
+  enabled: ENTERPRISE_WECOM_PINNED_RUNTIME,
+  gatewayBaseUrl: ENTERPRISE_RUNTIME_OPTIONS.gatewayUrl,
+  getDesktopToken: () => enterpriseRuntime.getDesktopToken(),
+  getGatewayServiceToken: () => enterpriseRuntime.getGatewayToken(),
+  runtimeControl: enterpriseWeComRuntimeControl
+})
+const enterpriseWeComRelay = createEnterpriseWeComRelay({
+  client: enterpriseRuntime.client,
+  getRuntimeToken: () => enterpriseRuntime.getGatewayToken(),
+  getWsUrl: () => freshGatewayWsUrl(null),
+  onState: state => enterpriseWeComBotController.applyRelayState(state),
+  onSessionEvent: event => {
+    for (const window of BrowserWindow.getAllWindows()) {
+      if (!window.isDestroyed()) window.webContents.send('hermes:enterprise:wecom-session-event', event)
+    }
+  },
+  storePath: () => {
+    const home = enterpriseRuntime.getManagedHermesHome()
+    return home ? path.join(home, 'wecom-relay-state.json') : ''
+  },
+  WebSocketImpl: globalThis.WebSocket
+})
 let enterpriseQuitCleanupPromise = null
 let enterpriseQuitReady = false
 let hermesProcess = null
+const intentionallyStoppedHermesProcesses = new WeakSet()
 let connectionPromise = null
 // Additional per-profile backends, keyed by profile name. The PRIMARY backend
 // (the desktop's launch profile) stays managed by hermesProcess +
@@ -1413,16 +1476,18 @@ function findPythonForRoot(root) {
   const override = process.env.HERMES_DESKTOP_PYTHON
   if (override && fileExists(override)) return override
 
-  const relativePaths = IS_WINDOWS
-    ? [path.join('.venv', 'Scripts', 'python.exe'), path.join('venv', 'Scripts', 'python.exe')]
-    : [path.join('.venv', 'bin', 'python'), path.join('venv', 'bin', 'python')]
-
-  for (const relativePath of relativePaths) {
-    const candidate = path.join(root, relativePath)
-    if (fileExists(candidate)) return candidate
-  }
+  const candidate = getVenvPython(resolvePythonVenvRoot(root))
+  if (fileExists(candidate)) return candidate
 
   return findSystemPython()
+}
+
+function resolvePythonVenvRoot(root) {
+  for (const name of ['.venv', 'venv']) {
+    const candidate = path.join(root, name)
+    if (fileExists(getVenvPython(candidate))) return candidate
+  }
+  return path.join(root, 'venv')
 }
 
 function findSystemPython() {
@@ -1732,6 +1797,14 @@ async function resolveHealedBranch(updateRoot, branch) {
 }
 
 async function checkUpdates() {
+  if (ENTERPRISE_WECOM_PINNED_RUNTIME) {
+    return {
+      supported: false,
+      reason: 'enterprise-experiment-pinned-runtime',
+      message: 'Updates are disabled while the WeCom GatewayRunner branch experiment is active.'
+    }
+  }
+
   const updateRoot = resolveUpdateRoot()
   let { branch } = readDesktopUpdateConfig()
   const gitDir = path.join(updateRoot, '.git')
@@ -2004,6 +2077,12 @@ async function releaseBackendLock(updateRoot, tag) {
 // Detection (checkUpdates / commit changelog / "N behind") stays in the UI;
 // only this apply action changed.
 async function applyUpdates(opts = {}) {
+  if (ENTERPRISE_WECOM_PINNED_RUNTIME) {
+    const error = new Error('Updates are disabled while the WeCom GatewayRunner branch experiment is active.')
+    error.code = 'enterprise-experiment-update-disabled'
+    throw error
+  }
+
   if (updateInFlight) {
     throw new Error('An update is already in progress.')
   }
@@ -2540,6 +2619,7 @@ function writeDefaultProjectDir(dir) {
 function createPythonBackend(root, label, dashboardArgs, options = {}) {
   const python = findPythonForRoot(root)
   if (!python) return null
+  const venvRoot = resolvePythonVenvRoot(root)
 
   return {
     kind: 'python',
@@ -2549,7 +2629,7 @@ function createPythonBackend(root, label, dashboardArgs, options = {}) {
     env: buildDesktopBackendEnv({
       hermesHome: HERMES_HOME,
       pythonPathEntries: [root],
-      venvRoot: path.join(root, 'venv')
+      venvRoot
     }),
     root,
     bootstrap: Boolean(options.bootstrap),
@@ -2733,6 +2813,16 @@ async function ensureRuntime(backend) {
   // to a renderer-side install overlay.
   if (backend.kind === 'bootstrap-needed') {
     rememberLog('[bootstrap] no Hermes install found; starting first-launch bootstrap')
+
+    if (ENTERPRISE_WECOM_PINNED_RUNTIME) {
+      const pinnedRuntimeError = new Error(
+        'The WeCom GatewayRunner branch experiment requires an explicit local runtime root; automatic repair is disabled.'
+      )
+      pinnedRuntimeError.code = 'enterprise-experiment-runtime-unavailable'
+      pinnedRuntimeError.isBootstrapFailure = true
+      bootstrapFailure = pinnedRuntimeError
+      throw pinnedRuntimeError
+    }
 
     if (await handOffWindowsBootstrapRecovery('bootstrap-needed')) {
       const handoffError = new Error('Hermes recovery was handed off to Hermes Setup. The desktop will restart when recovery completes.')
@@ -4797,6 +4887,7 @@ function resetHermesConnection() {
   connectionPromise = null
 
   if (hermesProcess && !hermesProcess.killed) {
+    intentionallyStoppedHermesProcesses.add(hermesProcess)
     hermesProcess.kill('SIGTERM')
   }
 
@@ -5136,6 +5227,16 @@ async function startHermes() {
     if (enterpriseManaged) {
       await advanceBootProgress('enterprise.runtime', 'Preparing enterprise managed runtime', 18)
       enterpriseLaunch = await enterpriseRuntime.prepareLaunch()
+      const allowedMessagingChannels = enterpriseLaunch?.publicState?.messagingChannelPolicy?.allowedChannelIds
+      if (Array.isArray(allowedMessagingChannels) && allowedMessagingChannels.includes('wecom-personal')) {
+        if (enterpriseWeComGatewayRunnerExperiment.isEnabled()) {
+          enterpriseWeComRelay.stop()
+        } else {
+          enterpriseWeComRelay.start()
+        }
+      } else {
+        enterpriseWeComRelay.stop()
+      }
     }
 
     // Resolve for the desktop's primary profile so a per-profile remote
@@ -5183,44 +5284,66 @@ async function startHermes() {
     await advanceBootProgress('backend.spawn', `Starting Hermes backend via ${backend.label}`, 84)
     rememberLog(`Starting Hermes backend via ${backend.label}`)
 
-    hermesProcess = spawn(
-      backend.command,
-      backend.args,
-      hiddenWindowsChildOptions({
-        cwd: hermesCwd,
-        env: {
-          ...process.env,
-          ...backend.env,
-          // Explicitly pin HERMES_HOME for the child so Python's get_hermes_home()
-          // resolves to the SAME location our resolveHermesHome() picked. Without
-          // this pin, Python falls back to ~/.hermes on every platform — fine on
-          // mac/linux (where our default matches), but on Windows our default is
-          // %LOCALAPPDATA%\hermes, which differs from C:\Users\<u>\.hermes.
-          // Mismatch would split config / sessions / .env / logs across two
-          // directories. install.ps1 sets HERMES_HOME via setx; the desktop
-          // can't reliably do that, so we set it inline for every spawn.
-          HERMES_HOME: enterpriseLaunch.hermesHome || HERMES_HOME,
-          ...(enterpriseLaunch.env || {}),
-          TERMINAL_CWD: hermesCwd,
-          HERMES_DASHBOARD_SESSION_TOKEN: token,
-          // Marks this dashboard backend as desktop-spawned so it runs the cron
-          // scheduler tick loop (the gateway isn't running under the app).
-          HERMES_DESKTOP: '1',
-          HERMES_WEB_DIST: webDist
-        },
-        shell: backend.shell,
-        stdio: ['ignore', 'pipe', 'pipe']
-      })
-    )
+    const childEnv = {
+      ...process.env,
+      ...backend.env,
+      // Explicitly pin HERMES_HOME for the child so Python's get_hermes_home()
+      // resolves to the SAME location our resolveHermesHome() picked. Without
+      // this pin, Python falls back to ~/.hermes on every platform — fine on
+      // mac/linux (where our default matches), but on Windows our default is
+      // %LOCALAPPDATA%\hermes, which differs from C:\Users\<u>\.hermes.
+      // Mismatch would split config / sessions / .env / logs across two
+      // directories. install.ps1 sets HERMES_HOME via setx; the desktop
+      // can't reliably do that, so we set it inline for every spawn.
+      HERMES_HOME: enterpriseLaunch.hermesHome || HERMES_HOME,
+      ...(enterpriseLaunch.env || {}),
+      TERMINAL_CWD: hermesCwd,
+      HERMES_DASHBOARD_SESSION_TOKEN: token,
+      HERMES_ENTERPRISE_RUNTIME_CONTROL_TOKEN: enterpriseWeComRuntimeControlToken,
+      // Marks this dashboard backend as desktop-spawned so it runs the cron
+      // scheduler tick loop (the gateway isn't running under the app).
+      HERMES_DESKTOP: '1',
+      HERMES_WEB_DIST: webDist
+    }
+    if (enterpriseWeComGatewayRunnerExperiment.isEnabled()) {
+      // The Electron-side experiment gate controls whether the Python child
+      // hosts the original GatewayRunner. Keep the child flag separate from
+      // the launcher flag so a normal Desktop backend never starts a channel
+      // runtime implicitly.
+      childEnv.HERMES_DESKTOP_WECOM_GATEWAY_RUNNER = '1'
+      // Do not inherit operator/user WECOM_* values into the experiment. Only
+      // the just-fetched runtime config may cross into this controlled child.
+      scrubWeComChildEnv(childEnv)
+    }
 
-    hermesProcess.stdout.on('data', rememberLog)
-    hermesProcess.stderr.on('data', rememberLog)
+    try {
+      hermesProcess = spawn(
+        backend.command,
+        backend.args,
+        hiddenWindowsChildOptions({
+          cwd: hermesCwd,
+          env: childEnv,
+          shell: backend.shell,
+          stdio: ['ignore', 'pipe', 'pipe']
+        })
+      )
+    } finally {
+      // spawn synchronously snapshots its options. Remove the credential pair
+      // from every main-process launch object immediately afterward.
+      scrubWeComChildEnv(childEnv)
+      delete childEnv.HERMES_ENTERPRISE_RUNTIME_CONTROL_TOKEN
+    }
+
+    const spawnedHermesProcess = hermesProcess
+
+    spawnedHermesProcess.stdout.on('data', rememberLog)
+    spawnedHermesProcess.stderr.on('data', rememberLog)
     let backendReady = false
     let rejectBackendStart = null
     const backendStartFailed = new Promise((_resolve, reject) => {
       rejectBackendStart = reject
     })
-    hermesProcess.once('error', error => {
+    spawnedHermesProcess.once('error', error => {
       rememberLog(`Hermes backend failed to start: ${error.message}`)
       updateBootProgress(
         {
@@ -5236,11 +5359,16 @@ async function startHermes() {
       sendBackendExit({ code: null, signal: null, error: error.message })
       rejectBackendStart?.(error)
     })
-    hermesProcess.once('exit', (code, signal) => {
+    spawnedHermesProcess.once('exit', (code, signal) => {
       rememberLog(`Hermes backend exited (${signal || code})`)
-      hermesProcess = null
+      const intentionalStop = intentionallyStoppedHermesProcesses.delete(spawnedHermesProcess)
+      if (hermesProcess === spawnedHermesProcess) hermesProcess = null
+      enterpriseWeComRuntimeConnection = null
       connectionPromise = null
-      sendBackendExit({ code, signal })
+      if (enterpriseWeComGatewayRunnerExperiment.isEnabled()) {
+        enterpriseWeComBotController.applyRuntimeState({ state: 'detached' })
+      }
+      if (!intentionalStop) sendBackendExit({ code, signal })
       if (!backendReady) {
         const message = `Hermes backend exited before it became ready (${signal || code}).`
         updateBootProgress(
@@ -5260,9 +5388,15 @@ async function startHermes() {
       }
     })
 
+    // Install the ready-line listener before the first await after spawn.
+    // A fast backend can announce its ephemeral port while boot progress is
+    // being persisted; attaching afterward loses the one-shot stdout line and
+    // leaves Desktop waiting until the 45-second timeout.
+    const dashboardPortPromise = waitForDashboardPort(spawnedHermesProcess)
+
     await advanceBootProgress('backend.port', 'Waiting for Hermes backend to launch', 86)
     // Discover the ephemeral port the child bound to
-    const port = await Promise.race([waitForDashboardPort(hermesProcess), backendStartFailed])
+    const port = await Promise.race([dashboardPortPromise, backendStartFailed])
 
     const baseUrl = `http://127.0.0.1:${port}`
     await advanceBootProgress('backend.wait', 'Waiting for Hermes backend to become ready', 90)
@@ -5280,6 +5414,15 @@ async function startHermes() {
       running: true,
       error: null
     })
+    enterpriseWeComRuntimeConnection = { baseUrl }
+    if (enterpriseWeComGatewayRunnerExperiment.isEnabled()) {
+      try {
+        const runtimeState = await enterpriseWeComGatewayRunnerExperiment.attach()
+        enterpriseWeComBotController.applyRuntimeState(runtimeState)
+      } catch (error) {
+        enterpriseWeComBotController.applyRuntimeState({ errorCode: error?.code || 'runtime-attach-failed', state: 'error' })
+      }
+    }
 
     return {
       baseUrl,
@@ -5544,11 +5687,20 @@ function createWindow() {
       return
     }
 
-    const state = await enterpriseRuntime.refreshPublicState()
+    const state = await refreshEnterprisePublicStateAndEnforceLifecycle()
     if (state.authenticated) {
       startHermes().catch(error => rememberLog(error.stack || error.message))
     }
   })
+}
+
+async function refreshEnterprisePublicStateAndEnforceLifecycle() {
+  const state = await enterpriseRuntime.refreshPublicState()
+  if (enterpriseWeComGatewayRunnerExperiment.isEnabled() && !enterpriseRuntime.hasStoredSession()) {
+    enterpriseWeComRelay.stop()
+    await teardownPrimaryBackendAndWait()
+  }
+  return state
 }
 
 function isTrustedEnterpriseRendererUrl(rawUrl) {
@@ -5585,9 +5737,39 @@ ipcMain.handle('hermes:enterprise:status', async event => {
   assertTrustedEnterpriseSender(event)
   return enterpriseRuntime.getPublicState()
 })
+ipcMain.handle('hermes:enterprise:wecom-bot-state', async event => {
+  assertTrustedEnterpriseSender(event, { mainWindowOnly: true })
+  return enterpriseWeComBotController.refresh()
+})
+ipcMain.handle('hermes:enterprise:wecom-bot-start', async event => {
+  assertTrustedEnterpriseSender(event, { mainWindowOnly: true })
+  return enterpriseWeComBotController.start()
+})
+ipcMain.handle('hermes:enterprise:wecom-bot-cancel', async event => {
+  assertTrustedEnterpriseSender(event, { mainWindowOnly: true })
+  return enterpriseWeComBotController.cancel()
+})
+ipcMain.handle('hermes:enterprise:wecom-bot-revoke', async event => {
+  assertTrustedEnterpriseSender(event, { mainWindowOnly: true })
+  enterpriseWeComRelay.stop()
+  return enterpriseWeComBotController.revokeBot()
+})
+ipcMain.handle('hermes:enterprise:wecom-bot-regenerate-verification', async event => {
+  assertTrustedEnterpriseSender(event, { mainWindowOnly: true })
+  return enterpriseWeComBotController.regenerateIdentityClaim()
+})
+ipcMain.handle('hermes:enterprise:wecom-bot-unlink-identity', async event => {
+  assertTrustedEnterpriseSender(event, { mainWindowOnly: true })
+  return enterpriseWeComBotController.unlinkIdentity()
+})
+ipcMain.handle('hermes:enterprise:wecom-bot-focus', async event => {
+  assertTrustedEnterpriseSender(event, { mainWindowOnly: true })
+  enterpriseWeComBotView.focus()
+  return enterpriseWeComBotController.publicState()
+})
 ipcMain.handle('hermes:enterprise:refresh', async event => {
   assertTrustedEnterpriseSender(event)
-  return enterpriseRuntime.refreshPublicState()
+  return refreshEnterprisePublicStateAndEnforceLifecycle()
 })
 ipcMain.handle('hermes:enterprise:login-methods', async event => {
   assertTrustedEnterpriseSender(event, { mainWindowOnly: true })
@@ -5621,9 +5803,9 @@ ipcMain.handle('hermes:enterprise:login', async (event, payload) => {
     error.code = 'enterprise-login-busy'
     throw error
   }
+  await teardownPrimaryBackendAndWait()
   const state = await enterpriseRuntime.login(payload || {})
   bootstrapFailure = null
-  await teardownPrimaryBackendAndWait()
   return state
 })
 // Explicit manifest/default refresh only. Ordinary model picker hot-switches
@@ -5636,10 +5818,14 @@ ipcMain.handle('hermes:enterprise:selectModel', async (event, model) => {
 })
 ipcMain.handle('hermes:enterprise:logout', async event => {
   assertTrustedEnterpriseSender(event)
-  await enterpriseWeComController.cancel({ force: true, nextStatus: 'idle', notifyRemote: true })
-  const state = await enterpriseRuntime.logout()
-  await teardownPrimaryBackendAndWait()
-  return state
+  try {
+    await enterpriseWeComController.cancel({ force: true, nextStatus: 'idle', notifyRemote: true })
+    await enterpriseWeComBotController.dispose()
+    return await enterpriseRuntime.logout()
+  } finally {
+    enterpriseWeComRelay.stop()
+    await teardownPrimaryBackendAndWait()
+  }
 })
 ipcMain.handle('hermes:enterprise:skill-hub:list', async (event, query) =>
   enterpriseSkillHubIpc(event, () => enterpriseSkillHub.list(query || {}))
@@ -5830,6 +6016,14 @@ ipcMain.handle('hermes:profile:set', async (_event, name) => {
   mainWindow?.reload()
 
   return { profile: next }
+})
+
+ipcMain.on('hermes:managed-output-redaction:enabled', event => {
+  event.returnValue = ENTERPRISE_MANAGED_OUTPUTS
+})
+
+ipcMain.on('hermes:managed-output-redaction:redact', (event, value) => {
+  event.returnValue = redactManagedText(value, ENTERPRISE_MANAGED_OUTPUTS)
 })
 
 ipcMain.on('hermes:previewShortcutActive', (_event, active) => {
@@ -6937,8 +7131,12 @@ app.on('before-quit', event => {
   if (!enterpriseQuitReady) {
     event.preventDefault()
     if (!enterpriseQuitCleanupPromise) {
-      enterpriseQuitCleanupPromise = enterpriseWeComController
-        .dispose({ permanent: true })
+      enterpriseQuitCleanupPromise = Promise.all([
+        enterpriseWeComController.dispose({ permanent: true }),
+        enterpriseWeComBotController.dispose(),
+        Promise.resolve().then(() => enterpriseWeComRelay.stop()),
+        teardownPrimaryBackendAndWait()
+      ])
         .catch(error => rememberLog(`[enterprise] quit cleanup failed: ${error?.message || error}`))
         .finally(() => {
           enterpriseQuitReady = true

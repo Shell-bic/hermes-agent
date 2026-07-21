@@ -1,7 +1,13 @@
 const { contextBridge, ipcRenderer, webUtils } = require('electron')
-const { isEnterpriseManagedEnv, redactManagedText } = require('./managed-redaction.cjs')
 
-const ENTERPRISE_MANAGED_OUTPUTS = isEnterpriseManagedEnv(process.env)
+// Sandboxed preloads can only require Electron and a small set of Node built-ins.
+// Keep the redaction implementation in the main process, where it is also used
+// by logs and notifications, and expose only its sanitized result here.
+const ENTERPRISE_MANAGED_OUTPUTS = ipcRenderer.sendSync('hermes:managed-output-redaction:enabled') === true
+
+function redactManagedText(value) {
+  return ipcRenderer.sendSync('hermes:managed-output-redaction:redact', value)
+}
 
 function unwrapEnterpriseSkillHub(result) {
   if (result?.ok) return result.value
@@ -42,6 +48,25 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
     refreshWeCom: () => ipcRenderer.invoke('hermes:enterprise:wecom-refresh'),
     selectLoginMethod: method => ipcRenderer.invoke('hermes:enterprise:login-method-select', method),
     selectModel: model => ipcRenderer.invoke('hermes:enterprise:selectModel', model),
+    weComBot: {
+      cancel: () => ipcRenderer.invoke('hermes:enterprise:wecom-bot-cancel'),
+      focusAuthorization: () => ipcRenderer.invoke('hermes:enterprise:wecom-bot-focus'),
+      onState: callback => {
+        const listener = (_event, state) => callback(state)
+        ipcRenderer.on('hermes:enterprise:wecom-bot-state', listener)
+        return () => ipcRenderer.removeListener('hermes:enterprise:wecom-bot-state', listener)
+      },
+      onSessionEvent: callback => {
+        const listener = (_event, state) => callback(state)
+        ipcRenderer.on('hermes:enterprise:wecom-session-event', listener)
+        return () => ipcRenderer.removeListener('hermes:enterprise:wecom-session-event', listener)
+      },
+      regenerateVerification: () => ipcRenderer.invoke('hermes:enterprise:wecom-bot-regenerate-verification'),
+      refresh: () => ipcRenderer.invoke('hermes:enterprise:wecom-bot-state'),
+      revoke: () => ipcRenderer.invoke('hermes:enterprise:wecom-bot-revoke'),
+      unlinkIdentity: () => ipcRenderer.invoke('hermes:enterprise:wecom-bot-unlink-identity'),
+      start: () => ipcRenderer.invoke('hermes:enterprise:wecom-bot-start')
+    },
     skillHub: {
       detail: key => ipcRenderer.invoke('hermes:enterprise:skill-hub:detail', key).then(unwrapEnterpriseSkillHub),
       install: payload =>
@@ -51,7 +76,7 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
     setWeComBounds: bounds => ipcRenderer.invoke('hermes:enterprise:wecom-bounds', bounds),
     status: () => ipcRenderer.invoke('hermes:enterprise:status')
   },
-  redactSensitiveText: value => redactManagedText(value, ENTERPRISE_MANAGED_OUTPUTS),
+  redactSensitiveText: value => redactManagedText(value),
   profile: {
     get: () => ipcRenderer.invoke('hermes:profile:get'),
     set: name => ipcRenderer.invoke('hermes:profile:set', name)

@@ -26,7 +26,8 @@ function resolveEnterpriseRuntimeOptions(env = process.env, { configPaths = [], 
 
   return {
     enabled,
-    gatewayUrl
+    gatewayUrl,
+    ...(config.weComGatewayRunnerExperiment === true ? { weComGatewayRunnerExperiment: true } : {})
   }
 }
 
@@ -208,6 +209,21 @@ class EnterpriseRuntime {
 
   hasStoredSession() {
     return Boolean(this.authStore?.readSession()?.desktopToken)
+  }
+
+  getDesktopToken() {
+    if (!this.enabled) return ''
+    return String(this.authStore?.readSession()?.desktopToken || '').trim()
+  }
+
+  getGatewayToken() {
+    if (!this.enabled) return ''
+    return String(this.lastLaunch?.env?.COMPANY_GATEWAY_TOKEN || '').trim()
+  }
+
+  getManagedHermesHome() {
+    if (!this.enabled) return ''
+    return String(this.lastLaunch?.hermesHome || this.managedHomeFor({ session: this.authStore?.readSession?.() })).trim()
   }
 
   getPublicState() {

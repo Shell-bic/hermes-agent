@@ -111,7 +111,7 @@ function validateWeComBotTransaction(value) {
   return value
 }
 
-function validateWeComBotBinding(value) {
+function validateWeComBotBinding(value, { allowDesktopHostedOffline = false } = {}) {
   requireExactFields(value, [
     'contractVersion', 'bindingId', 'botId', 'displayName', 'status', 'connectionStatus',
     'ownerVerificationRequired', 'createdAt', 'updatedAt', 'lastConnectedAt', 'errorCode'
@@ -126,7 +126,11 @@ function validateWeComBotBinding(value) {
   if (!BINDING_STATUSES.has(value.status) || !CONNECTION_STATUSES.has(value.connectionStatus)) invalid('binding_status_invalid', 'The binding status is invalid.')
   if (typeof value.ownerVerificationRequired !== 'boolean') invalid('binding_fields_invalid', 'Owner verification must be a boolean.')
   if (value.status === 'pending-owner-verification' && !value.ownerVerificationRequired) invalid('binding_owner_verification_invalid', 'A pending binding requires owner verification.')
-  if (value.status === 'connected' && (value.ownerVerificationRequired || value.connectionStatus !== 'online')) invalid('binding_connected_state_invalid', 'A connected binding must be verified and online.')
+  const desktopHostedOffline = allowDesktopHostedOffline === true && value.connectionStatus === 'offline'
+  if (value.status === 'connected' && (value.ownerVerificationRequired ||
+      (value.connectionStatus !== 'online' && !desktopHostedOffline))) {
+    invalid('binding_connected_state_invalid', 'A connected binding must be verified and online.')
+  }
   const createdAt = parseRfc3339DateTime(value.createdAt)
   const updatedAt = parseRfc3339DateTime(value.updatedAt)
   const lastConnectedAt = value.lastConnectedAt === null ? null : parseRfc3339DateTime(value.lastConnectedAt)

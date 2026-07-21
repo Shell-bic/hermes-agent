@@ -46,6 +46,17 @@ declare global {
         refreshWeCom: () => Promise<EnterpriseLoginState>
         selectLoginMethod: (method: EnterpriseLoginMethod) => Promise<EnterpriseLoginState>
         selectModel: (model: string) => Promise<EnterpriseDesktopState>
+        weComBot: {
+          cancel: () => Promise<EnterpriseWeComPersonalBotState>
+          focusAuthorization: () => Promise<EnterpriseWeComPersonalBotState>
+          onState: (callback: (state: EnterpriseWeComPersonalBotState) => void) => () => void
+          onSessionEvent: (callback: (event: import('./types/hermes').RpcEvent) => void) => () => void
+          regenerateVerification: () => Promise<EnterpriseWeComPersonalBotState>
+          refresh: () => Promise<EnterpriseWeComPersonalBotState>
+          revoke: () => Promise<EnterpriseWeComPersonalBotState>
+          unlinkIdentity: () => Promise<EnterpriseWeComPersonalBotState>
+          start: () => Promise<EnterpriseWeComPersonalBotState>
+        }
         skillHub: {
           detail: (key: string) => Promise<EnterpriseSkillHubItem>
           install: (payload: EnterpriseSkillHubInstallInput) => Promise<EnterpriseSkillHubInstallResult>
@@ -582,45 +593,60 @@ export interface EnterpriseMessagingChannelPolicyDecision {
   visibleChannelIds: null | string[]
 }
 
-export type EnterpriseWeComBotBindingStatus =
+export type EnterpriseWeComBotChannelStatus =
   | 'connected'
   | 'connecting'
-  | 'disconnected'
-  | 'pending-owner-verification'
+  | 'authorizing'
+  | 'error'
+  | 'offline'
   | 'revoked'
-  | 'suspended'
+  | 'unbound'
 
-export type EnterpriseWeComBotConnectionStatus = 'connecting' | 'error' | 'offline' | 'online'
+export type EnterpriseWeComBotIdentityStatus = 'conflict' | 'expired' | 'locked' | 'pending' | 'unlinked' | 'unverified' | 'verified'
 
-export interface EnterpriseWeComBotBinding {
+export interface EnterpriseWeComBotIdentityClaim {
   bindingId: string
-  botId: string
-  connectionStatus: EnterpriseWeComBotConnectionStatus
-  contractVersion: 'wecom-bot-binding.v1'
+  claimId: string
+  code: string
+  contractVersion: 'wecom-channel-identity.v1'
+  expiresAt: string
+  failedAttempts: number
+  status: 'expired' | 'locked' | 'pending'
+}
+
+export interface EnterpriseWeComBotIdentityLink {
+  channelUserIdHint: string
+  contractVersion: 'wecom-channel-identity.v1'
+  displayName: null | string
+  linkId: string
+  userName: string
+  verificationMethod: string
+  verifiedAt: string
+}
+
+export interface EnterpriseWeComPublicBinding {
+  bindingId: string
   createdAt: string
   displayName: null | string
-  errorCode: null | string
-  lastConnectedAt: null | string
-  ownerVerificationRequired: boolean
-  status: EnterpriseWeComBotBindingStatus
   updatedAt: string
 }
 
-export type EnterpriseWeComPersonalBotUiState =
-  | 'auth-pending'
-  | 'auth-preparing'
-  | 'binding-created'
-  | 'connected'
-  | 'connecting'
-  | 'disconnected'
-  | 'gateway-offline'
-  | 'not-bound'
-  | 'owner-mismatch'
-  | 'owner-verification'
-  | 'permission-denied'
-  | 'qr-expired'
-  | 'revoked'
-  | 'source-invalid'
+export interface EnterpriseWeComPersonalBotState {
+  authorizationPending: boolean
+  binding: EnterpriseWeComPublicBinding | null
+  channel: {
+    errorCode: null | string
+    localStopped: boolean
+    serverRevokePending: boolean
+    status: EnterpriseWeComBotChannelStatus
+  }
+  identity: {
+    claim: EnterpriseWeComBotIdentityClaim | null
+    errorCode: null | string
+    link: EnterpriseWeComBotIdentityLink | null
+    status: EnterpriseWeComBotIdentityStatus
+  }
+}
 
 export interface EnterpriseDesktopState {
   allowedModels: string[]

@@ -100,7 +100,7 @@ class EnterpriseGatewayClient {
     this.timeoutMs = Math.max(100, Number(timeoutMs) || 10000)
   }
 
-  async requestJson(path, { method = 'GET', body, includeDesktopCapabilities = false, signal, token } = {}) {
+  async requestJson(path, { method = 'GET', body, cache, includeDesktopCapabilities = false, signal, token } = {}) {
     if (typeof this.fetchImpl !== 'function') {
       throw new Error('Enterprise gateway client requires fetch.')
     }
@@ -139,6 +139,7 @@ class EnterpriseGatewayClient {
         method,
         headers,
         body: body === undefined ? undefined : JSON.stringify(body),
+        ...(cache ? { cache } : {}),
         signal: abortController.signal
       })
       text = await response.text()
@@ -290,6 +291,111 @@ class EnterpriseGatewayClient {
       includeDesktopCapabilities: true,
       token
     })
+  }
+
+  createWeComPersonalBotTransaction(token, body) {
+    return this.requestJson('/v1/wecom-personal-bot/transactions', {
+      method: 'POST',
+      body,
+      token
+    })
+  }
+
+  weComPersonalBotTransaction(token, transactionId, { signal } = {}) {
+    const id = encodeURIComponent(String(transactionId || '').trim())
+    if (!id) throw new Error('Enterprise WeCom Bot transaction is required.')
+    return this.requestJson(`/v1/wecom-personal-bot/transactions/${id}`, { signal, token })
+  }
+
+  cancelWeComPersonalBotTransaction(token, transactionId) {
+    const id = encodeURIComponent(String(transactionId || '').trim())
+    if (!id) throw new Error('Enterprise WeCom Bot transaction is required.')
+    return this.requestJson(`/v1/wecom-personal-bot/transactions/${id}/cancel`, { method: 'POST', token })
+  }
+
+  currentWeComPersonalBotBinding(token, { signal } = {}) {
+    return this.requestJson('/v1/wecom-personal-bot/bindings/current', { signal, token })
+  }
+
+  issueWeComPersonalBotOwnerVerification(token, bindingId, { signal } = {}) {
+    const id = encodeURIComponent(String(bindingId || '').trim())
+    if (!id) throw new Error('Enterprise WeCom Bot binding is required.')
+    return this.requestJson(`/v1/wecom-personal-bot/bindings/${id}/owner-verification`, {
+      method: 'POST',
+      signal,
+      token
+    })
+  }
+
+  weComPersonalBotIdentityClaim(token, bindingId, { signal } = {}) {
+    const id = encodeURIComponent(String(bindingId || '').trim())
+    if (!id) throw new Error('Enterprise WeCom Bot binding is required.')
+    return this.requestJson(`/v1/wecom-personal-bot/bindings/${id}/identity-claim`, { signal, token })
+  }
+
+  issueWeComPersonalBotIdentityClaim(token, bindingId, { signal } = {}) {
+    const id = encodeURIComponent(String(bindingId || '').trim())
+    if (!id) throw new Error('Enterprise WeCom Bot binding is required.')
+    return this.requestJson(`/v1/wecom-personal-bot/bindings/${id}/identity-claims`, {
+      method: 'POST',
+      body: {},
+      signal,
+      token
+    })
+  }
+
+  weComPersonalBotChannelIdentities(token, { signal } = {}) {
+    return this.requestJson('/v1/wecom-personal-bot/channel-identities', { signal, token })
+  }
+
+  unlinkWeComPersonalBotChannelIdentity(token, linkId, { signal } = {}) {
+    const id = encodeURIComponent(String(linkId || '').trim())
+    if (!id) throw new Error('Enterprise WeCom channel identity link is required.')
+    return this.requestJson(`/v1/wecom-personal-bot/channel-identities/${id}`, {
+      method: 'DELETE',
+      signal,
+      token
+    })
+  }
+
+  revokeWeComPersonalBotBinding(token, bindingId) {
+    const id = encodeURIComponent(String(bindingId || '').trim())
+    if (!id) throw new Error('Enterprise WeCom Bot binding is required.')
+    return this.requestJson(`/v1/wecom-personal-bot/bindings/${id}`, { method: 'DELETE', token })
+  }
+
+  weComPersonalBotRuntimeConfig(token, bindingId, { signal } = {}) {
+    const id = encodeURIComponent(String(bindingId || '').trim())
+    if (!id) throw new Error('Enterprise WeCom Bot binding is required.')
+    return this.requestJson(`/v1/wecom-personal-bot/bindings/${id}/runtime-config`, {
+      cache: 'no-store',
+      signal,
+      token
+    })
+  }
+
+  acquireWeComPersonalBotRuntimeLease(token) {
+    return this.requestJson('/v1/wecom-personal-bot/runtime/lease', { method: 'POST', token })
+  }
+
+  leaseWeComPersonalBotInbox(token, body = {}) {
+    return this.requestJson('/v1/wecom-personal-bot/runtime/inbox/lease', { method: 'POST', body, token })
+  }
+
+  ackWeComPersonalBotInbox(token, inboxId) {
+    const id = encodeURIComponent(String(inboxId || '').trim())
+    if (!id) throw new Error('Enterprise WeCom Bot inbox message is required.')
+    return this.requestJson(`/v1/wecom-personal-bot/runtime/inbox/${id}/ack`, { method: 'POST', token })
+  }
+
+  submitWeComPersonalBotOutbox(token, body) {
+    return this.requestJson('/v1/wecom-personal-bot/runtime/outbox', { method: 'POST', body, token })
+  }
+
+  weComPersonalBotOutboxStatus(token, outboxId, { signal } = {}) {
+    const id = encodeURIComponent(String(outboxId || '').trim())
+    if (!id) throw new Error('Enterprise WeCom Bot outbox message is required.')
+    return this.requestJson(`/v1/wecom-personal-bot/runtime/outbox/${id}`, { signal, token })
   }
 
   skillHubSkills(token, query = {}) {

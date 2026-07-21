@@ -38,6 +38,37 @@ test('enterprise desktop config allows local HTTP for workstation rehearsal', ()
   assert.deepEqual(config, { enabled: true, gatewayUrl: 'http://127.0.0.1:5100' })
 })
 
+test('enterprise desktop config keeps the GatewayRunner experiment default-off and machine-gated', () => {
+  const disabled = readEnterpriseDesktopConfig('desktop.json', {
+    readFileSync: reader({
+      'desktop.json': JSON.stringify({ schemaVersion: 1, gatewayUrl: 'https://gateway.example.com' })
+    })
+  })
+  const enabled = readEnterpriseDesktopConfig('desktop.json', {
+    readFileSync: reader({
+      'desktop.json': JSON.stringify({
+        schemaVersion: 1,
+        gatewayUrl: 'https://gateway.example.com',
+        weComGatewayRunnerExperiment: true
+      })
+    })
+  })
+
+  assert.equal(disabled.weComGatewayRunnerExperiment, undefined)
+  assert.equal(enabled.weComGatewayRunnerExperiment, true)
+  assert.throws(
+    () => readEnterpriseDesktopConfig('desktop.json', {
+      readFileSync: reader({
+        'desktop.json': JSON.stringify({
+          gatewayUrl: 'https://gateway.example.com',
+          weComGatewayRunnerExperiment: 'yes'
+        })
+      })
+    }),
+    /weComGatewayRunnerExperiment must be a boolean/
+  )
+})
+
 test('enterprise desktop config normalizes the configured HTTPS origin', () => {
   const config = readEnterpriseDesktopConfig('desktop.json', {
     readFileSync: reader({
