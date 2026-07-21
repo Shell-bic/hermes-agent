@@ -12,7 +12,7 @@
   },
   "scripts": {
     "dev": "concurrently -k \"npm:dev:renderer\" \"npm:dev:electron\"",
-    "dev:wecom": "cross-env HERMES_DESKTOP_HERMES_ROOT=../.. HERMES_DESKTOP_PYTHON=../../.venv/Scripts/python.exe HERMES_DESKTOP_ENTERPRISE_GATEWAY_URL=http://127.0.0.1:5000 HERMES_DESKTOP_WECOM_GATEWAY_RUNNER_EXPERIMENT=1 npm run dev",
+    "dev:wecom": "node scripts/dev-wecom.cjs",
     "dev:fake-boot": "cross-env HERMES_DESKTOP_BOOT_FAKE=1 HERMES_DESKTOP_BOOT_FAKE_STEP_MS=650 npm run dev",
     "dev:renderer": "node scripts/assert-root-install.cjs && vite --host 127.0.0.1 --port 5174",
     "dev:electron": "wait-on http://127.0.0.1:5174 && cross-env XCURSOR_SIZE=24 HERMES_DESKTOP_DEV_SERVER=http://127.0.0.1:5174 electron .",

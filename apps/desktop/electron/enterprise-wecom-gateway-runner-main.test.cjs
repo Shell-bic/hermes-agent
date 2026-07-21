@@ -8,12 +8,27 @@ const main = fs.readFileSync(path.join(electronDir, 'main.cjs'), 'utf8')
 const preload = fs.readFileSync(path.join(electronDir, 'preload.cjs'), 'utf8')
 const runtimeHome = fs.readFileSync(path.join(electronDir, 'enterprise-runtime-home.cjs'), 'utf8')
 const desktopPackage = JSON.parse(fs.readFileSync(path.join(electronDir, '..', 'package.json'), 'utf8'))
+const {
+  buildWeComDevLaunch,
+  desktopRoot,
+  hermesRoot
+} = require('../scripts/dev-wecom.cjs')
 
-test('WeCom development launcher enables managed mode against the local enterprise Gateway', () => {
-  const script = desktopPackage.scripts['dev:wecom']
+test('WeCom development launcher pins the current checkout and local enterprise Gateway', () => {
+  const launch = buildWeComDevLaunch({
+    env: {},
+    platform: 'win32'
+  })
 
-  assert.match(script, /HERMES_DESKTOP_ENTERPRISE_GATEWAY_URL=http:\/\/127\.0\.0\.1:5000/)
-  assert.match(script, /HERMES_DESKTOP_WECOM_GATEWAY_RUNNER_EXPERIMENT=1/)
+  assert.equal(desktopPackage.scripts['dev:wecom'], 'node scripts/dev-wecom.cjs')
+  assert.equal(launch.command, 'npm.cmd')
+  assert.deepEqual(launch.args, ['run', 'dev'])
+  assert.equal(launch.cwd, desktopRoot)
+  assert.equal(launch.env.HERMES_DESKTOP_HERMES_ROOT, hermesRoot)
+  assert.equal(launch.env.HERMES_DESKTOP_ENTERPRISE_GATEWAY_URL, 'http://127.0.0.1:5000')
+  assert.equal(launch.env.HERMES_DESKTOP_WECOM_GATEWAY_RUNNER_EXPERIMENT, '1')
+  assert.equal(path.isAbsolute(launch.env.HERMES_DESKTOP_HERMES_ROOT), true)
+  assert.equal(fs.existsSync(path.join(launch.env.HERMES_DESKTOP_HERMES_ROOT, 'hermes_cli', 'main.py')), true)
 })
 
 test('main injects only an independent runtime-control token and hot-attaches after backend readiness', () => {
