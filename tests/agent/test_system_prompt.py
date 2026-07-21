@@ -3,7 +3,10 @@
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from agent.system_prompt import build_system_prompt_parts
+from agent.system_prompt import (
+    ENTERPRISE_POLICY_BEHAVIOR_GUIDANCE,
+    build_system_prompt_parts,
+)
 
 
 def _make_agent(**overrides):
@@ -96,3 +99,21 @@ class TestCodingContextBlock:
         monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
         agent = _make_agent(valid_tool_names=[], platform="cli")
         assert "coding agent" not in _stable_prompt(agent)
+
+
+class TestEnterprisePolicyBehaviorGuidance:
+    def test_injected_only_in_enterprise_managed_mode(self, monkeypatch):
+        monkeypatch.setenv("HERMES_ENTERPRISE_MANAGED", "1")
+
+        stable = _stable_prompt(_make_agent())
+
+        assert ENTERPRISE_POLICY_BEHAVIOR_GUIDANCE in stable
+        assert "scheduled-job prompt" in stable
+        assert "filesystem, terminal, cache" in stable
+
+    def test_absent_outside_enterprise_managed_mode(self, monkeypatch):
+        monkeypatch.delenv("HERMES_ENTERPRISE_MANAGED", raising=False)
+
+        stable = _stable_prompt(_make_agent())
+
+        assert ENTERPRISE_POLICY_BEHAVIOR_GUIDANCE not in stable
