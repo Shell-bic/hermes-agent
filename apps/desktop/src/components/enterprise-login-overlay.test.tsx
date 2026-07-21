@@ -85,6 +85,23 @@ afterEach(() => {
 })
 
 describe('EnterpriseLoginOverlay', () => {
+  it('does not create a QR transaction while a stored session is recovering', async () => {
+    const recoveringState = {
+      ...enterpriseState,
+      status: 'loading' as const
+    }
+
+    $enterprise.set(recoveringState)
+    vi.mocked(window.hermesDesktop.enterprise.status).mockResolvedValue(recoveringState)
+
+    renderOverlay('zh')
+
+    await waitFor(() => expect(window.hermesDesktop.enterprise.status).toHaveBeenCalled())
+    expect(screen.queryByRole('heading', { name: '企业账号登录' })).toBeNull()
+    expect(window.hermesDesktop.enterprise.loginMethods).not.toHaveBeenCalled()
+    expect(window.hermesDesktop.enterprise.cancelWeCom).not.toHaveBeenCalled()
+  })
+
   it('takes over after authoritative refresh replaces a stale authenticated state', async () => {
     $enterprise.set({
       ...enterpriseState,

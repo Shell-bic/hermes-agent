@@ -112,7 +112,7 @@ test('renderer cold-start status stays non-blocking and receives authoritative r
   assert.match(main, /mainWindow\.webContents\.send\('hermes:enterprise:state', state\)/)
   assert.match(
     main,
-    /ipcMain\.handle\('hermes:enterprise:status',[\s\S]*return enterpriseRuntime\.getPublicState\(\)/
+    /ipcMain\.handle\('hermes:enterprise:status',[\s\S]*state === 'recovering' && !state\.authenticated[\s\S]*status: 'loading'[\s\S]*return state/
   )
   const statusStart = main.indexOf("ipcMain.handle('hermes:enterprise:status'")
   const statusEnd = main.indexOf("ipcMain.handle('hermes:enterprise:lifecycle-status'", statusStart)

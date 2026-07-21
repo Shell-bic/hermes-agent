@@ -61,7 +61,7 @@ export function EnterpriseLoginOverlay({ onAuthenticated }: EnterpriseLoginOverl
     }
   }, [])
 
-  const loginRequired = enterprise.enabled && !enterprise.authenticated
+  const loginRequired = enterprise.enabled && enterprise.status !== 'loading' && !enterprise.authenticated
 
   useEffect(() => {
     if (!loginRequired) {
@@ -143,7 +143,7 @@ export function EnterpriseLoginOverlay({ onAuthenticated }: EnterpriseLoginOverl
     return Math.max(0, Math.ceil((Date.parse(login.expiresAt) - now) / 1000))
   }, [login.expiresAt, now])
 
-  if (!enterprise.enabled || enterprise.authenticated) {
+  if (!enterprise.enabled || enterprise.status === 'loading' || enterprise.authenticated) {
     return null
   }
 

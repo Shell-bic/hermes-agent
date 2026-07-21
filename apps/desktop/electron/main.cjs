@@ -6110,7 +6110,11 @@ ipcMain.handle('hermes:enterprise:status', async event => {
   assertTrustedEnterpriseSender(event)
   // Never hold the renderer's first paint behind network-backed session
   // recovery. The authoritative refresh is pushed when it completes.
-  return enterpriseRuntime.getPublicState()
+  const state = enterpriseRuntime.getPublicState()
+  if (enterpriseLifecycle.getSnapshot().state === 'recovering' && !state.authenticated) {
+    return { ...state, error: null, status: 'loading' }
+  }
+  return state
 })
 ipcMain.handle('hermes:enterprise:lifecycle-status', async event => {
   assertTrustedEnterpriseSender(event)
