@@ -93,6 +93,17 @@ test('branch experiment pins its explicit runtime and disables original main upd
   assert.ok(pinnedFailClosed < installedCliFallback)
 })
 
+test('managed lifecycle defers safeStorage decryption until Electron is ready', () => {
+  assert.match(
+    main,
+    /enterpriseLifecycle = createEnterpriseManagedLifecycle\(\{[\s\S]*hasSession: !enterpriseRuntime\.isEnabled\(\) \|\| enterpriseAuthStore\.hasPersistedSession\(\)/
+  )
+  const lifecycleInitialization = main.indexOf('enterpriseLifecycle = createEnterpriseManagedLifecycle({')
+  const electronReady = main.indexOf('app.whenReady().then(() => {')
+  assert.ok(lifecycleInitialization > 0)
+  assert.ok(lifecycleInitialization < electronReady)
+})
+
 test('quit logout account switch and invalid session stop the backend, while Bot unbind only detaches the adapter', () => {
   const revokeStart = main.indexOf("ipcMain.handle('hermes:enterprise:wecom-bot-revoke'")
   const revokeEnd = main.indexOf("ipcMain.handle('hermes:enterprise:wecom-bot-regenerate-verification'", revokeStart)

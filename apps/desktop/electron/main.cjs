@@ -1113,7 +1113,11 @@ enterpriseLifecycle = createEnterpriseManagedLifecycle({
       reasonCode: enterpriseLifecycle.getSnapshot().reasonCode
     })
   },
-  hasSession: !enterpriseRuntime.isEnabled() || enterpriseRuntime.hasStoredSession(),
+  // This runs before app.whenReady(), when Electron safeStorage is not yet a
+  // reliable decryption surface. The encrypted envelope is sufficient to put
+  // the lifecycle into recovery; did-finish-load later validates/decrypts it
+  // and verifies the session against Gateway after Electron is ready.
+  hasSession: !enterpriseRuntime.isEnabled() || enterpriseAuthStore.hasPersistedSession(),
   publish: snapshot => queueMicrotask(() => rememberLog(
     `[enterprise-lifecycle] state=${snapshot.state} lifecycleEpoch=${snapshot.lifecycleEpoch} authEpoch=${snapshot.authEpoch} reason=${snapshot.reasonCode}`
   ))

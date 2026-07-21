@@ -105,6 +105,7 @@ test('enterprise auth store preserves encrypted session when secure storage is t
   })
 
   assert.equal(store.readSession(), null)
+  assert.equal(store.hasPersistedSession(), true)
   assert.equal(decryptCalled, false)
   assert.equal(fs.existsSync(filePath), true)
 })
@@ -191,6 +192,7 @@ test('enterprise auth store rejects and clears legacy plaintext sessions', () =>
   )
   const store = createEnterpriseAuthStore({ filePath, safeStorage: fakeSafeStorage() })
 
+  assert.equal(store.hasPersistedSession(), false)
   assert.equal(store.readSession(), null)
   assert.equal(fs.existsSync(filePath), false)
 })
@@ -200,6 +202,7 @@ test('enterprise auth store clears an expired encrypted session', () => {
   const store = createEnterpriseAuthStore({ filePath, safeStorage: fakeSafeStorage() })
   store.writeSession({ desktopToken: 'desktop-secret', expiresAt: '2020-01-01T00:00:00Z' })
 
+  assert.equal(store.hasPersistedSession(), false)
   assert.equal(store.readSession(), null)
   assert.equal(fs.existsSync(filePath), false)
 })

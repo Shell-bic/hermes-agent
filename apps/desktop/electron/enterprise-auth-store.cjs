@@ -90,6 +90,22 @@ class EnterpriseAuthStore {
     }
   }
 
+  hasPersistedSession() {
+    const raw = this.readRaw()
+    const encryptedToken = raw?.desktopToken
+    if (
+      !encryptedToken ||
+      typeof encryptedToken !== 'object' ||
+      encryptedToken.encoding !== 'safeStorage' ||
+      !String(encryptedToken.value || '')
+    ) {
+      return false
+    }
+
+    const expiresAt = raw.expiresAt || null
+    return !expiresAt || (Number.isFinite(Date.parse(expiresAt)) && Date.parse(expiresAt) > Date.now())
+  }
+
   readSession() {
     const raw = this.readRaw()
     const encryptedToken = raw?.desktopToken
