@@ -241,12 +241,48 @@ def _runtime_max_output_tokens(defaults: Dict[str, Any]) -> Optional[int]:
     return None
 
 
+def enterprise_runtime_required(config: Optional[Dict[str, Any]] = None) -> bool:
+    """Return whether this process carries any enterprise-runtime intent.
+
+    A generated managed home is a bundle: marker, policy snapshot, company
+    provider configuration, and gateway token.  Treat a partial bundle as
+    enterprise intent too so deleting only the marker cannot silently restore
+    local-provider resolution.
+    """
+    cfg = config if isinstance(config, dict) else load_config()
+    model_cfg = cfg.get("model") if isinstance(cfg.get("model"), dict) else {}
+    providers = cfg.get("providers") if isinstance(cfg.get("providers"), dict) else {}
+    configured_provider = str(model_cfg.get("provider") or "").strip().lower()
+    has_company_provider = ENTERPRISE_PROVIDER in providers
+    has_policy_reference = bool(
+        str(os.getenv("HERMES_ENTERPRISE_TOOL_POLICY_JSON") or "").strip()
+        or str(os.getenv("HERMES_ENTERPRISE_TOOL_POLICY_FILE") or "").strip()
+    )
+    return bool(
+        is_enterprise_managed()
+        or configured_provider == ENTERPRISE_PROVIDER
+        or has_company_provider
+        or has_policy_reference
+    )
+
+
+def _enterprise_bootstrap_error(reason: str) -> AuthError:
+    return AuthError(
+        "Enterprise managed runtime is incomplete: " + reason,
+        code="enterprise_managed_runtime_incomplete",
+    )
+
+
 def _resolve_enterprise_gateway_runtime(
     *,
     explicit_api_key: Optional[str] = None,
     explicit_base_url: Optional[str] = None,
     target_model: Optional[str] = None,
 ) -> Dict[str, Any]:
+    if not is_enterprise_managed():
+        raise _enterprise_bootstrap_error(
+            "HERMES_ENTERPRISE_MANAGED marker is missing"
+        )
     if str(explicit_api_key or "").strip() or str(explicit_base_url or "").strip():
         raise AuthError(
             "Enterprise managed policy denied runtime provider resolution: "
@@ -256,17 +292,34 @@ def _resolve_enterprise_gateway_runtime(
 
     config = load_config()
     providers = config.get("providers")
-    provider_cfg = providers.get(ENTERPRISE_PROVIDER) if isinstance(providers, dict) else {}
+    provider_cfg = providers.get(ENTERPRISE_PROVIDER) if isinstance(providers, dict) else None
     if not isinstance(provider_cfg, dict):
-        provider_cfg = {}
+        raise _enterprise_bootstrap_error(
+            f"providers.{ENTERPRISE_PROVIDER} is missing"
+        )
     base_url = str(
         provider_cfg.get("base_url")
         or provider_cfg.get("api")
         or provider_cfg.get("url")
         or ""
     ).strip().rstrip("/")
+    if not base_url:
+        raise _enterprise_bootstrap_error(
+            f"providers.{ENTERPRISE_PROVIDER}.base_url is missing"
+        )
     key_env = str(provider_cfg.get("key_env") or ENTERPRISE_GATEWAY_TOKEN_ENV).strip()
+    if key_env != ENTERPRISE_GATEWAY_TOKEN_ENV:
+        raise _enterprise_bootstrap_error(
+            f"providers.{ENTERPRISE_PROVIDER}.key_env must be {ENTERPRISE_GATEWAY_TOKEN_ENV}"
+        )
     policy = load_enterprise_policy()
+    if not policy:
+        raise _enterprise_bootstrap_error("enterprise policy snapshot is missing or invalid")
+    gateway_token = os.getenv(ENTERPRISE_GATEWAY_TOKEN_ENV, "").strip()
+    if not gateway_token:
+        raise _enterprise_bootstrap_error(
+            f"{ENTERPRISE_GATEWAY_TOKEN_ENV} is missing"
+        )
     profile = model_profile_for_selection(target_model or "", policy) or current_model_profile(policy)
     api_format = profile.get("apiFormat") if isinstance(profile, dict) else None
     if not api_format:
@@ -276,7 +329,7 @@ def _resolve_enterprise_gateway_runtime(
         "provider": ENTERPRISE_PROVIDER,
         "api_mode": _enterprise_api_mode(api_format),
         "base_url": base_url,
-        "api_key": os.getenv(key_env, "").strip(),
+        "api_key": gateway_token,
         "source": "enterprise-policy",
         "requested_provider": ENTERPRISE_PROVIDER,
     }
@@ -1412,20 +1465,22 @@ def resolve_runtime_provider(
     persisted default. Other callers can leave it None to preserve existing
     behavior (api_mode derived from config).
     """
+    config = load_config()
+    enterprise_required = enterprise_runtime_required(config)
     requested_provider = resolve_requested_provider(requested)
-    if is_enterprise_managed() and requested_provider == "auto":
+    if enterprise_required and requested_provider == "auto":
         model_cfg = _get_model_config()
         cfg_provider = str(model_cfg.get("provider") or "").strip().lower()
         if cfg_provider:
             requested_provider = cfg_provider
     try:
         require_runtime_provider_allowed(requested_provider)
-        if is_enterprise_managed() and target_model:
+        if enterprise_required and target_model:
             require_model_allowed(target_model, action="runtime model selection")
     except EnterprisePolicyDenied as exc:
         raise AuthError(str(exc), code="enterprise_managed_policy_denied") from exc
 
-    if is_enterprise_managed():
+    if enterprise_required:
         return _resolve_enterprise_gateway_runtime(
             explicit_api_key=explicit_api_key,
             explicit_base_url=explicit_base_url,

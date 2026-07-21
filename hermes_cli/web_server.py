@@ -155,10 +155,164 @@ def _start_desktop_cron_ticker(stop_event: "threading.Event", interval: int = 60
         stop_event.wait(interval)
 
 
+_DESKTOP_WECOM_GATEWAY_RUNNER_FLAG = "HERMES_DESKTOP_WECOM_GATEWAY_RUNNER"
+_ENTERPRISE_RUNTIME_CONTROL_TOKEN_ENV = "HERMES_ENTERPRISE_RUNTIME_CONTROL_TOKEN"
+_ENTERPRISE_RUNTIME_CONTROL_HEADER = "X-Hermes-Enterprise-Runtime-Token"
+_ENTERPRISE_RUNTIME_CONTROL_CONTRACT = "enterprise-wecom-runtime-control.v1"
+_ENTERPRISE_RUNTIME_CONTROL_PATHS = frozenset(
+    {
+        "/api/enterprise/wecom/attach",
+        "/api/enterprise/wecom/status",
+        "/api/enterprise/wecom/detach",
+    }
+)
+def _clear_desktop_wecom_runtime_env() -> None:
+    for key in list(os.environ):
+        if key.upper().startswith("WECOM_"):
+            os.environ.pop(key, None)
+
+
+async def _start_desktop_wecom_gateway_runner(
+    app: "FastAPI",
+    *,
+    config_loader=None,
+    runner_factory=None,
+):
+    """Start the original GatewayRunner inside an opted-in Desktop backend.
+
+    Electron injects the credential pair only into this controlled child. The
+    gateway config loader consumes it into runtime objects, then we immediately
+    remove both values from ``os.environ`` so dashboard code, subprocesses, and
+    later config reads cannot observe or persist them.
+    """
+    app.state.desktop_wecom_gateway_runner = None
+    if (
+        os.getenv("HERMES_DESKTOP") != "1"
+        or os.getenv(_DESKTOP_WECOM_GATEWAY_RUNNER_FLAG) != "1"
+    ):
+        return None
+
+    bot_id = str(os.getenv("WECOM_BOT_ID") or "").strip()
+    secret = str(os.getenv("WECOM_SECRET") or "").strip()
+    owner_user_id = str(os.getenv("WECOM_ALLOWED_USERS") or "").strip()
+    has_legacy_runtime = bool(bot_id or secret or owner_user_id)
+    if has_legacy_runtime and (
+        not bot_id or not secret or not owner_user_id or "," in owner_user_id
+    ):
+        _clear_desktop_wecom_runtime_env()
+        raise RuntimeError(
+            "Desktop WeCom GatewayRunner experiment requires a complete in-memory runtime credential and policy set."
+        )
+
+    if config_loader is None:
+        from gateway.config import load_gateway_config
+
+        config_loader = load_gateway_config
+    if runner_factory is None:
+        from gateway.run import GatewayRunner
+
+        runner_factory = GatewayRunner
+
+    try:
+        config = config_loader()
+    finally:
+        _clear_desktop_wecom_runtime_env()
+
+    from gateway.config import Platform
+
+    platforms = getattr(config, "platforms", None)
+    wecom = platforms.get(Platform.WECOM) if isinstance(platforms, dict) else None
+    if has_legacy_runtime:
+        if wecom is None:
+            raise RuntimeError("Desktop WeCom GatewayRunner runtime config did not materialize the WeCom platform.")
+        wecom.enabled = True
+        materialized = dict(getattr(wecom, "extra", None) or {})
+        if materialized.get("bot_id") != bot_id or materialized.get("secret") != secret:
+            raise RuntimeError("Desktop WeCom GatewayRunner runtime credentials were not materialized exactly.")
+        # Compatibility for the old launch-time experiment. New Desktop builds
+        # start with no adapter and use the private hot-attach endpoint below.
+        wecom.extra = {
+            "allow_from": [owner_user_id],
+            "bot_id": bot_id,
+            "dm_policy": "allowlist",
+            "group_policy": "open",
+            "secret": secret,
+        }
+        wecom.home_channel = None
+        config.platforms = {Platform.WECOM: wecom}
+    else:
+        materialized = {}
+        # Keep the runner alive as the Agent/session runtime, but do not inherit
+        # any user-configured channel. Electron will attach exactly one managed
+        # WeCom adapter after it receives RuntimeConfig v2.
+        config.platforms = {}
+
+    del bot_id, secret, owner_user_id, materialized
+
+    runner = runner_factory(config)
+    if hasattr(runner, "set_startup_auto_resume_enabled"):
+        # A Desktop-owned channel runtime must become ready without first
+        # spending an LLM turn on stale shutdown markers. The next genuine
+        # inbound message still resumes the persisted conversation normally.
+        runner.set_startup_auto_resume_enabled(False)
+
+    async def _notify_session_changed(session_id: str, reason: str) -> None:
+        from tui_gateway.ws import broadcast_event
+
+        await broadcast_event(
+            "session.changed",
+            payload={
+                "reason": str(reason or "updated"),
+                "stored_session_id": str(session_id or ""),
+            },
+        )
+
+    async def _notify_session_event(event_type: str, session_id: str, payload: dict) -> None:
+        from tui_gateway.ws import broadcast_event
+
+        await broadcast_event(
+            str(event_type),
+            payload={
+                **dict(payload or {}),
+                "stored_session_id": str(session_id or ""),
+            },
+        )
+
+    if hasattr(runner, "set_desktop_session_changed_callback"):
+        runner.set_desktop_session_changed_callback(_notify_session_changed)
+    if hasattr(runner, "set_desktop_session_event_callback"):
+        runner.set_desktop_session_event_callback(_notify_session_event)
+    try:
+        await runner.start()
+    except BaseException:
+        try:
+            await runner.stop()
+        except Exception:
+            pass
+        raise
+
+    app.state.desktop_wecom_gateway_runner = runner
+    return runner
+
+
+async def _stop_desktop_wecom_gateway_runner(app: "FastAPI") -> None:
+    runner = getattr(app.state, "desktop_wecom_gateway_runner", None)
+    app.state.desktop_wecom_gateway_runner = None
+    if runner is not None:
+        if hasattr(runner, "set_desktop_session_changed_callback"):
+            runner.set_desktop_session_changed_callback(None)
+        if hasattr(runner, "set_desktop_session_event_callback"):
+            runner.set_desktop_session_event_callback(None)
+        await runner.stop()
+
+
 @asynccontextmanager
 async def _lifespan(app: "FastAPI"):
     app.state.event_channels = {}  # dict[str, set]
     app.state.event_lock = asyncio.Lock()
+    app.state.enterprise_runtime_control_token = str(
+        os.environ.pop(_ENTERPRISE_RUNTIME_CONTROL_TOKEN_ENV, "") or ""
+    ).strip()
 
     # Desktop-spawned backends (HERMES_DESKTOP=1) fire cron jobs themselves,
     # since the app has no gateway running the scheduler. Server `hermes
@@ -176,10 +330,12 @@ async def _lifespan(app: "FastAPI"):
         cron_thread.start()
 
     try:
+        await _start_desktop_wecom_gateway_runner(app)
         yield
     finally:
         if cron_stop is not None:
             cron_stop.set()
+        await _stop_desktop_wecom_gateway_runner(app)
 
 
 def _get_event_state(app: "FastAPI"):
@@ -350,6 +506,16 @@ def _has_valid_session_token(request: Request) -> bool:
     return hmac.compare_digest(auth.encode(), expected.encode())
 
 
+def _has_valid_enterprise_runtime_token(request: Request) -> bool:
+    expected = str(
+        getattr(request.app.state, "enterprise_runtime_control_token", "") or ""
+    )
+    supplied = str(request.headers.get(_ENTERPRISE_RUNTIME_CONTROL_HEADER, "") or "")
+    return bool(expected and supplied) and hmac.compare_digest(
+        supplied.encode("utf-8"), expected.encode("utf-8")
+    )
+
+
 # Routes that may also authenticate via a ``?token=`` query param, for download
 # links opened by the OS shell or a new browser tab where the session header
 # can't be set. Kept narrow — same query-token tradeoff as the /api/pty WS.
@@ -512,12 +678,22 @@ async def _dashboard_auth_gate(request: Request, call_next):
 @app.middleware("http")
 async def auth_middleware(request: Request, call_next):
     """Require the session token on all /api/ routes except the public list."""
+    path = request.url.path
+    # These routes are a main-process-to-child control plane, never a
+    # dashboard-user API.  Keep this check ahead of OAuth/session-token bypass
+    # logic so neither user credential can authorize it accidentally.
+    if path in _ENTERPRISE_RUNTIME_CONTROL_PATHS:
+        if (
+            os.getenv("HERMES_DESKTOP") != "1"
+            or not _has_valid_enterprise_runtime_token(request)
+        ):
+            return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
+        return await call_next(request)
     # When the OAuth gate is active, cookie-based auth (gated_auth_middleware
     # above) is authoritative.  The legacy _SESSION_TOKEN path is loopback-only
     # and is skipped here so the gate's session attachment isn't overridden.
     if getattr(request.app.state, "auth_required", False):
         return await call_next(request)
-    path = request.url.path
     if path.startswith("/api/") and path not in _PUBLIC_API_PATHS:
         if not _has_valid_session_token(request) and not _has_valid_query_token(request, path):
             if path.startswith("/api/skills/enterprise/"):
@@ -1722,6 +1898,90 @@ async def fs_default_cwd():
     return {"cwd": cwd, "branch": _fs_git_branch(cwd)}
 
 
+def _enterprise_wecom_public_status(runner) -> dict:
+    if runner is None:
+        status = {
+            "state": "detached",
+            "bindingId": None,
+            "connected": False,
+            "errorCode": None,
+            "errorMessage": None,
+        }
+    else:
+        status = dict(runner.enterprise_wecom_status())
+        # Never reflect transport exception bodies; they may contain operator
+        # URLs. The stable error code is sufficient for Electron/UI mapping.
+        status["errorMessage"] = (
+            "Enterprise WeCom runtime operation failed."
+            if status.get("errorCode")
+            else None
+        )
+    return {"contractVersion": _ENTERPRISE_RUNTIME_CONTROL_CONTRACT, **status}
+
+
+@app.post("/api/enterprise/wecom/attach")
+async def enterprise_wecom_attach(request: Request):
+    runner = getattr(request.app.state, "desktop_wecom_gateway_runner", None)
+    if runner is None:
+        raise HTTPException(status_code=503, detail="Enterprise WeCom runtime is unavailable")
+    try:
+        payload = await request.json()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="Invalid runtime control payload") from exc
+    if not isinstance(payload, dict) or payload.get("contractVersion") != _ENTERPRISE_RUNTIME_CONTROL_CONTRACT:
+        raise HTTPException(status_code=400, detail="Runtime control contract mismatch")
+    if payload.get("identityContractVersion") != "wecom-channel-identity.v1" or payload.get(
+        "identityProofVersion"
+    ) != "hermes-channel-identity-v2":
+        raise HTTPException(status_code=400, detail="Identity runtime contract mismatch")
+    runtime = {
+        "binding_id": payload.get("bindingId"),
+        "corp_id": payload.get("corpId"),
+        "bot_id": payload.get("botId"),
+        "secret": payload.get("secret"),
+        "gateway_base_url": payload.get("gatewayBaseUrl"),
+        "gateway_service_token": payload.get("gatewayServiceToken"),
+    }
+    try:
+        await runner.attach_enterprise_wecom(runtime)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        _log.warning("Enterprise WeCom hot attach failed: %s", type(exc).__name__)
+        raise HTTPException(status_code=502, detail="Enterprise WeCom connection failed") from exc
+    return _enterprise_wecom_public_status(runner)
+
+
+@app.get("/api/enterprise/wecom/status")
+@app.post("/api/enterprise/wecom/status")
+async def enterprise_wecom_status(request: Request):
+    return _enterprise_wecom_public_status(
+        getattr(request.app.state, "desktop_wecom_gateway_runner", None)
+    )
+
+
+@app.post("/api/enterprise/wecom/detach")
+async def enterprise_wecom_detach(request: Request):
+    runner = getattr(request.app.state, "desktop_wecom_gateway_runner", None)
+    if runner is None:
+        return _enterprise_wecom_public_status(None)
+    payload = {}
+    if request.headers.get("content-length") not in {None, "", "0"}:
+        try:
+            payload = await request.json()
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail="Invalid runtime control payload") from exc
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Invalid runtime control payload")
+    try:
+        await runner.detach_enterprise_wecom(payload.get("bindingId"))
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return _enterprise_wecom_public_status(runner)
+
+
 @app.get("/api/status")
 async def get_status(profile: Optional[str] = None):
     status_scope = None
@@ -2882,6 +3142,11 @@ async def get_sessions(
                     s["is_default_profile"] = profile_name == "default"
                 # SQLite stores the flag as 0/1; expose a real JSON boolean.
                 s["archived"] = bool(s.get("archived"))
+                # A WeCom ChannelUserId is an opaque channel credential. Keep
+                # it inside the runtime/DB and expose only resolved labels to
+                # Desktop renderers.
+                if str(s.get("source") or "").strip().lower() == "wecom":
+                    s.pop("user_id", None)
             return {"sessions": sessions, "total": total, "limit": limit, "offset": offset}
         finally:
             db.close()
@@ -2992,6 +3257,8 @@ async def get_profiles_sessions(
                     and (now - s.get("last_active", s.get("started_at", 0))) < 300
                 )
                 s["archived"] = bool(s.get("archived"))
+                if str(s.get("source") or "").strip().lower() == "wecom":
+                    s.pop("user_id", None)
                 merged.append(s)
         except Exception as exc:
             errors.append({"profile": name, "error": str(exc)})

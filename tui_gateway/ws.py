@@ -28,6 +28,7 @@ import concurrent.futures
 import json
 import logging
 import socket
+import weakref
 from typing import Any
 
 from tui_gateway import server
@@ -39,6 +40,7 @@ _log = logging.getLogger(__name__)
 # threads from a wedged socket.
 _WS_WRITE_TIMEOUT_S = 10.0
 _WS_LOG_PAYLOAD_PREVIEW = 240
+_active_transports: "weakref.WeakSet[WSTransport]" = weakref.WeakSet()
 
 # Keep starlette optional at import time; handle_ws uses the real class when
 # it's available and falls back to a generic Exception sentinel otherwise.
@@ -142,6 +144,38 @@ class WSTransport:
         self._closed = True
 
 
+async def broadcast_event(
+    event_type: str,
+    *,
+    payload: dict[str, Any] | None = None,
+    session_id: str = "",
+) -> int:
+    """Broadcast a generic local dashboard event to connected clients.
+
+    This is deliberately an event notification, not a message transport.  A
+    consumer must re-read authoritative state (for example ``state.db``) after
+    receiving it; channel message bodies and remote reply targets never cross
+    this boundary.
+    """
+    frame = {
+        "jsonrpc": "2.0",
+        "method": "event",
+        "params": {
+            "type": str(event_type or ""),
+            "session_id": str(session_id or ""),
+            **({"payload": payload} if payload is not None else {}),
+        },
+    }
+    transports = [transport for transport in list(_active_transports) if not transport._closed]
+    if not transports:
+        return 0
+    results = await asyncio.gather(
+        *(transport.write_async(frame) for transport in transports),
+        return_exceptions=True,
+    )
+    return sum(result is True for result in results)
+
+
 def _ws_peer_label(ws: Any) -> str:
     """Return ``host:port`` when available, else a stable placeholder."""
     client = getattr(ws, "client", None)
@@ -189,6 +223,7 @@ async def handle_ws(ws: Any) -> None:
         _log.info("ws accepted peer=%s", peer)
 
         transport = WSTransport(ws, asyncio.get_running_loop(), peer=peer)
+        _active_transports.add(transport)
 
         ready_ok = await transport.write_async(
             {
@@ -300,6 +335,7 @@ async def handle_ws(ws: Any) -> None:
         reaped_sessions = 0
         detached_sessions = 0
         if transport is not None:
+            _active_transports.discard(transport)
             transport.close()
 
             # Reap sessions this transport owned (close_on_disconnect sidecar

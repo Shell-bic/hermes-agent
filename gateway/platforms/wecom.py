@@ -68,6 +68,7 @@ from gateway.platforms.base import (
     cache_document_from_bytes,
     cache_image_from_bytes,
 )
+from gateway.enterprise_wecom_identity import EnterpriseWeComIdentityClient
 
 logger = logging.getLogger(__name__)
 
@@ -160,6 +161,9 @@ class WeComAdapter(BasePlatformAdapter):
             or os.getenv("WECOM_WEBSOCKET_URL", DEFAULT_WS_URL)
         ).strip() or DEFAULT_WS_URL
 
+        self._enterprise_managed_runtime = extra.get("enterprise_managed_runtime") is True
+        self._binding_id = str(extra.get("binding_id") or "").strip()
+        self._corp_id = str(extra.get("corp_id") or "").strip()
         self._dm_policy = str(extra.get("dm_policy") or os.getenv("WECOM_DM_POLICY", "open")).strip().lower()
         # dm_policy already honors WECOM_DM_POLICY, so the allowlist must honor
         # WECOM_ALLOWED_USERS too. Without the env fallback an env-only setup
@@ -174,6 +178,29 @@ class WeComAdapter(BasePlatformAdapter):
         self._group_policy = str(extra.get("group_policy") or os.getenv("WECOM_GROUP_POLICY", "open")).strip().lower()
         self._group_allow_from = _coerce_list(extra.get("group_allow_from") or extra.get("groupAllowFrom"))
         self._groups = extra.get("groups") if isinstance(extra.get("groups"), dict) else {}
+
+        # The Desktop-managed adapter is intentionally open for both DMs and
+        # groups.  This is an in-memory property of this one adapter; Hermes'
+        # global/default authorization behavior is unchanged.
+        if self._enterprise_managed_runtime:
+            self._dm_policy = "open"
+            self._group_policy = "open"
+            self._allow_from = []
+            self._group_allow_from = []
+
+        identity_client = extra.get("identity_client")
+        if identity_client is not None:
+            self._identity_client = identity_client
+        elif self._enterprise_managed_runtime:
+            self._identity_client = EnterpriseWeComIdentityClient(
+                gateway_base_url=str(extra.get("gateway_base_url") or ""),
+                gateway_service_token=str(extra.get("gateway_service_token") or ""),
+                binding_id=self._binding_id,
+                bot_id=self._bot_id,
+                secret=self._secret,
+            )
+        else:
+            self._identity_client = None
 
         self._session: Optional["aiohttp.ClientSession"] = None
         self._ws: Optional["aiohttp.ClientWebSocketResponse"] = None
@@ -264,6 +291,21 @@ class WeComAdapter(BasePlatformAdapter):
         if self._http_client:
             await self._http_client.aclose()
             self._http_client = None
+
+        identity_client, self._identity_client = self._identity_client, None
+        if identity_client is not None:
+            try:
+                await identity_client.close()
+            except Exception:
+                logger.debug("[%s] Identity client close failed", self.name, exc_info=True)
+
+        if self._enterprise_managed_runtime:
+            # The runner may retain the PlatformConfig briefly while publishing
+            # an error state. Remove credential material as part of detach;
+            # the control plane must provide it again for a later attach.
+            for key in ("secret", "gateway_service_token"):
+                self.config.extra.pop(key, None)
+            self._secret = ""
 
         self._dedup.clear()
         logger.info("[%s] Disconnected", self.name)
@@ -528,6 +570,33 @@ class WeComAdapter(BasePlatformAdapter):
         # Mirrors what the Telegram adapter does (re.sub @botname).
         if is_group and text:
             text = re.sub(r"^@\S+\s*", "", text).strip()
+        # A six-digit claim is transport control only in a direct chat.  It is
+        # checked before media work, batching and BasePlatformAdapter's active
+        # session guard, so a successful claim never reaches the LLM.  Failed
+        # proof/transport/domain outcomes remain ordinary chat input.
+        if (
+            not is_group
+            and self._identity_client is not None
+            and re.fullmatch(r"[0-9]{6}", text or "")
+        ):
+            try:
+                claim = await self._identity_client.redeem(sender_id, text)
+            except Exception:
+                logger.info("[%s] Identity claim unavailable; continuing as chat", self.name)
+            else:
+                if claim.intercept:
+                    message = (
+                        "身份验证成功，可以继续聊天了。"
+                        if claim.outcome == "claimed"
+                        else "该企业微信身份已完成验证。"
+                    )
+                    await self.send(chat_id, message, reply_to=msg_id)
+                    return
+
+        identity = None
+        if self._identity_client is not None and sender_id:
+            identity = await self._identity_client.resolve(sender_id)
+
         media_urls, media_types = await self._extract_media(body)
         message_type = self._derive_message_type(body, text, media_types)
         has_reply_context = bool(reply_text and (text or media_urls))
@@ -543,8 +612,45 @@ class WeComAdapter(BasePlatformAdapter):
             chat_id=chat_id,
             chat_type="group" if is_group else "dm",
             user_id=sender_id or None,
+            # Identity resolution is UI/audit metadata only.  Keep the Agent's
+            # SessionContext byte-stable when this actor later claims an
+            # enterprise identity; changing user_name would perturb the
+            # per-turn context prompt and destroy prompt-cache reuse.
             user_name=sender_id or None,
         )
+        if self._enterprise_managed_runtime:
+            source.binding_id = self._binding_id
+            source.source_instance_id = self._binding_id
+            source.conversation_id = chat_id
+            source.channel_identity_status = (
+                identity.mapping_status if identity is not None else "unknown"
+            )
+            source.channel_identity_label = (
+                identity.display_name or identity.user_name or "已映射企业用户"
+                if identity is not None and identity.mapping_status == "mapped"
+                else None
+            )
+            source.channel_identity_match_scope = (
+                identity.match_scope if identity is not None else "none"
+            )
+            # This is an adapter-owned isolation requirement, not a user's
+            # global session preference.  It keeps two members in the same
+            # WeCom group from sharing one Agent session.
+            source.force_group_sessions_per_user = True
+            # Private, non-serialized runtime context.  It lets the model audit
+            # hook sign after WECOM_* has been scrubbed from the process env.
+            source._enterprise_channel_signing_context = {  # type: ignore[attr-defined]
+                "bot_id": self._bot_id,
+                "secret": self._secret,
+            }
+            if identity is not None:
+                source._enterprise_identity = {  # type: ignore[attr-defined]
+                    "mapping_status": identity.mapping_status,
+                    "match_scope": identity.match_scope,
+                    "desktop_user_id": identity.desktop_user_id,
+                    "user_name": identity.user_name,
+                    "display_name": identity.display_name,
+                }
 
         event = MessageEvent(
             text=text,

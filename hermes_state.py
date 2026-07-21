@@ -545,6 +545,11 @@ CREATE TABLE IF NOT EXISTS sessions (
     handoff_error TEXT,
     rewind_count INTEGER NOT NULL DEFAULT 0,
     archived INTEGER NOT NULL DEFAULT 0,
+    source_instance_id TEXT,
+    conversation_id TEXT,
+    channel_identity_status TEXT,
+    channel_identity_label TEXT,
+    channel_identity_match_scope TEXT,
     FOREIGN KEY (parent_session_id) REFERENCES sessions(id)
 );
 
@@ -1287,6 +1292,11 @@ class SessionDB:
         user_id: str = None,
         parent_session_id: str = None,
         cwd: str = None,
+        source_instance_id: str = None,
+        conversation_id: str = None,
+        channel_identity_status: str = None,
+        channel_identity_label: str = None,
+        channel_identity_match_scope: str = None,
     ) -> None:
         """Shared INSERT OR IGNORE for session rows."""
         stored_model_config = secret_policy.redact_persisted_value(model_config)
@@ -1295,8 +1305,10 @@ class SessionDB:
         def _do(conn):
             conn.execute(
                 """INSERT OR IGNORE INTO sessions (id, source, user_id, model, model_config,
-                   system_prompt, parent_session_id, cwd, started_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   system_prompt, parent_session_id, cwd, source_instance_id, conversation_id,
+                   channel_identity_status, channel_identity_label,
+                   channel_identity_match_scope, started_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     session_id,
                     source,
@@ -1306,6 +1318,11 @@ class SessionDB:
                     stored_system_prompt,
                     parent_session_id,
                     cwd,
+                    source_instance_id,
+                    conversation_id,
+                    channel_identity_status,
+                    channel_identity_label,
+                    channel_identity_match_scope,
                     time.time(),
                 ),
             )
@@ -1349,6 +1366,63 @@ class SessionDB:
 
         def _do(conn):
             conn.execute("UPDATE sessions SET cwd = ? WHERE id = ?", (cwd, session_id))
+
+        self._execute_write(_do)
+
+    def bind_session_source_context(
+        self,
+        session_id: str,
+        *,
+        source: str,
+        source_instance_id: str,
+        conversation_id: str,
+    ) -> None:
+        """Attach trusted external routing metadata to an existing session."""
+        if not session_id or not source or not source_instance_id or not conversation_id:
+            raise ValueError("complete session source context is required")
+
+        def _do(conn):
+            conn.execute(
+                """UPDATE sessions
+                   SET source = ?, source_instance_id = ?, conversation_id = ?
+                   WHERE id = ?""",
+                (source, source_instance_id, conversation_id, session_id),
+            )
+
+        self._execute_write(_do)
+
+    def update_channel_source_metadata(
+        self,
+        session_id: str,
+        *,
+        source_instance_id: str = None,
+        conversation_id: str = None,
+        channel_identity_status: str = None,
+        channel_identity_label: str = None,
+        channel_identity_match_scope: str = None,
+    ) -> None:
+        """Persist non-authoritative channel identity labels for Desktop lists."""
+        if not session_id:
+            return
+
+        def _do(conn):
+            conn.execute(
+                """UPDATE sessions SET
+                   source_instance_id = COALESCE(?, source_instance_id),
+                   conversation_id = COALESCE(?, conversation_id),
+                   channel_identity_status = COALESCE(?, channel_identity_status),
+                   channel_identity_label = ?,
+                   channel_identity_match_scope = COALESCE(?, channel_identity_match_scope)
+                   WHERE id = ?""",
+                (
+                    source_instance_id,
+                    conversation_id,
+                    channel_identity_status,
+                    channel_identity_label,
+                    channel_identity_match_scope,
+                    session_id,
+                ),
+            )
 
         self._execute_write(_do)
     # ──────────────────────────────────────────────────────────────────────
@@ -2216,6 +2290,9 @@ class SessionDB:
                     "id", "ended_at", "end_reason", "message_count",
                     "tool_call_count", "title", "last_active", "preview",
                     "model", "system_prompt", "cwd",
+                    "source", "user_id", "source_instance_id", "conversation_id",
+                    "channel_identity_status", "channel_identity_label",
+                    "channel_identity_match_scope",
                 ):
                     if key in tip_row:
                         merged[key] = tip_row[key]
