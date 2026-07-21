@@ -83,6 +83,14 @@ test('branch experiment pins its explicit runtime and disables original main upd
     /if \(backend\.kind === 'bootstrap-needed'\) \{[\s\S]*if \(ENTERPRISE_WECOM_PINNED_RUNTIME\)[\s\S]*enterprise-experiment-runtime-unavailable[\s\S]*handOffWindowsBootstrapRecovery/
   )
   assert.match(main, /const venvRoot = resolvePythonVenvRoot\(root\)[\s\S]*pythonPathEntries: \[root\],[\s\S]*venvRoot/)
+  assert.match(
+    main,
+    /function findPythonForRoot\(root\) \{[\s\S]*getVenvPython\(VENV_ROOT\)[\s\S]*return managedVenvPython/
+  )
+  const pinnedFailClosed = main.indexOf('WeCom experiment could not resolve its pinned source runtime')
+  const installedCliFallback = main.indexOf('// 3. Bootstrap-complete ACTIVE_HERMES_ROOT')
+  assert.ok(pinnedFailClosed > 0)
+  assert.ok(pinnedFailClosed < installedCliFallback)
 })
 
 test('quit logout account switch and invalid session stop the backend, while Bot unbind only detaches the adapter', () => {

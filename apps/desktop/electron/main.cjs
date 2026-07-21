@@ -1628,6 +1628,13 @@ function findPythonForRoot(root) {
   const candidate = getVenvPython(resolvePythonVenvRoot(root))
   if (fileExists(candidate)) return candidate
 
+  // A development worktree does not necessarily carry its own venv. Reuse
+  // the managed installation's interpreter and dependencies while
+  // createPythonBackend() pins PYTHONPATH to `root`, so the child executes the
+  // checked-out Python sources instead of the installed hermes_cli package.
+  const managedVenvPython = getVenvPython(VENV_ROOT)
+  if (fileExists(managedVenvPython)) return managedVenvPython
+
   return findSystemPython()
 }
 
@@ -2853,6 +2860,30 @@ function resolveHermesBackend(dashboardArgs) {
   if (!IS_PACKAGED && isHermesSourceRoot(SOURCE_REPO_ROOT)) {
     const backend = createPythonBackend(SOURCE_REPO_ROOT, `Hermes source at ${SOURCE_REPO_ROOT}`, dashboardArgs)
     if (backend) return backend
+  }
+
+  // This branch experiment depends on private runtime-control routes that are
+  // only present in the pinned checkout. Falling through to an installed CLI
+  // produces a healthy dashboard with an incompatible backend and surfaces as
+  // the misleading `wecom-runtime-control-rejected` error. Fail closed instead.
+  if (ENTERPRISE_WECOM_PINNED_RUNTIME) {
+    rememberLog(
+      `[runtime] WeCom experiment could not resolve its pinned source runtime ` +
+      `(override=${overrideRoot || 'none'}, source=${SOURCE_REPO_ROOT}).`
+    )
+    return {
+      kind: 'bootstrap-needed',
+      label: 'Pinned WeCom experiment runtime is unavailable',
+      command: null,
+      args: dashboardArgs,
+      bootstrap: true,
+      env: {},
+      shell: false,
+      activeRoot: ACTIVE_HERMES_ROOT,
+      installStamp: INSTALL_STAMP,
+      isPackaged: IS_PACKAGED,
+      platform: process.platform
+    }
   }
 
   // 3. Bootstrap-complete ACTIVE_HERMES_ROOT -- the canonical install at
