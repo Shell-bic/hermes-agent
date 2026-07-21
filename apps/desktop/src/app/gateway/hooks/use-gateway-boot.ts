@@ -46,6 +46,7 @@ import type { RpcEvent } from '@/types/hermes'
 
 interface GatewayBootOptions {
   enabled?: boolean
+  suspended?: boolean
   handleGatewayEvent: (event: RpcEvent) => void
   onConnectionReady: (
     connection: Awaited<ReturnType<NonNullable<typeof window.hermesDesktop>['getConnection']>> | null
@@ -59,6 +60,7 @@ const POST_BOOT_RECONNECT_FAILURE_THRESHOLD = 6
 
 export function useGatewayBoot({
   enabled = true,
+  suspended = false,
   handleGatewayEvent,
   onConnectionReady,
   onGatewayReady,
@@ -107,13 +109,15 @@ export function useGatewayBoot({
         publish(null)
         callbacksRef.current.onGatewayReady(null)
         const state = await refreshEnterpriseState().catch(() => null)
-        if (!cancelled && state?.enabled && !state.authenticated) {
+        if (!cancelled && state?.enabled && state.status !== 'loading' && !state.authenticated) {
           completeDesktopBoot('Waiting for enterprise sign-in')
           setSessionsLoading(false)
         }
       })
-      completeDesktopBoot('Waiting for enterprise sign-in')
-      setSessionsLoading(false)
+      if (!suspended) {
+        completeDesktopBoot('Waiting for enterprise sign-in')
+        setSessionsLoading(false)
+      }
 
       return () => {
         cancelled = true
@@ -595,5 +599,5 @@ export function useGatewayBoot({
       setPrimaryGateway(null)
       $gateway.set(null)
     }
-  }, [enabled])
+  }, [enabled, suspended])
 }

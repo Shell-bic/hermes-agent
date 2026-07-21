@@ -173,6 +173,20 @@ function DisabledHarness() {
   return null
 }
 
+function SuspendedHarness() {
+  useGatewayBoot({
+    enabled: false,
+    suspended: true,
+    handleGatewayEvent: () => undefined,
+    onConnectionReady: () => undefined,
+    onGatewayReady: () => undefined,
+    refreshHermesConfig: async () => undefined,
+    refreshSessions: async () => undefined
+  })
+
+  return null
+}
+
 const originalWebSocket = globalThis.WebSocket
 
 beforeEach(() => {
@@ -336,6 +350,14 @@ describe('useGatewayBoot remote reconnect loop (real hook, fake socket)', () => 
     expect($desktopBoot.get().visible).toBe(false)
     expect($desktopBoot.get().running).toBe(false)
     expect($desktopBoot.get().progress).toBe(100)
+  })
+
+  it('keeps the initial boot overlay active while enterprise session recovery is pending', () => {
+    render(<SuspendedHarness />)
+
+    expect($desktopBoot.get().visible).toBe(true)
+    expect($desktopBoot.get().running).toBe(true)
+    expect($desktopBoot.get().progress).toBe(0)
   })
 
   it('INITIAL boot against a dead VPS: getConnection hangs (waitForHermes) → app sits in the connecting combo, then fails', async () => {

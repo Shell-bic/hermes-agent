@@ -849,6 +849,7 @@ export function DesktopController() {
 
   useGatewayBoot({
     enabled: gatewayBootEnabled,
+    suspended: enterprise.status === 'loading',
     handleGatewayEvent: handleDesktopGatewayEvent,
     onConnectionReady: c => {
       connectionRef.current = c
