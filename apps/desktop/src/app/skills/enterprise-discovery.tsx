@@ -319,8 +319,26 @@ export function EnterpriseDiscovery({ authenticated, onInstalled, query, refresh
     setRefreshingPolicy(true)
 
     try {
-      await refreshEnterprisePolicy()
-      await Promise.all([refreshList(), onInstalled()])
+      const state = await refreshEnterprisePolicy()
+
+      if (state.policyRefreshStatus !== 'current') {
+        notify({
+          kind: 'warning',
+          message: state.policyRefreshError || t.skills.enterprisePolicyFailed,
+          title: state.policyRefreshStatus === 'stale'
+            ? t.skills.enterprisePolicyStale
+            : t.skills.enterprisePolicyFailed
+        })
+
+        return
+      }
+
+      await refreshList()
+      notify({
+        kind: 'success',
+        message: t.skills.enterprisePolicyRefreshSucceeded,
+        title: t.skills.enterprisePolicyCurrent
+      })
     } catch (error) {
       notify({ kind: 'warning', message: errorInfo(error).message, title: t.skills.enterpriseLoadFailed })
     } finally {

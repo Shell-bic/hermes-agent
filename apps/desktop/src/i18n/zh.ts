@@ -910,6 +910,7 @@ export const zh: Translations = {
     enterprisePolicyCurrent: '企业策略已是最新',
     enterprisePolicyFailed: '企业策略刷新失败',
     enterprisePolicyRefresh: '刷新企业策略',
+    enterprisePolicyRefreshSucceeded: '技能可用状态已更新。',
     enterprisePolicyRefreshing: '正在刷新企业策略',
     enterprisePolicyStale: '正在使用最近一次有效的企业策略',
     noDescription: '暂无描述。',

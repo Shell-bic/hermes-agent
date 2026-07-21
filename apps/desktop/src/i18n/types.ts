@@ -602,6 +602,7 @@ export interface Translations {
     enterprisePolicyCurrent: string
     enterprisePolicyFailed: string
     enterprisePolicyRefresh: string
+    enterprisePolicyRefreshSucceeded: string
     enterprisePolicyRefreshing: string
     enterprisePolicyStale: string
     noDescription: string

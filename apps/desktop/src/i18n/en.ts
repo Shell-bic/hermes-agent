@@ -721,6 +721,7 @@ export const en: Translations = {
     enterprisePolicyCurrent: 'Enterprise policy is current',
     enterprisePolicyFailed: 'Enterprise policy refresh failed',
     enterprisePolicyRefresh: 'Refresh enterprise policy',
+    enterprisePolicyRefreshSucceeded: 'Skill availability has been updated.',
     enterprisePolicyRefreshing: 'Refreshing enterprise policy',
     enterprisePolicyStale: 'Using last-known-good enterprise policy',
     noDescription: 'No description.',

@@ -361,6 +361,28 @@ describe('SkillsView toolset management', () => {
     expect(screen.getByText('Enterprise policy refresh failed (HTTP 503).')).toBeTruthy()
   })
 
+  it('reports a successful policy refresh without reloading ordinary capabilities', async () => {
+    $enterprise.set(managedEnterpriseState({ policyRefreshStatus: 'current', policyStale: false }))
+    getSkills.mockResolvedValueOnce([]).mockRejectedValueOnce(new Error('ordinary skills reload failed'))
+    getToolsets.mockResolvedValueOnce([toolset()]).mockRejectedValueOnce(new Error('ordinary toolsets reload failed'))
+    const notifications = await import('@/store/notifications')
+
+    await renderSkills('enterprise')
+    await waitFor(() => expect(getSkills).toHaveBeenCalledTimes(1))
+    fireEvent.click(await screen.findByRole('button', { name: 'Refresh enterprise policy' }))
+
+    await waitFor(() => expect(refreshEnterprisePolicyBridge).toHaveBeenCalledTimes(1))
+    await waitFor(() => expect(listEnterpriseSkills).toHaveBeenCalledTimes(2))
+    expect(getSkills).toHaveBeenCalledTimes(1)
+    expect(getToolsets).toHaveBeenCalledTimes(1)
+    expect(notifications.notifyError).not.toHaveBeenCalled()
+    expect(notifications.notify).toHaveBeenCalledWith({
+      kind: 'success',
+      message: 'Skill availability has been updated.',
+      title: 'Enterprise policy is current'
+    })
+  })
+
   it('filters enterprise discovery by search and category', async () => {
     const item = (name: string, category: string) => ({
       artifactSha256: 'd'.repeat(64),
