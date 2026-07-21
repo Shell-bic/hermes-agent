@@ -92,12 +92,37 @@ class EnterpriseAuthStore {
 
   readSession() {
     const raw = this.readRaw()
-    const desktopToken = decryptValue(raw?.desktopToken, this.safeStorage)
+    const encryptedToken = raw?.desktopToken
+
+    if (!encryptedToken) {
+      return null
+    }
+
+    // Known-invalid or legacy plaintext envelopes must not remain on disk.
+    // A valid safeStorage envelope is different: the OS credential service
+    // can become temporarily unavailable while Electron is shutting down
+    // (notably when the dev terminal receives Ctrl+C). Fail closed for this
+    // read, but preserve the ciphertext so the next normal launch can decrypt
+    // the still-valid Desktop session.
+    if (
+      typeof encryptedToken !== 'object' ||
+      encryptedToken.encoding !== 'safeStorage' ||
+      !String(encryptedToken.value || '')
+    ) {
+      this.clear()
+      return null
+    }
+
+    if (!isSecureStorageAvailable(this.safeStorage)) {
+      return null
+    }
+
+    const desktopToken = decryptValue(encryptedToken, this.safeStorage)
 
     if (!desktopToken) {
-      if (raw?.desktopToken) {
-        this.clear()
-      }
+      // Decryption can also fail transiently while the OS credential service
+      // is locking. Keep the encrypted envelope; explicit login overwrites it
+      // if it is genuinely no longer decryptable.
       return null
     }
 

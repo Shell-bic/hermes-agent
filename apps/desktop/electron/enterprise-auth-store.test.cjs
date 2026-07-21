@@ -81,7 +81,7 @@ test('enterprise auth store rejects Linux basic_text even when Electron reports 
   assert.equal(fs.existsSync(filePath), false)
 })
 
-test('enterprise auth store clears an existing session when Linux falls back to basic_text', () => {
+test('enterprise auth store preserves encrypted session when secure storage is temporarily unavailable', () => {
   const filePath = tempFile()
   let decryptCalled = false
   fs.writeFileSync(
@@ -106,7 +106,31 @@ test('enterprise auth store clears an existing session when Linux falls back to 
 
   assert.equal(store.readSession(), null)
   assert.equal(decryptCalled, false)
-  assert.equal(fs.existsSync(filePath), false)
+  assert.equal(fs.existsSync(filePath), true)
+})
+
+test('enterprise auth store preserves ciphertext when secure storage decryption fails transiently', () => {
+  const filePath = tempFile()
+  fs.writeFileSync(
+    filePath,
+    JSON.stringify({
+      desktopToken: { encoding: 'safeStorage', value: Buffer.from('ciphertext').toString('base64') },
+      expiresAt: '2099-01-01T00:00:00Z'
+    }),
+    'utf8'
+  )
+  const store = createEnterpriseAuthStore({
+    filePath,
+    safeStorage: {
+      decryptString: () => {
+        throw new Error('credential service is locking')
+      },
+      isEncryptionAvailable: () => true
+    }
+  })
+
+  assert.equal(store.readSession(), null)
+  assert.equal(fs.existsSync(filePath), true)
 })
 
 test('enterprise auth store clears any prior file when secure encryption fails', () => {
