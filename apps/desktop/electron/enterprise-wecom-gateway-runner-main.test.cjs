@@ -15,20 +15,31 @@ const {
 } = require('../scripts/dev-wecom.cjs')
 
 test('WeCom development launcher pins the current checkout and local enterprise Gateway', () => {
+  const npmExecPath = 'C:\\Program Files\\nodejs\\node_modules\\npm\\bin\\npm-cli.js'
   const launch = buildWeComDevLaunch({
-    env: {},
+    env: { npm_execpath: npmExecPath },
     platform: 'win32'
   })
 
   assert.equal(desktopPackage.scripts['dev:wecom'], 'node scripts/dev-wecom.cjs')
-  assert.equal(launch.command, 'npm.cmd')
-  assert.deepEqual(launch.args, ['run', 'dev'])
+  assert.equal(launch.command, process.execPath)
+  assert.deepEqual(launch.args, [npmExecPath, 'run', 'dev'])
   assert.equal(launch.cwd, desktopRoot)
   assert.equal(launch.env.HERMES_DESKTOP_HERMES_ROOT, hermesRoot)
   assert.equal(launch.env.HERMES_DESKTOP_ENTERPRISE_GATEWAY_URL, 'http://127.0.0.1:5000')
   assert.equal(launch.env.HERMES_DESKTOP_WECOM_GATEWAY_RUNNER_EXPERIMENT, '1')
   assert.equal(path.isAbsolute(launch.env.HERMES_DESKTOP_HERMES_ROOT), true)
   assert.equal(fs.existsSync(path.join(launch.env.HERMES_DESKTOP_HERMES_ROOT, 'hermes_cli', 'main.py')), true)
+})
+
+test('WeCom development launcher avoids direct npm.cmd spawn on Windows fallback', () => {
+  const launch = buildWeComDevLaunch({
+    env: { ComSpec: 'C:\\Windows\\System32\\cmd.exe' },
+    platform: 'win32'
+  })
+
+  assert.equal(launch.command, 'C:\\Windows\\System32\\cmd.exe')
+  assert.deepEqual(launch.args, ['/d', '/s', '/c', 'npm run dev'])
 })
 
 test('main injects only an independent runtime-control token and hot-attaches after backend readiness', () => {

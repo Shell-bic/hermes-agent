@@ -7,9 +7,24 @@ const desktopRoot = path.resolve(__dirname, '..')
 const hermesRoot = path.resolve(desktopRoot, '..', '..')
 
 function buildWeComDevLaunch({ env = process.env, platform = process.platform } = {}) {
+  const npmExecPath = typeof env.npm_execpath === 'string' ? env.npm_execpath.trim() : ''
+  const command = npmExecPath
+    ? process.execPath
+    : platform === 'win32'
+      ? env.ComSpec || env.COMSPEC || 'cmd.exe'
+      : 'npm'
+  const args = npmExecPath
+    ? [npmExecPath, 'run', 'dev']
+    : platform === 'win32'
+      ? ['/d', '/s', '/c', 'npm run dev']
+      : ['run', 'dev']
+
   return {
-    command: platform === 'win32' ? 'npm.cmd' : 'npm',
-    args: ['run', 'dev'],
+    // npm.cmd cannot be passed directly to spawn(..., { shell: false }) on
+    // newer Windows Node releases (notably Node 25: spawn EINVAL). npm exposes
+    // its JS entry point to lifecycle scripts, so run that through this Node.
+    command,
+    args,
     cwd: desktopRoot,
     env: {
       ...env,
