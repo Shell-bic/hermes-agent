@@ -9,6 +9,30 @@
     <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png" />
     <link rel="shortcut icon" href="/apple-touch-icon.png" />
     <title>Hermes</title>
+    <style>
+      html,
+      body,
+      #root {
+        height: 100%;
+        margin: 0;
+      }
+
+      #hermes-startup-splash {
+        position: fixed;
+        inset: 0;
+        z-index: 2147483647;
+        display: grid;
+        place-items: center;
+        background: var(--hermes-boot-background, #111111);
+        color: var(--hermes-boot-foreground, #d8d8d8);
+        font: 600 0.64rem/1 ui-monospace, SFMono-Regular, Consolas, monospace;
+        letter-spacing: 0.4em;
+      }
+
+      #hermes-startup-splash > span {
+        padding-left: 0.4em;
+      }
+    </style>
     <script>
       // Pre-paint the themed background before the app bundle loads. Without
       // this, the first frame (which is what `ready-to-show` waits for) is the
@@ -24,6 +48,8 @@
           scheme = dark ? 'dark' : 'light'
         }
         document.documentElement.style.backgroundColor = bg
+        document.documentElement.style.setProperty('--hermes-boot-background', bg)
+        document.documentElement.style.setProperty('--hermes-boot-foreground', scheme === 'light' ? '#272727' : '#d8d8d8')
         if (scheme === 'dark' || scheme === 'light') {
           document.documentElement.style.colorScheme = scheme
         }
@@ -33,7 +59,9 @@
     </script>
   </head>
   <body>
-    <div id="root" class="scrollbar-dt"></div>
+    <div id="root" class="scrollbar-dt">
+      <div id="hermes-startup-splash" role="status" aria-label="Hermes is connecting"><span>CONNECTING</span></div>
+    </div>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>
