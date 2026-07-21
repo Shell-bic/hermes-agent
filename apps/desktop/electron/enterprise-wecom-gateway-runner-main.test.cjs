@@ -104,15 +104,19 @@ test('managed lifecycle defers safeStorage decryption until Electron is ready', 
   assert.ok(lifecycleInitialization < electronReady)
 })
 
-test('renderer cold-start status joins the authoritative session recovery', () => {
+test('renderer cold-start status stays non-blocking and receives authoritative recovery state', () => {
   assert.match(
     main,
     /async function refreshEnterprisePublicStateAndEnforceLifecycle\(\) \{[\s\S]*if \(enterprisePublicStateRefreshPromise\)[\s\S]*return enterprisePublicStateRefreshPromise[\s\S]*enterprisePublicStateRefreshPromise = refresh/
   )
+  assert.match(main, /mainWindow\.webContents\.send\('hermes:enterprise:state', state\)/)
   assert.match(
     main,
-    /ipcMain\.handle\('hermes:enterprise:status',[\s\S]*state === 'recovering'[\s\S]*return refreshEnterprisePublicStateAndEnforceLifecycle\(\)[\s\S]*return enterpriseRuntime\.getPublicState\(\)/
+    /ipcMain\.handle\('hermes:enterprise:status',[\s\S]*return enterpriseRuntime\.getPublicState\(\)/
   )
+  const statusStart = main.indexOf("ipcMain.handle('hermes:enterprise:status'")
+  const statusEnd = main.indexOf("ipcMain.handle('hermes:enterprise:lifecycle-status'", statusStart)
+  assert.doesNotMatch(main.slice(statusStart, statusEnd), /refreshEnterprisePublicStateAndEnforceLifecycle/)
 })
 
 test('quit logout account switch and invalid session stop the backend, while Bot unbind only detaches the adapter', () => {

@@ -6042,6 +6042,9 @@ async function refreshEnterprisePublicStateAndEnforceLifecycle() {
       enterpriseWeComRelay.stop()
       await teardownPrimaryBackendAndWait()
     }
+    if (mainWindow && !mainWindow.isDestroyed() && !mainWindow.webContents.isDestroyed()) {
+      mainWindow.webContents.send('hermes:enterprise:state', state)
+    }
     return state
   })()
   enterprisePublicStateRefreshPromise = refresh
@@ -6105,12 +6108,8 @@ async function runEnterpriseManagedRecoveryAction(action) {
 
 ipcMain.handle('hermes:enterprise:status', async event => {
   assertTrustedEnterpriseSender(event)
-  // On cold start the renderer can mount before did-finish-load has completed
-  // the stored-session verification. Join that authoritative refresh instead
-  // of returning the constructor's stale unauthenticated placeholder.
-  if (enterpriseLifecycle.getSnapshot().state === 'recovering') {
-    return refreshEnterprisePublicStateAndEnforceLifecycle()
-  }
+  // Never hold the renderer's first paint behind network-backed session
+  // recovery. The authoritative refresh is pushed when it completes.
   return enterpriseRuntime.getPublicState()
 })
 ipcMain.handle('hermes:enterprise:lifecycle-status', async event => {

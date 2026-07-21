@@ -92,6 +92,11 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
       ipcRenderer.on('hermes:enterprise:login-state', listener)
       return () => ipcRenderer.removeListener('hermes:enterprise:login-state', listener)
     },
+    onState: callback => {
+      const listener = (_event, state) => callback(state)
+      ipcRenderer.on('hermes:enterprise:state', listener)
+      return () => ipcRenderer.removeListener('hermes:enterprise:state', listener)
+    },
     refresh: () => ipcRenderer.invoke('hermes:enterprise:refresh'),
     recoverPolicy: () => invokeEnterpriseRecovery('hermes:enterprise:recover-policy'),
     refreshWeCom: () => ipcRenderer.invoke('hermes:enterprise:wecom-refresh'),

@@ -185,6 +185,16 @@ function applyEnterpriseState(state: EnterpriseDesktopState | null | undefined):
   return next
 }
 
+export function subscribeEnterpriseState(): () => void {
+  const bridge = window.hermesDesktop?.enterprise
+
+  if (!bridge?.onState) {
+    return () => undefined
+  }
+
+  return bridge.onState(state => applyEnterpriseState(state))
+}
+
 function clearEnterpriseRuntimeSessionState(): void {
   setConnection(null)
   setGatewayState('idle')

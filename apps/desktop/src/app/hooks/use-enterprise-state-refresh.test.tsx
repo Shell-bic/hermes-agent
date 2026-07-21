@@ -83,4 +83,36 @@ describe('useEnterpriseStateRefresh', () => {
       status: 'restricted'
     })
   })
+
+  it('applies an authoritative enterprise state pushed after cold-start recovery', async () => {
+    let listener: ((state: EnterpriseDesktopState) => void) | null = null
+    const unsubscribe = vi.fn()
+
+    const status = vi.fn<() => Promise<EnterpriseDesktopState>>().mockResolvedValue(
+      enterpriseState({ authenticated: false, status: 'unauthenticated' })
+    )
+
+    ;(window as { hermesDesktop?: unknown }).hermesDesktop = {
+      enterprise: {
+        onState: (callback: (state: EnterpriseDesktopState) => void) => {
+          listener = callback
+
+          return unsubscribe
+        },
+        status
+      }
+    }
+
+    const view = render(<Harness />)
+    await waitFor(() => expect(status).toHaveBeenCalledTimes(1))
+    expect($enterprise.get().authenticated).toBe(false)
+
+    act(() => listener?.(enterpriseState({ user: { displayName: 'Recovered user' } })))
+
+    await waitFor(() => expect($enterprise.get().authenticated).toBe(true))
+    expect($enterprise.get().user).toMatchObject({ displayName: 'Recovered user' })
+
+    view.unmount()
+    expect(unsubscribe).toHaveBeenCalledTimes(1)
+  })
 })

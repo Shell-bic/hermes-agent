@@ -48,6 +48,7 @@ declare global {
         }>
         logout: () => Promise<EnterpriseDesktopState>
         onLoginState: (callback: (state: EnterpriseLoginState) => void) => () => void
+        onState: (callback: (state: EnterpriseDesktopState) => void) => () => void
         refresh: () => Promise<EnterpriseDesktopState>
         recoverPolicy: () => Promise<EnterpriseLifecycleSnapshot>
         refreshWeCom: () => Promise<EnterpriseLoginState>

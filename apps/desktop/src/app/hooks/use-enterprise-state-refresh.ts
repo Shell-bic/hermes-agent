@@ -1,13 +1,16 @@
 import { useStore } from '@nanostores/react'
 import { useEffect } from 'react'
 
-import { $enterprise, refreshEnterpriseState } from '@/store/enterprise'
+import { $enterprise, refreshEnterpriseState, subscribeEnterpriseState } from '@/store/enterprise'
 
 export function useEnterpriseStateRefresh(gatewayState: string | undefined): void {
   const enterprise = useStore($enterprise)
 
   useEffect(() => {
+    const unsubscribe = subscribeEnterpriseState()
     void refreshEnterpriseState()
+
+    return unsubscribe
   }, [])
 
   useEffect(() => {
