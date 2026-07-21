@@ -44,6 +44,7 @@
     "test:enterprise:profile": "node --test electron/enterprise-managed-profile.test.cjs",
     "test:enterprise:bootstrap-fixture-consumer": "node scripts/test-desktop-bootstrap-fixture-consumer.cjs",
     "test:enterprise:x1-bootstrap-matrix": "node --test scripts/x1-enterprise-bootstrap-matrix.test.cjs",
+    "e2e:enterprise:x2-policy-refresh": "node ../../scripts/e2e-enterprise-skill-policy-refresh.cjs",
     "test:enterprise:d4": "node --test electron/enterprise-api-ipc.test.cjs electron/enterprise-backend-request.test.cjs electron/enterprise-gateway-client.test.cjs electron/enterprise-http-transport.test.cjs electron/enterprise-managed-lifecycle.test.cjs electron/enterprise-managed-profile.test.cjs electron/enterprise-profile-delete.test.cjs electron/enterprise-public-error.test.cjs electron/enterprise-runtime-access.test.cjs electron/enterprise-runtime-home.test.cjs electron/enterprise-skill-hub-ipc.test.cjs electron/enterprise-skill-hub.test.cjs electron/enterprise-skill-install-operation-store.test.cjs && node scripts/run-ui-tests.cjs src/app/skills/index.test.tsx",
     "consume:enterprise:bootstrap-fixture": "node scripts/consume-desktop-bootstrap-v2-fixture.cjs",
     "typecheck": "tsc -p . --noEmit",
