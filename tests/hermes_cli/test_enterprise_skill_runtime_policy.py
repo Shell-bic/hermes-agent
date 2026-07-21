@@ -1,13 +1,20 @@
+import base64
+from datetime import datetime, timedelta, timezone
+import hashlib
 import json
 import os
 import shutil
 import subprocess
+import uuid
 from pathlib import Path
 
 import pytest
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+DESKTOP_USER_ID = "67f4d4f5-2164-45b4-9d62-3809e211b2f4"
+RECEIPT_KID = "runtime-policy-test-key"
+RECEIPT_ISSUER = "https://gateway.example.test"
 RUNTIME_CASES = (
     REPO_ROOT
     / "contracts"
@@ -18,11 +25,53 @@ RUNTIME_CASES = (
 )
 
 
+def _b64url(value: bytes) -> str:
+    return base64.urlsafe_b64encode(value).rstrip(b"=").decode("ascii")
+
+
+def _receipt_signing_material():
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+
+    private_key = getattr(_receipt_signing_material, "private_key", None)
+    if private_key is None:
+        private_key = ec.generate_private_key(ec.SECP256R1())
+        _receipt_signing_material.private_key = private_key
+    public_pem = private_key.public_key().public_bytes(
+        serialization.Encoding.PEM,
+        serialization.PublicFormat.SubjectPublicKeyInfo,
+    ).decode("ascii")
+    return private_key, public_pem
+
+
+def _sign_receipt(private_key, claims: dict) -> str:
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.hazmat.primitives.asymmetric.utils import decode_dss_signature
+
+    header = {
+        "alg": "ES256",
+        "kid": RECEIPT_KID,
+        "typ": "hermes-skill-install-receipt+jws",
+    }
+    encoded_header = _b64url(json.dumps(header, separators=(",", ":")).encode())
+    encoded_payload = _b64url(json.dumps(claims, separators=(",", ":")).encode())
+    der = private_key.sign(
+        f"{encoded_header}.{encoded_payload}".encode("ascii"),
+        ec.ECDSA(hashes.SHA256()),
+    )
+    r, s = decode_dss_signature(der)
+    signature = r.to_bytes(32, "big") + s.to_bytes(32, "big")
+    return f"{encoded_header}.{encoded_payload}.{_b64url(signature)}"
+
+
 def _write_policy(home: Path, monkeypatch, skills: list[dict], *, manage: bool = False) -> Path:
+    _private_key, public_pem = _receipt_signing_material()
     policy_path = home / "enterprise-policy.json"
     policy_path.write_text(
         json.dumps(
             {
+                "enterpriseUserId": DESKTOP_USER_ID,
                 "role": [
                     {
                         "name": "skill-admin",
@@ -32,7 +81,23 @@ def _write_policy(home: Path, monkeypatch, skills: list[dict], *, manage: bool =
                 "toolPolicySnapshot": {
                     "policyHash": "runtime-policy-test",
                     "skills": skills,
-                }
+                },
+                "skillInstallReceiptTrust": {
+                    "schemaVersion": 2,
+                    "issuer": RECEIPT_ISSUER,
+                    "audience": "hermes-enterprise-skill-runtime",
+                    "purpose": "hermes-enterprise-skill-materialize",
+                    "signerMode": "gateway-service",
+                    "algorithm": "ES256",
+                    "publicKeys": [
+                        {
+                            "kid": RECEIPT_KID,
+                            "algorithm": "ES256",
+                            "publicKeyPem": public_pem,
+                            "rotationState": "current",
+                        }
+                    ],
+                },
             }
         ),
         encoding="utf-8",
@@ -55,6 +120,67 @@ def _write_skill(skills_root: Path, rel: str, name: str) -> Path:
     return skill_md
 
 
+def _enterprise_lock_entry(skills_root: Path, name: str) -> dict:
+    from tools.enterprise_skills import _tree_manifest
+
+    skill_root = skills_root / "enterprise" / name
+    _manifest, content_hash = _tree_manifest(skill_root)
+    private_key, _public_pem = _receipt_signing_material()
+    now = datetime.now(timezone.utc)
+    recovery_expiry = (now + timedelta(hours=2)).isoformat().replace("+00:00", "Z")
+    operation_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"runtime-policy:{name}"))
+    client_operation_id = f"runtime-policy-{hashlib.sha256(name.encode()).hexdigest()[:16]}"
+    artifact_sha = hashlib.sha256(f"artifact:{name}".encode()).hexdigest()
+    authorization_hash = hashlib.sha256(f"authorization:{name}".encode()).hexdigest()
+    claims = {
+        "schemaVersion": 2,
+        "bindingSchemaVersion": 2,
+        "kid": RECEIPT_KID,
+        "issuer": RECEIPT_ISSUER,
+        "audience": "hermes-enterprise-skill-runtime",
+        "purpose": "hermes-enterprise-skill-materialize",
+        "operationId": operation_id,
+        "clientOperationId": client_operation_id,
+        "desktopUserId": DESKTOP_USER_ID,
+        "tenantId": "tenant-runtime-policy",
+        "skillKey": name,
+        "packageRevision": 1,
+        "artifactSha256": artifact_sha,
+        "materializedContentHash": content_hash,
+        "installAuthorizationHash": authorization_hash,
+        "materializationRecoveryExpiresAt": recovery_expiry,
+        "commitAuthorizedAt": (now - timedelta(seconds=5)).isoformat(),
+        "receiptExpiresAt": (now + timedelta(minutes=30)).isoformat(),
+    }
+    receipt = _sign_receipt(private_key, claims)
+    return {
+        "source": "enterprise",
+        "key": name,
+        "identifier": name,
+        "path": f"enterprise/{name}",
+        "install_path": f"enterprise/{name}",
+        "revision": 1,
+        "artifactSha256": artifact_sha,
+        "content_hash": content_hash,
+        "metadata": {
+            "enterprise_key": name,
+            "enterprise_revision": 1,
+            "artifact_sha256": artifact_sha,
+            "enterprise_install_operation_id": operation_id,
+            "enterprise_client_operation_id": client_operation_id,
+            "enterprise_desktop_user_id": DESKTOP_USER_ID,
+            "enterprise_tenant_id": "tenant-runtime-policy",
+            "install_authorization_hash": authorization_hash,
+            "materialization_binding_schema_version": 2,
+            "materialization_recovery_expires_at": recovery_expiry,
+            "materialization_receipt_digest": hashlib.sha256(receipt.encode("ascii")).hexdigest(),
+            "materialization_receipt_kid": RECEIPT_KID,
+            "materialization_receipt_jws": receipt,
+            "materialization_receipt_validated": True,
+        },
+    }
+
+
 def _write_enterprise_lock(skills_root: Path, name: str) -> None:
     lock_dir = skills_root / ".hub"
     lock_dir.mkdir(parents=True, exist_ok=True)
@@ -63,14 +189,7 @@ def _write_enterprise_lock(skills_root: Path, name: str) -> None:
             {
                 "version": 1,
                 "installed": {
-                    name: {
-                        "source": "enterprise",
-                        "key": name,
-                        "identifier": name,
-                        "path": f"enterprise/{name}",
-                        "install_path": f"enterprise/{name}",
-                        "metadata": {"enterprise_key": name},
-                    }
+                    name: _enterprise_lock_entry(skills_root, name)
                 },
             }
         ),
@@ -83,14 +202,7 @@ def _write_enterprise_locks(skills_root: Path, names: list[str]) -> None:
     lock_path = skills_root / ".hub" / "lock.json"
     lock = json.loads(lock_path.read_text(encoding="utf-8"))
     for name in names[1:]:
-        lock["installed"][name] = {
-            "source": "enterprise",
-            "key": name,
-            "identifier": name,
-            "path": f"enterprise/{name}",
-            "install_path": f"enterprise/{name}",
-            "metadata": {"enterprise_key": name},
-        }
+        lock["installed"][name] = _enterprise_lock_entry(skills_root, name)
     lock_path.write_text(json.dumps(lock), encoding="utf-8")
 
 
@@ -304,6 +416,7 @@ def test_enterprise_linked_directory_escape_never_reads_external_content(
     skill_md = _write_skill(
         skills_root, "enterprise/expense-review", "expense-review"
     )
+    _write_enterprise_lock(skills_root, "expense-review")
     references = skill_md.parent / "references"
     shutil.rmtree(references)
     outside = tmp_path / "outside-references"
@@ -311,7 +424,6 @@ def test_enterprise_linked_directory_escape_never_reads_external_content(
     secret = outside / "secret.md"
     secret.write_text("EXTERNAL-LINKED-SENTINEL", encoding="utf-8")
     _link_directory(references, outside)
-    _write_enterprise_lock(skills_root, "expense-review")
     _write_policy(
         home,
         monkeypatch,
@@ -336,7 +448,8 @@ def test_enterprise_linked_directory_escape_never_reads_external_content(
     )
 
     assert payload["success"] is False
-    assert "outside" in payload["error"].lower()
+    assert payload["errorCode"] == "enterprise_skill_policy_denied"
+    assert "invalid-provenance" in payload["error"].lower()
     assert "EXTERNAL-LINKED-SENTINEL" not in json.dumps(payload)
     assert linked_reads == []
 
