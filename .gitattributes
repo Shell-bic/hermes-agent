@@ -11,3 +11,4 @@ docker/entrypoint.sh text eol=lf
 
 # Cross-language enterprise Skill Hub fixtures have canonical byte hashes.
 contracts/enterprise-skill-hub/** text eol=lf
+contracts/wecom-personal-bot/** text eol=lf

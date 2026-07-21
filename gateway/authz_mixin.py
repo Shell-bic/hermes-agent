@@ -224,6 +224,21 @@ class GatewayAuthorizationMixin:
         if not user_id:
             return False
 
+        # Desktop-hosted Enterprise WeCom deliberately keeps the channel open
+        # and delegates identity attribution to the Enterprise Gateway.  The
+        # one-time marker is attached by GatewayRunner.attach_enterprise_wecom
+        # after its private runtime-control request has been authenticated; it
+        # is never populated from an operator's ordinary channel config.  This
+        # avoids applying Hermes' separate pairing gate after the enterprise
+        # six-digit identity claim has already succeeded, while preserving the
+        # normal fail-closed behavior for every unmanaged WeCom adapter.
+        if source.platform == Platform.WECOM:
+            adapter = (getattr(self, "adapters", None) or {}).get(Platform.WECOM)
+            if getattr(adapter, "_enterprise_managed_open_access", False) is True:
+                if source.chat_type in {"group", "forum", "channel"}:
+                    return self._adapter_group_policy(Platform.WECOM) == "open"
+                return self._adapter_dm_policy(Platform.WECOM) == "open"
+
         platform_env_map = {
             Platform.TELEGRAM: "TELEGRAM_ALLOWED_USERS",
             Platform.DISCORD: "DISCORD_ALLOWED_USERS",

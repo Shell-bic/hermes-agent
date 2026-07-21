@@ -207,6 +207,48 @@ def test_own_policy_open_group_not_authorized_without_allowlist(monkeypatch, pla
     assert runner._is_user_authorized(_source(platform, chat_type="group")) is False
 
 
+@pytest.mark.parametrize("chat_type", ["dm", "group"])
+def test_desktop_managed_wecom_open_policy_bypasses_upstream_pairing(monkeypatch, chat_type):
+    """Enterprise identity claim replaces Hermes pairing for the managed adapter."""
+    _clear_auth_env(monkeypatch)
+    config = GatewayConfig(
+        platforms={
+            Platform.WECOM: PlatformConfig(
+                enabled=True,
+                extra={"dm_policy": "open", "group_policy": "open"},
+            )
+        }
+    )
+    runner, adapter = _make_runner(Platform.WECOM, config, enforces=True)
+    adapter._dm_policy = "open"
+    adapter._group_policy = "open"
+    adapter._enterprise_managed_open_access = True
+
+    assert runner._is_user_authorized(_source(Platform.WECOM, chat_type=chat_type)) is True
+    runner.pairing_store.is_approved.assert_not_called()
+
+
+def test_unmanaged_wecom_cannot_enable_open_access_from_runtime_config_marker(monkeypatch):
+    """The existing config-derived lifecycle marker is not an authorization grant."""
+    _clear_auth_env(monkeypatch)
+    config = GatewayConfig(
+        platforms={
+            Platform.WECOM: PlatformConfig(
+                enabled=True,
+                extra={
+                    "enterprise_managed_runtime": True,
+                    "dm_policy": "open",
+                },
+            )
+        }
+    )
+    runner, adapter = _make_runner(Platform.WECOM, config, enforces=True)
+    adapter._dm_policy = "open"
+    adapter._enterprise_managed_runtime = True
+
+    assert runner._is_user_authorized(_source(Platform.WECOM)) is False
+
+
 def test_wecom_open_group_with_per_group_sender_allowlist_is_authorized(monkeypatch):
     """WeCom ``groups.<id>.allow_from`` is an adapter-enforced restriction.
 

@@ -1,20 +1,66 @@
 const { contextBridge, ipcRenderer, webUtils } = require('electron')
-const { isEnterpriseManagedRenderer, redactManagedText } = require('./managed-redaction.cjs')
-const { createManagedProfileInvoker } = require('./enterprise-managed-profile.cjs')
-const { unwrapEnterprisePublicResult } = require('./enterprise-public-error.cjs')
-const { WINDOW_CONNECTION_CHANNELS } = require('./enterprise-window-connections.cjs')
 
-// Machine deployment config is resolved in the main process and passed as an
-// exact, immutable renderer argument. Environment detection remains a legacy
-// fallback for direct development launches.
-const ENTERPRISE_MANAGED_OUTPUTS = isEnterpriseManagedRenderer(process.argv, process.env)
+// Sandboxed preloads can only require Electron and a small set of Node built-ins.
+// Keep the redaction implementation in the main process, where it is also used
+// by logs and notifications, and expose only its sanitized result here.
+const ENTERPRISE_MANAGED_OUTPUTS = ipcRenderer.sendSync('hermes:managed-output-redaction:enabled') === true
+
+function redactManagedText(value) {
+  return ipcRenderer.sendSync('hermes:managed-output-redaction:redact', value)
+}
+
+const WINDOW_CONNECTION_CHANNELS = Object.freeze({
+  ACK: 'hermes:enterprise:runtime-revoke-ack',
+  NOT_READY: 'hermes:enterprise:runtime-revoke-not-ready',
+  READY: 'hermes:enterprise:runtime-revoke-ready',
+  REVOKE: 'hermes:enterprise:runtime-revoke'
+})
+
+function malformedEnterpriseResult() {
+  const error = new Error('The enterprise operation failed.')
+  error.code = 'enterprise_operation_failed'
+  error.errorCode = 'enterprise_operation_failed'
+  error.httpStatus = null
+  error.lifecycleEpoch = 0
+  error.recoveryKind = 'none'
+  error.status = null
+  return error
+}
+
+function unwrapEnterprisePublicResult(result) {
+  if (result?.envelope !== 'enterprise-public-result.v1' || typeof result.ok !== 'boolean') {
+    throw malformedEnterpriseResult()
+  }
+  if (result.ok === true) return result.value
+
+  const source = result.error
+  if (
+    source?.envelope !== 'enterprise-public-error.v1' ||
+    typeof source.errorCode !== 'string' ||
+    typeof source.message !== 'string' ||
+    !Number.isSafeInteger(source.lifecycleEpoch) ||
+    source.lifecycleEpoch < 0
+  ) {
+    throw malformedEnterpriseResult()
+  }
+
+  const error = new Error(source.message)
+  error.envelope = source.envelope
+  error.code = source.errorCode
+  error.errorCode = source.errorCode
+  error.httpStatus = source.httpStatus ?? null
+  error.lifecycleEpoch = source.lifecycleEpoch
+  error.recoveryKind = source.recoveryKind || 'none'
+  error.status = source.httpStatus ?? null
+  throw error
+}
 
 function unwrapEnterpriseSkillHub(result) {
   return unwrapEnterprisePublicResult(result)
 }
 
-const invokeProfile = createManagedProfileInvoker(ipcRenderer)
-const invokeManagedProfile = (channel, ...args) => invokeProfile(channel, ...args)
+const invokeManagedProfile = (channel, ...args) =>
+  ipcRenderer.invoke(channel, ...args).then(unwrapEnterprisePublicResult)
 const invokeHermesApi = request => ipcRenderer.invoke('hermes:api', request).then(unwrapEnterprisePublicResult)
 const invokeEnterpriseRecovery = channel => ipcRenderer.invoke(channel).then(unwrapEnterprisePublicResult)
 
@@ -53,6 +99,25 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
     refreshPolicy: () => ipcRenderer.invoke('hermes:enterprise:refreshPolicy'),
     retryStop: () => invokeEnterpriseRecovery('hermes:enterprise:retry-stop'),
     selectModel: model => ipcRenderer.invoke('hermes:enterprise:selectModel', model),
+    weComBot: {
+      cancel: () => ipcRenderer.invoke('hermes:enterprise:wecom-bot-cancel'),
+      focusAuthorization: () => ipcRenderer.invoke('hermes:enterprise:wecom-bot-focus'),
+      onState: callback => {
+        const listener = (_event, state) => callback(state)
+        ipcRenderer.on('hermes:enterprise:wecom-bot-state', listener)
+        return () => ipcRenderer.removeListener('hermes:enterprise:wecom-bot-state', listener)
+      },
+      onSessionEvent: callback => {
+        const listener = (_event, state) => callback(state)
+        ipcRenderer.on('hermes:enterprise:wecom-session-event', listener)
+        return () => ipcRenderer.removeListener('hermes:enterprise:wecom-session-event', listener)
+      },
+      regenerateVerification: () => ipcRenderer.invoke('hermes:enterprise:wecom-bot-regenerate-verification'),
+      refresh: () => ipcRenderer.invoke('hermes:enterprise:wecom-bot-state'),
+      revoke: () => ipcRenderer.invoke('hermes:enterprise:wecom-bot-revoke'),
+      unlinkIdentity: () => ipcRenderer.invoke('hermes:enterprise:wecom-bot-unlink-identity'),
+      start: () => ipcRenderer.invoke('hermes:enterprise:wecom-bot-start')
+    },
     skillHub: {
       detail: key => ipcRenderer.invoke('hermes:enterprise:skill-hub:detail', key).then(unwrapEnterpriseSkillHub),
       install: payload =>
@@ -62,7 +127,7 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
     setWeComBounds: bounds => ipcRenderer.invoke('hermes:enterprise:wecom-bounds', bounds),
     status: () => ipcRenderer.invoke('hermes:enterprise:status')
   },
-  redactSensitiveText: value => redactManagedText(value, ENTERPRISE_MANAGED_OUTPUTS),
+  redactSensitiveText: value => redactManagedText(value),
   profile: {
     get: () => ipcRenderer.invoke('hermes:profile:get'),
     set: name => invokeManagedProfile('hermes:profile:set', name)

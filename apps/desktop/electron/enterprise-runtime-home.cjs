@@ -1,6 +1,7 @@
 const fs = require('node:fs')
 const path = require('node:path')
 const crypto = require('node:crypto')
+const { resolveMessagingChannelPolicy } = require('./messaging-channel-policy.cjs')
 
 const MANAGED_PROVIDER = 'company-gateway'
 const GATEWAY_TOKEN_ENV = 'COMPANY_GATEWAY_TOKEN'
@@ -914,6 +915,12 @@ function publicEnterpriseState({ bootstrap = null, manifest = null, modelProfile
   const providerRuntime = normalizeProviderRuntimeMetadata(manifest?.providerRuntime)
     || currentModelProfile?.providerRuntime
     || null
+  const messagingChannelPolicy = resolveMessagingChannelPolicy({
+    bootstrap,
+    manifest,
+    mode: 'managed',
+    requireDualSnapshot: true
+  })
 
   return {
     allowedModels,
@@ -926,6 +933,7 @@ function publicEnterpriseState({ bootstrap = null, manifest = null, modelProfile
     defaultModel,
     enabled: true,
     lockedSurfaces,
+    messagingChannelPolicy,
     modelProfiles: normalizedProfiles,
     modelRuntimeHash: manifest?.modelRuntimeHash || null,
     generatedAt: manifest?.generatedAt || manifest?.toolPolicySnapshot?.generatedAt || null,
@@ -997,6 +1005,7 @@ function buildPolicySnapshot({ bootstrap = null, manifest = null, modelProfiles 
     defaultModel: publicState.defaultModel,
     enterpriseUserId: enterpriseUserId(bootstrap?.user || bootstrap?.account),
     lockedSurfaces: publicState.lockedSurfaces,
+    messagingChannelPolicy: publicState.messagingChannelPolicy,
     manifestId: manifest?.manifestId || null,
     modelProfiles: publicState.modelProfiles,
     modelRuntimeHash: publicState.modelRuntimeHash,

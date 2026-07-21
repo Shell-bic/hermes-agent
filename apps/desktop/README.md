@@ -98,6 +98,13 @@ npm run lint
 npm run test:desktop:all
 ```
 
+The WeCom personal-bot contract has a single-repository test entry and a separate cross-repository byte check. The byte check intentionally requires the Enterprise Gateway repository root; omitting it fails instead of silently skipping verification:
+
+```bash
+npm run test:wecom-personal-bot-contract
+npm run verify:wecom-personal-bot-contract-mirror -- /path/to/enterprise-gateway
+```
+
 ### Troubleshooting
 
 Boot logs land in `HERMES_HOME/logs/desktop.log` (includes backend output and recent Python tracebacks) — check it first if the app reports a boot failure.

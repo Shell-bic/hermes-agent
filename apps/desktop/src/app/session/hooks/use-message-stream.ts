@@ -3,6 +3,7 @@ import { type MutableRefObject, useCallback, useEffect, useRef } from 'react'
 
 import { readActiveTerminal } from '@/app/right-sidebar/terminal/buffer'
 import { translateNow } from '@/i18n'
+import { runtimeSessionIdForStoredSession, storedSessionIdFromChange } from '@/lib/channel-session-events'
 import {
   appendAssistantTextPart,
   appendReasoningPart,
@@ -66,6 +67,7 @@ interface MessageStreamOptions {
   queryClient: QueryClient
   refreshHermesConfig: () => Promise<void>
   refreshSessions: () => Promise<void>
+  selectedStoredSessionIdRef: MutableRefObject<string | null>
   sessionStateByRuntimeIdRef: MutableRefObject<Map<string, ClientSessionState>>
   updateSessionState: (
     sessionId: string,
@@ -260,6 +262,7 @@ export function useMessageStream({
   queryClient,
   refreshHermesConfig,
   refreshSessions,
+  selectedStoredSessionIdRef,
   sessionStateByRuntimeIdRef,
   updateSessionState
 }: MessageStreamOptions) {
@@ -711,10 +714,88 @@ export function useMessageStream({
     [updateSessionState]
   )
 
+  const interruptAssistantMessage = useCallback(
+    (sessionId: string) => {
+      flushQueuedDeltas(sessionId)
+      clearAllPrompts(sessionId)
+      setSessionCompacting(sessionId, false)
+      compactedTurnRef.current.delete(sessionId)
+
+      updateSessionState(sessionId, state => {
+        const streamId = state.streamId
+
+        const messages = state.messages
+          .filter(message => !((message.pending || message.id === streamId) && !chatMessageText(message).trim()))
+          .map(message =>
+            message.pending || message.id === streamId ? { ...message, pending: false } : message
+          )
+
+        return {
+          ...state,
+          messages,
+          busy: false,
+          awaitingResponse: false,
+          streamId: null,
+          pendingBranchGroup: null,
+          interrupted: true,
+          needsInput: false,
+          turnStartedAt: null
+        }
+      })
+    },
+    [flushQueuedDeltas, updateSessionState]
+  )
+
   const handleGatewayEvent = useCallback(
     (event: RpcEvent) => {
       const payload = event.payload as GatewayEventPayload | undefined
-      const explicitSid = event.session_id || ''
+
+      const storedSessionId = typeof payload?.stored_session_id === 'string' ? payload.stored_session_id : ''
+
+      const bridgedRuntimeId = storedSessionId
+        ? runtimeSessionIdForStoredSession(
+            storedSessionId,
+            sessionStateByRuntimeIdRef.current,
+            activeSessionIdRef.current,
+            selectedStoredSessionIdRef.current
+          )
+        : null
+
+      const changedStoredSessionId = storedSessionIdFromChange(event)
+
+      if (changedStoredSessionId) {
+        void refreshSessions().catch(() => undefined)
+
+        const changedRuntimeId = runtimeSessionIdForStoredSession(
+          changedStoredSessionId,
+          sessionStateByRuntimeIdRef.current,
+          activeSessionIdRef.current,
+          selectedStoredSessionIdRef.current
+        )
+
+        if (changedRuntimeId) {
+          // The channel runtime only sends an invalidation signal. Re-read the
+          // authoritative transcript from state.db; no remote message DTOs are
+          // injected into the live stream, preserving history alternation and
+          // prompt-cache ownership in the backend.
+          void hydrateFromStoredSession(3, changedStoredSessionId, changedRuntimeId)
+        }
+
+        return
+      }
+
+      if (storedSessionId && !bridgedRuntimeId) {
+        // A background channel session may not have a live Desktop runtime yet.
+        // Keep its event scoped to that stored session instead of attributing
+        // an unscoped channel reply to whichever Desktop chat is active.
+        if (event.type === 'message.start' || event.type === 'message.complete') {
+          void refreshSessions().catch(() => undefined)
+        }
+
+        return
+      }
+
+      const explicitSid = bridgedRuntimeId || event.session_id || ''
 
       if (!explicitSid && gatewayEventRequiresSessionId(event.type)) {
         return
@@ -903,6 +984,22 @@ export function useMessageStream({
 
         if (payload?.usage) {
           setCurrentUsage(current => ({ ...current, ...payload.usage }))
+        }
+      } else if (event.type === 'message.interrupted') {
+        if (!sessionId) {
+          return
+        }
+
+        interruptAssistantMessage(sessionId)
+
+        if (isActiveEvent) {
+          setTurnStartedAt(null)
+          notify({
+            durationMs: 4_000,
+            kind: 'info',
+            title: '企业微信消息已更新',
+            message: '上一轮已停止，正在处理最新收到的消息。'
+          })
         }
       } else if (event.type === 'tool.start' || event.type === 'tool.progress' || event.type === 'tool.generating') {
         if (!sessionId) {
@@ -1137,9 +1234,14 @@ export function useMessageStream({
       completeAssistantMessage,
       failAssistantMessage,
       flushQueuedDeltas,
+      hydrateFromStoredSession,
+      interruptAssistantMessage,
       queryClient,
       refreshHermesConfig,
+      refreshSessions,
+      selectedStoredSessionIdRef,
       sessionInterrupted,
+      sessionStateByRuntimeIdRef,
       updateSessionState,
       upsertToolCall
     ]

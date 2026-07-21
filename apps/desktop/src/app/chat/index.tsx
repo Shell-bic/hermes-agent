@@ -119,6 +119,15 @@ function ChatHeader({
 
   const title = activeStoredSession ? sessionTitle(activeStoredSession) : 'New session'
 
+  const channelIdentityLabel = activeStoredSession?.source === 'wecom'
+    ? activeStoredSession.channel_identity_status === 'mapped'
+      ? `已识别：${activeStoredSession.channel_identity_label || '企业用户'}`
+      : activeStoredSession.channel_identity_status === 'ambiguous'
+        ? '身份映射有冲突'
+        : '未知企业微信用户'
+    : null
+
+
   // Pins live on the durable lineage-root id, but selectedSessionId is the live
   // (tip) id — resolve through the loaded row so the menu reflects the pin
   // state after auto-compression rotates the id.
@@ -159,6 +168,7 @@ function ChatHeader({
             variant="ghost"
           >
             <h2 className="min-w-0 flex-1 truncate text-[0.75rem] font-medium leading-none">{title}</h2>
+            {channelIdentityLabel && <span className="shrink-0 text-[0.625rem] text-(--ui-text-tertiary)">{channelIdentityLabel}</span>}
             <Codicon className="shrink-0 text-(--ui-text-tertiary)" name="chevron-down" size="0.8125rem" />
           </Button>
         </SessionActionsMenu>

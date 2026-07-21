@@ -4,7 +4,12 @@ const path = require('node:path')
 const { normalizeEnterpriseGatewayBaseUrl } = require('./enterprise-gateway-client.cjs')
 
 const ENTERPRISE_DESKTOP_CONFIG_SCHEMA_VERSION = 1
-const ENTERPRISE_DESKTOP_CONFIG_KEYS = new Set(['enabled', 'gatewayUrl', 'schemaVersion'])
+const ENTERPRISE_DESKTOP_CONFIG_KEYS = new Set([
+  'enabled',
+  'gatewayUrl',
+  'schemaVersion',
+  'weComGatewayRunnerExperiment'
+])
 
 function normalizeEnterpriseDesktopGatewayUrl(rawUrl, configPath = 'enterprise desktop config') {
   const value = String(rawUrl || '').trim()
@@ -70,7 +75,8 @@ function readEnterpriseDesktopConfig(configPath, { readFileSync = fs.readFileSyn
   if (unknownKeys.length > 0) {
     throw new Error(
       `Enterprise desktop config ${configPath} contains unsupported fields: ${unknownKeys.join(', ')}. ` +
-        'Only schemaVersion, enabled, and gatewayUrl are allowed; enterprise credentials belong on the auth service.'
+        'Only schemaVersion, enabled, gatewayUrl, and the internal experiment gate are allowed; ' +
+        'enterprise credentials belong on the auth service.'
     )
   }
 
@@ -88,6 +94,11 @@ function readEnterpriseDesktopConfig(configPath, { readFileSync = fs.readFileSyn
   if (parsed.gatewayUrl !== undefined && typeof parsed.gatewayUrl !== 'string') {
     throw new Error(`Enterprise desktop config ${configPath} field gatewayUrl must be a string.`)
   }
+  if (parsed.weComGatewayRunnerExperiment !== undefined && typeof parsed.weComGatewayRunnerExperiment !== 'boolean') {
+    throw new Error(
+      `Enterprise desktop config ${configPath} field weComGatewayRunnerExperiment must be a boolean.`
+    )
+  }
 
   const rawGatewayUrl = String(parsed.gatewayUrl || '').trim()
   const gatewayUrl = rawGatewayUrl ? normalizeEnterpriseDesktopGatewayUrl(rawGatewayUrl, configPath) : ''
@@ -96,7 +107,11 @@ function readEnterpriseDesktopConfig(configPath, { readFileSync = fs.readFileSyn
     throw new Error(`Enterprise desktop config ${configPath} enables enterprise mode but does not provide gatewayUrl.`)
   }
 
-  return { enabled, gatewayUrl }
+  return {
+    enabled,
+    gatewayUrl,
+    ...(parsed.weComGatewayRunnerExperiment === true ? { weComGatewayRunnerExperiment: true } : {})
+  }
 }
 
 function loadEnterpriseDesktopConfig(configPaths, options) {

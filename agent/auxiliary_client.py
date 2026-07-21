@@ -2222,6 +2222,36 @@ def _normalize_main_runtime(main_runtime: Optional[Dict[str, Any]]) -> Dict[str,
     return normalized
 
 
+def _enterprise_auxiliary_runtime(model: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """Resolve the sole auxiliary runtime allowed by a managed home.
+
+    Partial enterprise bootstrap artifacts count as managed intent.  The
+    shared resolver then fails closed if the marker, policy, company provider,
+    endpoint, or token is missing.
+    """
+    from hermes_cli.runtime_provider import (
+        enterprise_runtime_required,
+        resolve_runtime_provider,
+    )
+
+    if not enterprise_runtime_required():
+        return None
+    from hermes_cli.enterprise_policy import (
+        ENTERPRISE_PROVIDER,
+        current_model,
+        load_enterprise_policy,
+    )
+
+    target_model = str(model or "").strip() or current_model(load_enterprise_policy())
+    runtime = resolve_runtime_provider(
+        requested=ENTERPRISE_PROVIDER,
+        target_model=target_model or None,
+    )
+    runtime = dict(runtime)
+    runtime["model"] = target_model
+    return runtime
+
+
 def _get_provider_chain() -> List[tuple]:
     """Return the ordered provider detection chain.
 
@@ -3575,6 +3605,49 @@ def resolve_provider_client(
             client_obj, final_model_str, api_key_str, base_url_str, api_mode,
         )
 
+    managed_runtime = _enterprise_auxiliary_runtime(model)
+    if managed_runtime is not None:
+        from hermes_cli.enterprise_policy import ENTERPRISE_PROVIDER
+
+        requested_provider = provider
+        if requested_provider not in {
+            "auto",
+            ENTERPRISE_PROVIDER,
+            f"custom:{ENTERPRISE_PROVIDER}",
+        }:
+            raise RuntimeError(
+                "Enterprise managed policy denied auxiliary provider resolution: "
+                f"provider '{requested_provider}' is not the enterprise gateway provider"
+            )
+        managed_base_url = str(managed_runtime.get("base_url") or "").rstrip("/")
+        managed_api_key = str(managed_runtime.get("api_key") or "")
+        if explicit_base_url and explicit_base_url.rstrip("/") != managed_base_url:
+            raise RuntimeError(
+                "Enterprise managed policy denied auxiliary endpoint override"
+            )
+        if explicit_api_key and explicit_api_key != managed_api_key:
+            raise RuntimeError(
+                "Enterprise managed policy denied auxiliary API key override"
+            )
+        managed_api_mode = str(managed_runtime.get("api_mode") or "")
+        if api_mode and managed_api_mode and api_mode != managed_api_mode:
+            raise RuntimeError(
+                "Enterprise managed policy denied auxiliary API mode override"
+            )
+        final_model = str(managed_runtime.get("model") or model or "")
+        client = OpenAI(api_key=managed_api_key, base_url=managed_base_url)
+        client = _wrap_if_needed(
+            client,
+            final_model,
+            managed_base_url,
+            managed_api_key,
+        )
+        return (
+            _to_async_client(client, final_model, is_vision=is_vision)
+            if async_mode
+            else (client, final_model)
+        )
+
     # ── Auto: try all providers in priority order ────────────────────
     if provider == "auto":
         client, resolved = _resolve_auto(main_runtime=main_runtime, task=task)
@@ -4478,7 +4551,15 @@ def _client_cache_key(
     # so the task participates in the cache key. Non-auto providers keep the
     # old cache shape because the explicit provider/model tuple is sufficient.
     task_key = (task or "") if provider == "auto" else ""
-    pool_hint = _pool_cache_hint(provider, main_runtime=main_runtime)
+    from hermes_cli.enterprise_policy import ENTERPRISE_PROVIDER
+    from hermes_cli.runtime_provider import enterprise_runtime_required
+
+    pool_hint = ()
+    if not (
+        provider == ENTERPRISE_PROVIDER
+        and enterprise_runtime_required()
+    ):
+        pool_hint = _pool_cache_hint(provider, main_runtime=main_runtime)
     return (provider, async_mode, base_url or "", api_key or "", api_mode or "", runtime_key, is_vision, task_key, pool_hint)
 
 
@@ -4688,6 +4769,15 @@ def _get_cached_client(
     preventing the fd-exhaustion that previously occurred in long-running
     gateways where recycled worker threads created unbounded entries (#10200).
     """
+    managed_runtime = _enterprise_auxiliary_runtime(model)
+    if managed_runtime is not None:
+        provider = str(managed_runtime.get("provider") or "")
+        model = str(managed_runtime.get("model") or model or "")
+        base_url = str(managed_runtime.get("base_url") or "")
+        api_key = str(managed_runtime.get("api_key") or "")
+        api_mode = str(managed_runtime.get("api_mode") or "")
+        main_runtime = None
+
     # Resolve the current event loop for async clients so we can validate
     # cached entries.  Loop identity is NOT in the cache key — instead we
     # check at hit time whether the cached loop is still current and open.
@@ -4740,7 +4830,7 @@ def _get_cached_client(
     # after key #1 is marked exhausted the retry would still get key #1 from
     # the env var and fail again, causing the retry2_err handler to mark key #2.
     effective_api_key = api_key
-    if not effective_api_key:
+    if managed_runtime is None and not effective_api_key:
         _pe = _peek_pool_entry(_normalize_aux_provider(provider))
         if _pe is not None:
             _pk = _pool_runtime_api_key(_pe)
@@ -4811,6 +4901,35 @@ def _resolve_task_provider_model(
     to "custom" and the task uses that direct endpoint. api_mode is one of
     "chat_completions", "codex_responses", or None (auto-detect).
     """
+    managed_runtime = _enterprise_auxiliary_runtime(model)
+    if managed_runtime is not None:
+        from hermes_cli.enterprise_policy import ENTERPRISE_PROVIDER
+
+        requested_provider = str(provider or "").strip().lower()
+        if requested_provider and requested_provider not in {
+            "auto",
+            ENTERPRISE_PROVIDER,
+            f"custom:{ENTERPRISE_PROVIDER}",
+        }:
+            raise RuntimeError(
+                "Enterprise managed policy denied auxiliary provider override"
+            )
+        if base_url:
+            raise RuntimeError(
+                "Enterprise managed policy denied auxiliary endpoint override"
+            )
+        if api_key:
+            raise RuntimeError(
+                "Enterprise managed policy denied auxiliary API key override"
+            )
+        return (
+            ENTERPRISE_PROVIDER,
+            str(managed_runtime.get("model") or "") or None,
+            str(managed_runtime.get("base_url") or "") or None,
+            str(managed_runtime.get("api_key") or "") or None,
+            str(managed_runtime.get("api_mode") or "") or None,
+        )
+
     cfg_provider = None
     cfg_model = None
     cfg_base_url = None
@@ -5209,7 +5328,7 @@ def call_llm(
     effective_extra_body = _get_task_extra_body(task)
     effective_extra_body.update(extra_body or {})
 
-    if task == "vision":
+    if task == "vision" and _enterprise_auxiliary_runtime(resolved_model) is None:
         effective_provider, client, final_model = resolve_vision_provider_client(
             provider=resolved_provider if resolved_provider != "auto" else provider,
             model=resolved_model or model,
@@ -5718,7 +5837,7 @@ async def async_call_llm(
     effective_extra_body = _get_task_extra_body(task)
     effective_extra_body.update(extra_body or {})
 
-    if task == "vision":
+    if task == "vision" and _enterprise_auxiliary_runtime(resolved_model) is None:
         effective_provider, client, final_model = resolve_vision_provider_client(
             provider=resolved_provider if resolved_provider != "auto" else provider,
             model=resolved_model or model,
@@ -5750,6 +5869,7 @@ async def async_call_llm(
             base_url=resolved_base_url,
             api_key=resolved_api_key,
             api_mode=resolved_api_mode,
+            main_runtime=main_runtime,
         )
         if client is None:
             _explicit = (resolved_provider or "").strip().lower()

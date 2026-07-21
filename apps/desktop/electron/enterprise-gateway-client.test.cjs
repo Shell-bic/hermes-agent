@@ -4,6 +4,8 @@ const assert = require('node:assert/strict')
 const {
   DESKTOP_BOOTSTRAP_CONTRACT_HEADER,
   DESKTOP_BOOTSTRAP_CONTRACT_VERSION,
+  DESKTOP_CAPABILITIES_HEADER,
+  DESKTOP_CLIENT_CAPABILITIES,
   EnterpriseGatewayError,
   createEnterpriseGatewayClient,
   normalizeEnterpriseGatewayBaseUrl,
@@ -158,6 +160,94 @@ test('only bootstrap sends the Desktop bootstrap contract header', async () => {
   assert.equal(calls[0].options.headers[DESKTOP_BOOTSTRAP_CONTRACT_HEADER], String(DESKTOP_BOOTSTRAP_CONTRACT_VERSION))
   assert.equal(Object.hasOwn(calls[1].options.headers, DESKTOP_BOOTSTRAP_CONTRACT_HEADER), false)
   assert.equal(Object.hasOwn(calls[2].options.headers, DESKTOP_BOOTSTRAP_CONTRACT_HEADER), false)
+})
+
+test('personal Bot client uses explicit owner verification issuance and runtime routes', async () => {
+  const calls = []
+  const client = createEnterpriseGatewayClient({
+    baseUrl: 'https://gateway.example.com',
+    fetchImpl: async (url, options) => {
+      calls.push([url, options])
+      return jsonResponse({ ok: true })
+    }
+  })
+
+  await client.createWeComPersonalBotTransaction('desktop-token', {
+    clientCapabilities: ['messaging-channel-policy.v1'],
+    contractVersion: 'wecom-bot-transaction.v1'
+  })
+  await client.issueWeComPersonalBotOwnerVerification('desktop-token', 'binding/value')
+  await client.weComPersonalBotRuntimeConfig('desktop-token', 'binding/value')
+  await client.acquireWeComPersonalBotRuntimeLease('runtime-token')
+  await client.leaseWeComPersonalBotInbox('runtime-token', { maxMessages: 1 })
+
+  assert.equal(calls[0][0], 'https://gateway.example.com/v1/wecom-personal-bot/transactions')
+  assert.equal(calls[0][1].method, 'POST')
+  assert.equal(calls[1][0], 'https://gateway.example.com/v1/wecom-personal-bot/bindings/binding%2Fvalue/owner-verification')
+  assert.equal(calls[1][1].method, 'POST')
+  assert.equal(calls[1][1].body, undefined)
+  assert.equal(
+    calls[2][0],
+    'https://gateway.example.com/v1/wecom-personal-bot/bindings/binding%2Fvalue/runtime-config'
+  )
+  assert.equal(calls[2][1].headers.Authorization, 'Bearer desktop-token')
+  assert.equal(calls[2][1].cache, 'no-store')
+  assert.equal(calls[3][0], 'https://gateway.example.com/v1/wecom-personal-bot/runtime/lease')
+  assert.equal(calls[3][1].headers.Authorization, 'Bearer runtime-token')
+  assert.deepEqual(JSON.parse(calls[4][1].body), { maxMessages: 1 })
+})
+
+test('personal Bot identity client owns binding and link identifiers in main process', async () => {
+  const calls = []
+  const client = createEnterpriseGatewayClient({
+    baseUrl: 'https://gateway.example.com',
+    fetchImpl: async (url, options) => {
+      calls.push([url, options])
+      return jsonResponse({ ok: true })
+    }
+  })
+
+  await client.weComPersonalBotIdentityClaim('desktop-token', 'binding/value')
+  await client.issueWeComPersonalBotIdentityClaim('desktop-token', 'binding/value')
+  await client.weComPersonalBotChannelIdentities('desktop-token')
+  await client.unlinkWeComPersonalBotChannelIdentity('desktop-token', 'link/value')
+
+  assert.equal(calls[0][0].endsWith('/bindings/binding%2Fvalue/identity-claim'), true)
+  assert.equal(calls[1][0].endsWith('/bindings/binding%2Fvalue/identity-claims'), true)
+  assert.equal(calls[1][1].method, 'POST')
+  assert.deepEqual(JSON.parse(calls[1][1].body), {})
+  assert.equal(calls[2][0].endsWith('/channel-identities'), true)
+  assert.equal(calls[3][0].endsWith('/channel-identities/link%2Fvalue'), true)
+  assert.equal(calls[3][1].method, 'DELETE')
+})
+
+test('bootstrap and runtime manifest send the trusted main-process capability handshake', async () => {
+  const calls = []
+  const client = createEnterpriseGatewayClient({
+    baseUrl: 'https://gateway.example.com',
+    fetchImpl: async (url, options) => {
+      calls.push({ options, url })
+      if (String(url).endsWith('/api/desktop/auth/me')) {
+        return jsonResponse({
+          id: '00000000-0000-0000-0000-000000000001',
+          userName: 'fixture-user',
+          displayName: 'Fixture User'
+        })
+      }
+      return jsonResponse({ ok: true })
+    }
+  })
+
+  await client.bootstrap('dsk_fixture')
+  await client.runtimeManifest('dsk_fixture', { preferredModel: null })
+  await client.me('dsk_fixture')
+
+  assert.equal(DESKTOP_CAPABILITIES_HEADER, 'X-Hermes-Desktop-Capabilities')
+  assert.deepEqual(DESKTOP_CLIENT_CAPABILITIES, ['messaging-channel-policy.v1'])
+  assert.equal(calls[0].options.headers[DESKTOP_CAPABILITIES_HEADER], 'messaging-channel-policy.v1')
+  assert.equal(calls[1].options.headers[DESKTOP_CAPABILITIES_HEADER], 'messaging-channel-policy.v1')
+  assert.equal(calls[2].options.headers[DESKTOP_CAPABILITIES_HEADER], undefined)
+  assert.equal(calls[0].options.headers.Authorization, 'Bearer dsk_fixture')
 })
 
 test('Gateway request timeout aborts and returns a stable non-enumerating code', async () => {

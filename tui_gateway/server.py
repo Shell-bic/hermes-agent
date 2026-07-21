@@ -3,11 +3,13 @@ import concurrent.futures
 import contextlib
 import contextvars
 import copy
+import hmac
 import inspect
 import json
 import logging
 import os
 import queue
+import re
 import subprocess
 import sys
 import threading
@@ -1228,10 +1230,12 @@ def _ensure_session_db_row(session: dict) -> None:
     try:
         db.create_session(
             key,
-            source="tui",
+            source=str(session.get("source") or "tui"),
             model=row_model,
             model_config=model_config or None,
             cwd=_session_cwd(session) if session.get("explicit_cwd") else None,
+            source_instance_id=(session.get("source_context") or {}).get("binding_id"),
+            conversation_id=(session.get("source_context") or {}).get("conversation_id"),
         )
     except Exception:
         logger.debug("failed to persist desktop session row", exc_info=True)
@@ -4144,10 +4148,58 @@ def _inflight_snapshot(session: dict) -> dict | None:
 # ── Methods: session ─────────────────────────────────────────────────
 
 
+def _managed_wecom_source_context(params: dict) -> dict | None:
+    """Authorize and validate main-process-only managed WeCom routing."""
+    source_context = params.get("source_context")
+    if not isinstance(source_context, dict) or source_context.get("source") != "wecom":
+        return None
+    expected = str(os.environ.get("COMPANY_GATEWAY_TOKEN") or "").strip()
+    provided = str(params.get("source_authorization") or "").strip()
+    if not expected or not provided or not hmac.compare_digest(provided, expected):
+        raise ValueError("managed source authorization required")
+    binding_id = str(source_context.get("binding_id") or "").strip()
+    conversation_id = str(source_context.get("conversation_id") or "").strip()
+    if (
+        not re.fullmatch(
+            r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
+            binding_id,
+        )
+        or not (0 < len(conversation_id) <= 256)
+        or any(ord(char) < 0x20 for char in conversation_id)
+    ):
+        raise ValueError("invalid managed WeCom source context")
+    return {
+        "binding_id": binding_id,
+        "conversation_id": conversation_id,
+        "source": "wecom",
+    }
+
+
 @method("session.create")
 def _(rid, params: dict) -> dict:
     sid = uuid.uuid4().hex[:8]
     key = _new_session_key()
+    session_source = "tui"
+    managed_source_context = _managed_wecom_source_context(params)
+    if managed_source_context:
+        # This narrow shape is consumed by the trusted Desktop main-process
+        # relay. Bot/chat ids are never accepted; the server-issued binding and
+        # conversation ids define the complete source scope.
+        binding_id = managed_source_context["binding_id"]
+        conversation_id = managed_source_context["conversation_id"]
+        from gateway.config import Platform
+        from gateway.session import SessionSource, build_session_key
+
+        key = build_session_key(
+            SessionSource(
+                platform=Platform.WECOM,
+                chat_id=conversation_id,
+                binding_id=binding_id,
+                source_instance_id=binding_id,
+                conversation_id=conversation_id,
+            )
+        )
+        session_source = "wecom"
     cols = int(params.get("cols", 80))
     history = _coerce_seed_history(params.get("messages"))
     title = str(params.get("title") or "").strip()
@@ -4233,6 +4285,8 @@ def _(rid, params: dict) -> dict:
             "profile_home": str(profile_home) if profile_home is not None else None,
             "running": False,
             "session_key": key,
+            "source": session_source,
+            "source_context": managed_source_context,
             "show_reasoning": _load_show_reasoning(),
             "slash_worker": None,
             "tool_progress_mode": _load_tool_progress_mode(),
@@ -4240,12 +4294,15 @@ def _(rid, params: dict) -> dict:
             "transport": current_transport() or _stdio_transport,
         }
         _register_session_cwd(_sessions[sid])
-    # NOTE: we intentionally do NOT persist a DB row here. Every TUI/desktop
-    # launch (and every "New agent" / draft) opens a session here just to paint
-    # the composer, so eagerly creating a row left an "Untitled" empty session
-    # behind for every launch the user never typed into. The row is now created
-    # lazily on the first prompt (see _ensure_session_db_row + prompt.submit),
-    # and the AIAgent's own INSERT-OR-IGNORE persists it on the first turn too.
+        # Managed WeCom sessions are real inbound conversations, not abandoned
+        # composer drafts. Persist their routing before the deferred agent build
+        # can lazily create the same row with the generic desktop source.
+        if managed_source_context:
+            _ensure_session_db_row(_sessions[sid])
+    # NOTE: ordinary TUI/desktop drafts intentionally do not persist a DB row
+    # here. Managed WeCom sessions are the narrow exception above because an
+    # inbound message already constitutes real activity. Other rows are created
+    # lazily on the first prompt (see _ensure_session_db_row + prompt.submit).
 
     # Return the lightweight session immediately so Ink can paint the composer
     # + skeleton panel, then build the real AIAgent just after this response is
@@ -4336,6 +4393,11 @@ def _(rid, params: dict) -> dict:
                         "started_at": s.get("started_at") or 0,
                         "message_count": s.get("message_count") or 0,
                         "source": s.get("source") or "",
+                        "source_instance_id": s.get("source_instance_id"),
+                        "conversation_id": s.get("conversation_id"),
+                        "channel_identity_status": s.get("channel_identity_status"),
+                        "channel_identity_label": s.get("channel_identity_label"),
+                        "channel_identity_match_scope": s.get("channel_identity_match_scope"),
                     }
                     for s in rows
                 ]
@@ -4395,6 +4457,10 @@ def _(rid, params: dict) -> dict:
     if not target:
         return _err(rid, 4006, "session_id required")
     try:
+        managed_source_context = _managed_wecom_source_context(params)
+    except ValueError as exc:
+        return _err(rid, 4031, str(exc))
+    try:
         cols = int(params.get("cols", 80))
     except (TypeError, ValueError):
         cols = 80
@@ -4434,11 +4500,35 @@ def _(rid, params: dict) -> dict:
             found = {}
         else:
             return _err(rid, 4007, "session not found")
+    if managed_source_context:
+        existing_binding = str(found.get("source_instance_id") or "").strip()
+        existing_conversation = str(found.get("conversation_id") or "").strip()
+        if (
+            existing_binding
+            and existing_binding != managed_source_context["binding_id"]
+        ) or (
+            existing_conversation
+            and existing_conversation != managed_source_context["conversation_id"]
+        ):
+            return _err(rid, 4032, "managed WeCom session routing mismatch")
+        try:
+            db.bind_session_source_context(
+                target,
+                source="wecom",
+                source_instance_id=managed_source_context["binding_id"],
+                conversation_id=managed_source_context["conversation_id"],
+            )
+            found = db.get_session(target) or found
+        except Exception as exc:
+            return _err(rid, 5000, f"resume source binding failed: {exc}")
     profile_resume_cwd = str(found.get("cwd") or "").strip() or _profile_configured_cwd(
         profile_home
     )
 
     def _reuse_live_payload(sid: str, session: dict) -> dict:
+        if managed_source_context:
+            session["source"] = "wecom"
+            session["source_context"] = managed_source_context
         payload = _live_session_payload(
             sid,
             session,
@@ -4525,6 +4615,18 @@ def _(rid, params: dict) -> dict:
                     "resume_session_id": target,
                     "running": False,
                     "session_key": target,
+                    "source": str(found.get("source") or "tui"),
+                    "source_context": (
+                        {
+                            "binding_id": found.get("source_instance_id"),
+                            "conversation_id": found.get("conversation_id"),
+                            "source": "wecom",
+                        }
+                        if found.get("source") == "wecom"
+                        and found.get("source_instance_id")
+                        and found.get("conversation_id")
+                        else None
+                    ),
                     "show_reasoning": _load_show_reasoning(),
                     "slash_worker": None,
                     "tool_progress_mode": _load_tool_progress_mode(),
@@ -4652,6 +4754,17 @@ def _(rid, params: dict) -> dict:
                         "model_override"
                     ]
                 _sessions[sid]["display_history_prefix"] = display_history_prefix
+                _sessions[sid]["source"] = str(found.get("source") or "tui")
+                if (
+                    found.get("source") == "wecom"
+                    and found.get("source_instance_id")
+                    and found.get("conversation_id")
+                ):
+                    _sessions[sid]["source_context"] = {
+                        "binding_id": found.get("source_instance_id"),
+                        "conversation_id": found.get("conversation_id"),
+                        "source": "wecom",
+                    }
                 # Remember the profile home so each turn re-binds HERMES_HOME (the
                 # agent persists to its own db, but mid-turn home reads — memory,
                 # skills — must resolve to the resumed profile too).
@@ -5831,6 +5944,68 @@ def _(rid, params: dict) -> dict:
 # ── Methods: prompt ──────────────────────────────────────────────────
 
 
+def _deliver_wecom_manual_final(session: dict, text: str) -> bool:
+    """Deliver one persisted Desktop final through the original GatewayRunner."""
+    final = str(text or "").strip()
+    if (
+        session.get("source") != "wecom"
+        or not final
+        or final.lower().startswith("error:")
+    ):
+        return False
+    session_id = str(session.get("session_key") or "").strip()
+    history_version = int(session.get("history_version", 0) or 0)
+    if not session_id or history_version <= 0:
+        return False
+    from gateway.run import deliver_desktop_wecom_reply_from_worker
+
+    return deliver_desktop_wecom_reply_from_worker(
+        session_id,
+        final,
+        f"desktop-final:{session_id}:{history_version}",
+    )
+
+
+def _queue_wecom_manual_final(session: dict, text: str) -> None:
+    """Preserve the legacy relay outbox for the default-off experiment path."""
+    context = session.get("source_context") or {}
+    conversation_id = str(context.get("conversation_id") or "").strip()
+    binding_id = str(context.get("binding_id") or "").strip()
+    final = str(text or "").strip()
+    if (
+        session.get("source") != "wecom"
+        or not conversation_id
+        or not binding_id
+        or not final
+        or final.lower().startswith("error:")
+    ):
+        return
+    queue_id = uuid.uuid4().hex
+    queue_dir = get_hermes_home() / "wecom-composer-outbox"
+    queue_dir.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "bindingId": binding_id,
+        "conversationId": conversation_id,
+        "idempotencyKey": f"wecom_desktop_{queue_id}",
+        "text": final,
+    }
+    target = queue_dir / f"{queue_id}.json"
+    temporary = queue_dir / f".{queue_id}.tmp"
+    with open(temporary, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, ensure_ascii=False)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temporary, target)
+
+
+def _consume_wecom_manual_outbox_pending(
+    session: dict, *, status: str, history_persisted: bool
+) -> bool:
+    """Consume the one-turn flag and require a successfully persisted final."""
+    pending = bool(session.pop("wecom_manual_outbox_pending", False))
+    return pending and status == "complete" and history_persisted
+
+
 @method("prompt.submit")
 def _(rid, params: dict) -> dict:
     sid, text = params.get("session_id", ""), params.get("text", "")
@@ -5872,6 +6047,15 @@ def _(rid, params: dict) -> dict:
                     print(f"[tui_gateway] prompt.submit: replace_messages failed: {exc}", file=sys.stderr)
         session["running"] = True
         session["last_active"] = time.time()
+        # Only manual, plain Desktop prompts in a persisted WeCom-source
+        # session are mirrored. The user prompt is intentionally never sent;
+        # only the final assistant response crosses back through the original
+        # WeCom adapter after history persistence succeeds.
+        session["wecom_manual_outbox_pending"] = bool(
+            session.get("source") == "wecom"
+            and not str(text or "").lstrip().startswith("/")
+            and not session.get("attached_images")
+        )
         _start_inflight_turn(session, text)
 
     # Persist the DB row lazily, now that the user has actually sent a message.
@@ -6244,6 +6428,7 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                 pass
             result = agent.run_conversation(run_message, **run_kwargs)
 
+            history_persisted = False
             last_reasoning = None
             status_note = None
             if isinstance(result, dict):
@@ -6253,6 +6438,7 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                         if current_version == history_version:
                             session["history"] = result["messages"]
                             session["history_version"] = history_version + 1
+                            history_persisted = True
                         else:
                             # History mutated externally during the turn
                             # (undo/compress/retry/rollback now guard on
@@ -6319,6 +6505,18 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
             with session["history_lock"]:
                 _clear_inflight_turn(session)
             _emit("message.complete", sid, payload)
+
+            if _consume_wecom_manual_outbox_pending(
+                session, status=status, history_persisted=history_persisted
+            ):
+                try:
+                    if os.getenv("HERMES_DESKTOP_WECOM_GATEWAY_RUNNER") == "1":
+                        if not _deliver_wecom_manual_final(session, raw):
+                            logger.warning("managed WeCom Desktop final was not delivered")
+                    else:
+                        _queue_wecom_manual_final(session, raw)
+                except Exception:
+                    logger.exception("failed to deliver managed WeCom Desktop final")
 
             # ── /goal continuation (Ralph-style loop) ─────────────────
             # After every TUI turn, if a /goal is active, ask the judge

@@ -46,7 +46,12 @@ function actualPreloadBridge(
           invoke,
           on: () => undefined,
           removeListener: () => undefined,
-          send: () => undefined
+          send: () => undefined,
+          sendSync: (channel: string, value?: unknown) => {
+            if (channel === 'hermes:managed-output-redaction:enabled') return false
+            if (channel === 'hermes:managed-output-redaction:redact') return value
+            return undefined
+          }
         },
         webUtils: { getPathForFile: () => '' }
       }

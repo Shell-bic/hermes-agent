@@ -73,7 +73,7 @@ test('QR IPC is main-window-only and app/window shutdown uses guarded controller
   assert.match(main, /app\.on\('before-quit', event =>[\s\S]*event\.preventDefault\(\)/)
   assert.match(main, /enterpriseQuitCleanupPromise[\s\S]*dispose\(\{ permanent: true \}\)[\s\S]*enterpriseQuitReady = true[\s\S]*app\.quit\(\)/)
   const logoutStart = main.indexOf("ipcMain.handle('hermes:enterprise:logout'")
-  const logoutEnd = main.indexOf("ipcMain.handle('hermes:connection'", logoutStart)
+  const logoutEnd = main.indexOf('registerEnterpriseSkillHubIpc(', logoutStart)
   assert.match(main.slice(logoutStart, logoutEnd), /enterpriseWeComController\.cancel\(\{ force: true/)
   assert.doesNotMatch(main.slice(logoutStart, logoutEnd), /enterpriseWeComController\.dispose/)
 })

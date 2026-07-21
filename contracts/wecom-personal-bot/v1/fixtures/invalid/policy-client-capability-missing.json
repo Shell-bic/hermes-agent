@@ -1,0 +1,9 @@
+{
+  "contractVersion": "messaging-channel-policy.v1",
+  "hideUnlisted": true,
+  "visibleChannelIds": ["wecom-personal"],
+  "userManageableChannelIds": ["wecom-personal"],
+  "allowedChannelIds": ["wecom-personal"],
+  "policyHash": "1b8ff419ecd7859f38f41f11c7bb8f644ab4056ff372ad6461a382b2f1a416ee",
+  "requiredClientCapabilities": ["messaging-channel-policy.v2"]
+}

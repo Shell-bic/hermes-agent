@@ -92,6 +92,15 @@ class SessionSource:
     parent_chat_id: Optional[str] = None  # Parent channel when chat_id refers to a thread
     message_id: Optional[str] = None  # ID of the triggering message (for pin/reply/react)
     role_authorized: bool = False  # True when adapter granted access via role (not user ID)
+    # Managed channel instance/conversation scope. A platform-level chat id is
+    # not globally unique when one Desktop can bind more than one remote Bot.
+    binding_id: Optional[str] = None
+    source_instance_id: Optional[str] = None
+    conversation_id: Optional[str] = None
+    channel_identity_status: Optional[str] = None
+    channel_identity_label: Optional[str] = None
+    channel_identity_match_scope: Optional[str] = None
+    force_group_sessions_per_user: bool = False
     
     @property
     def description(self) -> str:
@@ -135,6 +144,20 @@ class SessionSource:
             d["parent_chat_id"] = self.parent_chat_id
         if self.message_id:
             d["message_id"] = self.message_id
+        if self.binding_id:
+            d["binding_id"] = self.binding_id
+        if self.source_instance_id:
+            d["source_instance_id"] = self.source_instance_id
+        if self.conversation_id:
+            d["conversation_id"] = self.conversation_id
+        if self.channel_identity_status:
+            d["channel_identity_status"] = self.channel_identity_status
+        if self.channel_identity_label:
+            d["channel_identity_label"] = self.channel_identity_label
+        if self.channel_identity_match_scope:
+            d["channel_identity_match_scope"] = self.channel_identity_match_scope
+        if self.force_group_sessions_per_user:
+            d["force_group_sessions_per_user"] = True
         return d
 
     @classmethod
@@ -153,6 +176,13 @@ class SessionSource:
             guild_id=data.get("guild_id"),
             parent_chat_id=data.get("parent_chat_id"),
             message_id=data.get("message_id"),
+            binding_id=data.get("binding_id"),
+            source_instance_id=data.get("source_instance_id"),
+            conversation_id=data.get("conversation_id"),
+            channel_identity_status=data.get("channel_identity_status"),
+            channel_identity_label=data.get("channel_identity_label"),
+            channel_identity_match_scope=data.get("channel_identity_match_scope"),
+            force_group_sessions_per_user=bool(data.get("force_group_sessions_per_user", False)),
         )
     
 
@@ -643,7 +673,22 @@ def build_session_key(
         shared session per chat.
       - Without identifiers, messages fall back to one session per platform/chat_type.
     """
+    from urllib.parse import quote
+
     platform = source.platform.value
+    if source.force_group_sessions_per_user:
+        group_sessions_per_user = True
+        thread_sessions_per_user = True
+    # Preserve the legacy key exactly for every existing adapter. Managed
+    # relay sources opt in with both an instance and conversation identifier.
+    # Percent encoding prevents opaque remote ids from injecting separators.
+    instance_id = source.source_instance_id or source.binding_id
+    managed_scope = ""
+    if instance_id and source.conversation_id:
+        managed_scope = ":instance:{}:conversation:{}".format(
+            quote(str(instance_id), safe="._-"),
+            quote(str(source.conversation_id), safe="._-"),
+        )
     if source.chat_type == "dm":
         dm_chat_id = source.chat_id
         if source.platform == Platform.WHATSAPP:
@@ -651,8 +696,8 @@ def build_session_key(
 
         if dm_chat_id:
             if source.thread_id:
-                return f"agent:main:{platform}:dm:{dm_chat_id}:{source.thread_id}"
-            return f"agent:main:{platform}:dm:{dm_chat_id}"
+                return f"agent:main:{platform}{managed_scope}:dm:{dm_chat_id}:{source.thread_id}"
+            return f"agent:main:{platform}{managed_scope}:dm:{dm_chat_id}"
         # No chat_id — fall back to the sender's own identifier before the
         # bare per-platform sink.  Without this, every DM from every user that
         # arrives without a chat_id (non-standard adapters / synthetic sources)
@@ -667,11 +712,11 @@ def build_session_key(
             )
         if dm_participant_id:
             if source.thread_id:
-                return f"agent:main:{platform}:dm:{dm_participant_id}:{source.thread_id}"
-            return f"agent:main:{platform}:dm:{dm_participant_id}"
+                return f"agent:main:{platform}{managed_scope}:dm:{dm_participant_id}:{source.thread_id}"
+            return f"agent:main:{platform}{managed_scope}:dm:{dm_participant_id}"
         if source.thread_id:
-            return f"agent:main:{platform}:dm:{source.thread_id}"
-        return f"agent:main:{platform}:dm"
+            return f"agent:main:{platform}{managed_scope}:dm:{source.thread_id}"
+        return f"agent:main:{platform}{managed_scope}:dm"
 
     participant_id = source.user_id_alt or source.user_id
     if participant_id and source.platform == Platform.WHATSAPP:
@@ -679,7 +724,10 @@ def build_session_key(
         # single group member gets two isolated per-user sessions when the
         # bridge reshuffles alias forms.
         participant_id = canonical_whatsapp_identifier(str(participant_id)) or participant_id
-    key_parts = ["agent:main", platform, source.chat_type]
+    key_parts = ["agent:main", platform]
+    if managed_scope:
+        key_parts.extend(managed_scope.lstrip(":").split(":"))
+    key_parts.append(source.chat_type)
 
     if source.chat_id:
         key_parts.append(source.chat_id)
@@ -991,6 +1039,11 @@ class SessionStore:
                 "session_id": session_id,
                 "source": source.platform.value,
                 "user_id": source.user_id,
+                "source_instance_id": source.source_instance_id or source.binding_id,
+                "conversation_id": source.conversation_id,
+                "channel_identity_status": source.channel_identity_status,
+                "channel_identity_label": source.channel_identity_label,
+                "channel_identity_match_scope": source.channel_identity_match_scope,
             }
 
         # SQLite operations outside the lock
@@ -1007,6 +1060,19 @@ class SessionStore:
                 print(f"[gateway] Warning: Failed to create SQLite session: {e}")
 
         return entry
+
+    def update_channel_source_metadata(self, session_id: str, source: SessionSource) -> None:
+        """Refresh read-time channel labels without changing session ownership."""
+        if not self._db or not session_id:
+            return
+        self._db.update_channel_source_metadata(
+            session_id,
+            source_instance_id=source.source_instance_id or source.binding_id,
+            conversation_id=source.conversation_id,
+            channel_identity_status=source.channel_identity_status,
+            channel_identity_label=source.channel_identity_label,
+            channel_identity_match_scope=source.channel_identity_match_scope,
+        )
 
     def update_session(
         self,
@@ -1217,6 +1283,14 @@ class SessionStore:
                 "session_id": session_id,
                 "source": old_entry.platform.value if old_entry.platform else "unknown",
                 "user_id": old_entry.origin.user_id if old_entry.origin else None,
+                "source_instance_id": (
+                    old_entry.origin.source_instance_id or old_entry.origin.binding_id
+                    if old_entry.origin else None
+                ),
+                "conversation_id": old_entry.origin.conversation_id if old_entry.origin else None,
+                "channel_identity_status": old_entry.origin.channel_identity_status if old_entry.origin else None,
+                "channel_identity_label": old_entry.origin.channel_identity_label if old_entry.origin else None,
+                "channel_identity_match_scope": old_entry.origin.channel_identity_match_scope if old_entry.origin else None,
             }
 
         if self._db and db_end_session_id:

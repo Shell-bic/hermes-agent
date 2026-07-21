@@ -1,0 +1,10 @@
+[
+  { "name": "numeric string", "value": "0" },
+  { "name": "date only", "value": "2026-07-15" },
+  { "name": "RFC1123", "value": "Wed, 15 Jul 2026 09:10:00 GMT" },
+  { "name": "missing offset", "value": "2026-07-15T09:10:00" },
+  { "name": "calendar rollover", "value": "2026-02-30T09:10:00Z" },
+  { "name": "non-leap February 29", "value": "2025-02-29T09:10:00+08:00" },
+  { "name": "invalid hour", "value": "2026-07-15T24:00:00Z" },
+  { "name": "invalid offset", "value": "2026-07-15T09:10:00+24:00" }
+]

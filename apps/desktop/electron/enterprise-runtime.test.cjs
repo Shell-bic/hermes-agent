@@ -86,6 +86,20 @@ test('resolveEnterpriseRuntimeOptions loads machine config without requiring a t
   })
 })
 
+test('resolveEnterpriseRuntimeOptions propagates only an explicit machine GatewayRunner experiment opt-in', () => {
+  const readFileSync = () => JSON.stringify({
+    schemaVersion: 1,
+    gatewayUrl: 'https://machine-gateway.example.com',
+    weComGatewayRunnerExperiment: true
+  })
+
+  assert.deepEqual(resolveEnterpriseRuntimeOptions({}, { configPaths: ['machine.json'], readFileSync }), {
+    enabled: true,
+    gatewayUrl: 'https://machine-gateway.example.com',
+    weComGatewayRunnerExperiment: true
+  })
+})
+
 test('resolveEnterpriseRuntimeOptions keeps machine deployment config over user environment', () => {
   const readFileSync = () => JSON.stringify({ schemaVersion: 1, gatewayUrl: 'https://machine.example.com' })
 
@@ -227,6 +241,9 @@ test('enterprise runtime prepares managed launch without exposing gateway token 
 
   assert.equal(launch.hermesHome, 'managed-home')
   assert.equal(launch.env.COMPANY_GATEWAY_TOKEN, 'gateway-token')
+  assert.equal(runtime.getGatewayToken(), 'gateway-token')
+  assert.equal(runtime.getDesktopToken(), 'desktop-token')
+  assert.equal(runtime.getManagedHermesHome(), 'managed-home')
   assert.equal(JSON.stringify(launch.publicState).includes('gateway-token'), false)
   assert.deepEqual(calls, [
     ['bootstrap', 'desktop-token'],

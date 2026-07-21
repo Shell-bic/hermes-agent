@@ -8,7 +8,10 @@ to env vars nothing read on startup — the home channel appeared to set
 successfully but was lost on every new gateway session.
 """
 
-from gateway.run import _home_target_env_var, _home_thread_env_var
+from types import SimpleNamespace
+
+from gateway.config import Platform
+from gateway.run import _home_target_env_var, _home_thread_env_var, _should_prompt_for_home_channel
 
 
 def test_matrix_home_target_env_var_uses_home_room():
@@ -40,3 +43,19 @@ def test_home_thread_env_var_uses_home_target_name_plus_thread_id():
     assert _home_thread_env_var("discord") == "DISCORD_HOME_CHANNEL_THREAD_ID"
     assert _home_thread_env_var("matrix") == "MATRIX_HOME_ROOM_THREAD_ID"
     assert _home_thread_env_var("email") == "EMAIL_HOME_ADDRESS_THREAD_ID"
+
+
+def test_enterprise_managed_wecom_suppresses_unusable_home_channel_prompt(monkeypatch):
+    monkeypatch.delenv("WECOM_HOME_CHANNEL", raising=False)
+    source = SimpleNamespace(platform=Platform.WECOM)
+    managed_adapter = SimpleNamespace(_enterprise_managed_runtime=True)
+
+    assert not _should_prompt_for_home_channel(source, [], managed_adapter)
+
+
+def test_unmanaged_wecom_keeps_upstream_home_channel_prompt(monkeypatch):
+    monkeypatch.delenv("WECOM_HOME_CHANNEL", raising=False)
+    source = SimpleNamespace(platform=Platform.WECOM)
+
+    assert _should_prompt_for_home_channel(source, [], SimpleNamespace())
+    assert not _should_prompt_for_home_channel(source, [{"role": "user"}], SimpleNamespace())

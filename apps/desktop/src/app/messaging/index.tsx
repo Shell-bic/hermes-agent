@@ -1,5 +1,7 @@
+import { useStore } from '@nanostores/react'
 import type * as React from 'react'
 import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useNavigate } from 'react-router-dom'
 
 import { PageLoader } from '@/components/page-loader'
 import { StatusDot, type StatusTone } from '@/components/status-dot'
@@ -7,8 +9,14 @@ import { Button } from '@/components/ui/button'
 import { DisclosureCaret } from '@/components/ui/disclosure-caret'
 import { Input } from '@/components/ui/input'
 import { Switch } from '@/components/ui/switch'
+import type {
+  EnterpriseWeComBotChannelStatus,
+  EnterpriseWeComBotIdentityStatus,
+  EnterpriseWeComPersonalBotState
+} from '@/global'
 import {
   getMessagingPlatforms,
+  listAllProfileSessions,
   type MessagingEnvVarInfo,
   type MessagingPlatformInfo,
   updateMessagingPlatform
@@ -16,11 +24,13 @@ import {
 import { type Translations, useI18n } from '@/i18n'
 import { AlertTriangle, ExternalLink, Save, Trash2 } from '@/lib/icons'
 import { cn } from '@/lib/utils'
+import { $enterprise } from '@/store/enterprise'
 import { notify, notifyError } from '@/store/notifications'
 
 import { useRefreshHotkey } from '../hooks/use-refresh-hotkey'
 import { useRouteEnumParam } from '../hooks/use-route-enum-param'
 import { PageSearchShell } from '../page-search-shell'
+import { sessionRoute } from '../routes'
 import { CREDENTIAL_CONTROL_CLASS } from '../settings/credential-key-ui'
 import { ListRow } from '../settings/primitives'
 import type { SetStatusbarItemGroup } from '../shell/statusbar-controls'
@@ -94,7 +104,24 @@ function fieldCopy(field: MessagingEnvVarInfo, m: Translations['messaging']) {
   }
 }
 
-export function MessagingView({ setStatusbarItemGroup: _setStatusbarItemGroup, ...props }: MessagingViewProps) {
+export function MessagingView(props: MessagingViewProps) {
+  const enterprise = useStore($enterprise)
+  const policy = enterprise.messagingChannelPolicy
+
+  if (enterprise.enabled && policy?.mode === 'managed') {
+    return (
+      <ManagedWeComPersonalBotView
+        {...props}
+        allowed={policy.allowedChannelIds?.includes('wecom-personal') === true}
+        visible={policy.visibleChannelIds?.includes('wecom-personal') === true}
+      />
+    )
+  }
+
+  return <UnmanagedMessagingView {...props} />
+}
+
+function UnmanagedMessagingView({ setStatusbarItemGroup: _setStatusbarItemGroup, ...props }: MessagingViewProps) {
   const { t } = useI18n()
   const m = t.messaging
   const [platforms, setPlatforms] = useState<MessagingPlatformInfo[] | null>(null)
@@ -298,6 +325,292 @@ export function MessagingView({ setStatusbarItemGroup: _setStatusbarItemGroup, .
                 saving={saving}
               />
             )}
+          </main>
+        </div>
+      )}
+    </PageSearchShell>
+  )
+}
+
+const BOT_STATE_COPY: Record<EnterpriseWeComBotChannelStatus, string> = {
+  authorizing: '等待扫码',
+  connected: '已连接',
+  connecting: '正在连接',
+  error: '连接异常',
+  offline: '已离线',
+  revoked: '已解绑',
+  unbound: '未绑定'
+}
+
+const IDENTITY_STATE_COPY: Record<EnterpriseWeComBotIdentityStatus, string> = {
+  conflict: '身份认领冲突',
+  expired: '验证码已过期',
+  locked: '验证码已锁定',
+  pending: '等待认领',
+  unlinked: '已解除身份关联',
+  unverified: '尚未认领',
+  verified: '已关联企业身份'
+}
+
+const INITIAL_BOT_STATE: EnterpriseWeComPersonalBotState = {
+  authorizationPending: false,
+  binding: null,
+  channel: { errorCode: null, localStopped: false, serverRevokePending: false, status: 'unbound' },
+  identity: { claim: null, errorCode: null, link: null, status: 'unverified' }
+}
+
+function botTone(state: EnterpriseWeComBotChannelStatus): StatusTone {
+  if (state === 'connected') {
+    return 'good'
+  }
+
+  if (state === 'error') {
+    return 'bad'
+  }
+
+  if (state === 'unbound' || state === 'revoked') {
+    return 'muted'
+  }
+
+  return 'warn'
+}
+
+function identityTone(state: EnterpriseWeComBotIdentityStatus): StatusTone {
+  if (state === 'verified') {
+    return 'good'
+  }
+
+  if (state === 'conflict' || state === 'expired' || state === 'locked') {
+    return 'bad'
+  }
+
+  return state === 'unverified' || state === 'unlinked' ? 'muted' : 'warn'
+}
+
+function ManagedWeComPersonalBotView({ allowed, visible, ...props }: MessagingViewProps & { allowed: boolean; visible: boolean }) {
+  const navigate = useNavigate()
+  const [state, setState] = useState(INITIAL_BOT_STATE)
+  const [sessions, setSessions] = useState<Awaited<ReturnType<typeof listAllProfileSessions>>['sessions']>([])
+  const [busy, setBusy] = useState(false)
+
+  const refreshSessions = useCallback(async () => {
+    if (!visible) {
+      return
+    }
+
+    const recent = await listAllProfileSessions(8, 0, 'exclude', 'recent', 'all', { source: 'wecom' }).catch(() => null)
+
+    if (recent) {
+      setSessions(recent.sessions)
+    }
+  }, [visible])
+
+  const refresh = useCallback(async () => {
+    if (!visible) {
+      return
+    }
+
+    const bridge = window.hermesDesktop?.enterprise?.weComBot
+
+    if (!bridge) {
+      return
+    }
+
+    const [stateResult] = await Promise.allSettled([
+      bridge.refresh(),
+      refreshSessions()
+    ])
+
+    if (stateResult.status === 'fulfilled') {
+      setState(stateResult.value)
+    }
+  }, [refreshSessions, visible])
+
+  useEffect(() => {
+    if (!visible) {
+      return
+    }
+
+    const bridge = window.hermesDesktop?.enterprise?.weComBot
+    const unsubscribe = bridge?.onState(setState)
+    let settleTimer: number | null = null
+
+    const unsubscribeSessionEvents = bridge?.onSessionEvent(event => {
+      if (event.type === 'message.start') {
+        void refreshSessions()
+      } else if (event.type === 'message.complete') {
+        void refreshSessions()
+
+        if (settleTimer !== null) {
+          window.clearTimeout(settleTimer)
+        }
+
+        settleTimer = window.setTimeout(() => {
+          void refreshSessions()
+        }, 500)
+      }
+    })
+
+    void refresh()
+
+    const timer = window.setInterval(() => {
+      if (!document.hidden) {
+        void refresh()
+      }
+    }, 4000)
+
+    return () => {
+      unsubscribe?.()
+      unsubscribeSessionEvents?.()
+
+      if (settleTimer !== null) {
+        window.clearTimeout(settleTimer)
+      }
+
+      window.clearInterval(timer)
+    }
+  }, [refresh, refreshSessions, visible])
+
+  async function action(kind: 'cancel' | 'focusAuthorization' | 'regenerateVerification' | 'revoke' | 'start' | 'unlinkIdentity') {
+    if (!allowed) {
+      return
+    }
+
+    const bridge = window.hermesDesktop.enterprise.weComBot
+    setBusy(true)
+
+    try {
+      setState(await bridge[kind]())
+    } catch (error) {
+      notifyError(error, '企业微信机器人操作失败')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <PageSearchShell {...props} onSearchChange={() => {}} searchHidden searchPlaceholder="" searchValue="">
+      {!visible ? (
+        <div className="grid h-full place-items-center px-6 text-sm text-muted-foreground">企业策略当前未开放消息渠道。</div>
+      ) : (
+        <div className="grid h-full min-h-0 grid-cols-1 lg:grid-cols-[14rem_minmax(0,1fr)]">
+          <aside className="p-2">
+            <button className="flex w-full items-center gap-2 rounded-md bg-(--ui-row-active-background) px-2 py-1.5 text-left" type="button">
+              <PlatformAvatar platformId="wecom" platformName="企业微信个人机器人" />
+              <span className="min-w-0 flex-1 truncate text-sm">企业微信个人机器人</span>
+              <StatusDot tone={botTone(state.channel.status)} />
+            </button>
+          </aside>
+          <main className="min-h-0 overflow-y-auto">
+            <div className="mx-auto max-w-2xl space-y-5 px-5 py-4">
+              <header className="flex items-start gap-3">
+                <PlatformAvatar platformId="wecom" platformName="企业微信个人机器人" />
+                <div>
+                  <h3 className="text-[0.9375rem] font-semibold">企业微信个人机器人</h3>
+                  <p className="mt-1 text-xs leading-5 text-(--ui-text-tertiary)">扫码绑定后，可直接在企业微信中与本机 Hermes Agent 对话。</p>
+                  <div className="mt-3"><StatePill tone={botTone(state.channel.status)}>{BOT_STATE_COPY[state.channel.status]}</StatePill></div>
+                </div>
+              </header>
+
+              {state.channel.errorCode && (
+                <div className="flex items-start gap-2 rounded-xl border border-destructive/30 bg-destructive/10 px-3 py-2 text-xs text-destructive">
+                  <AlertTriangle className="mt-0.5 size-3.5" />
+                  <span>{state.channel.serverRevokePending ? '机器人已在本机停止，但服务器解绑仍待重试：' : '连接失败：'}{state.channel.errorCode}</span>
+                </div>
+              )}
+
+              {!allowed && (
+                <div className="rounded-xl border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-300">
+                  企业策略当前只允许查看此渠道，不能绑定或处理消息。
+                </div>
+              )}
+
+              <section className="rounded-xl border border-border/80 bg-card/50 p-4">
+                <div className="flex flex-wrap items-start justify-between gap-3">
+                  <div>
+                    <h4 className="text-sm font-semibold">Bot 渠道</h4>
+                    <p className="mt-1 text-xs leading-5 text-muted-foreground">负责企业微信消息连接。关闭 Desktop 后机器人会下线。</p>
+                  </div>
+                  <StatePill tone={botTone(state.channel.status)}>{BOT_STATE_COPY[state.channel.status]}</StatePill>
+                </div>
+                <div className="mt-3 flex flex-wrap gap-2">
+                  {['unbound', 'revoked', 'error'].includes(state.channel.status) && (
+                    <Button disabled={busy || !allowed} onClick={() => void action('start')} size="sm">开始扫码绑定</Button>
+                  )}
+                  {state.authorizationPending && (
+                    <>
+                      <Button disabled={busy || !allowed} onClick={() => void action('focusAuthorization')} size="sm">返回扫码窗口</Button>
+                      <Button disabled={busy || !allowed} onClick={() => void action('cancel')} size="sm" variant="ghost">取消扫码</Button>
+                    </>
+                  )}
+                  {state.binding && state.channel.status !== 'revoked' && (
+                    <Button disabled={busy || !allowed} onClick={() => void action('revoke')} size="sm" variant="ghost">解绑 Bot</Button>
+                  )}
+                </div>
+              </section>
+
+              <section className="rounded-xl border border-border/80 bg-card/50 p-4">
+                <div className="flex flex-wrap items-start justify-between gap-3">
+                  <div>
+                    <h4 className="text-sm font-semibold">企业身份</h4>
+                    <p className="mt-1 text-xs leading-5 text-muted-foreground">认领仅用于标注会话身份；尚未认领的私聊和群聊也可以正常使用机器人。</p>
+                  </div>
+                  <StatePill tone={identityTone(state.identity.status)}>{IDENTITY_STATE_COPY[state.identity.status]}</StatePill>
+                </div>
+
+                {state.identity.errorCode && (
+                  <div className="mt-3 flex items-start gap-2 rounded-lg border border-destructive/30 bg-destructive/10 px-3 py-2 text-xs text-destructive">
+                    <AlertTriangle className="mt-0.5 size-3.5" />
+                    <span>身份状态获取失败：{state.identity.errorCode}。Bot 渠道仍可继续聊天。</span>
+                  </div>
+                )}
+
+                {state.identity.claim && (
+                  <div className="mt-3 rounded-lg border border-amber-500/30 bg-amber-500/10 p-3">
+                    <p className="text-xs leading-5 text-muted-foreground">请在企业微信中私聊该机器人并发送以下 6 位认领码。群聊中的数字不会触发认领。</p>
+                    <div className="mt-2 select-all font-mono text-3xl font-semibold tracking-[0.28em]">{state.identity.claim.code}</div>
+                    <p className="mt-2 text-xs text-muted-foreground">有效期至 {new Date(state.identity.claim.expiresAt).toLocaleTimeString()} · 已尝试 {state.identity.claim.failedAttempts}/10 次</p>
+                  </div>
+                )}
+
+                {state.identity.link && (
+                  <div className="mt-3 rounded-lg bg-muted/60 px-3 py-2 text-xs leading-5">
+                    <div className="font-medium">{state.identity.link.displayName || state.identity.link.userName}</div>
+                    <div className="text-muted-foreground">企业微信标识 {state.identity.link.channelUserIdHint} · {new Date(state.identity.link.verifiedAt).toLocaleString()}</div>
+                  </div>
+                )}
+
+                {state.binding && state.channel.status === 'connected' && (
+                  <div className="mt-3 flex flex-wrap gap-2">
+                    <Button disabled={busy || !allowed} onClick={() => void action('regenerateVerification')} size="sm" variant="ghost">重新生成认领码</Button>
+                    {state.identity.link && (
+                      <Button disabled={busy || !allowed} onClick={() => void action('unlinkIdentity')} size="sm" variant="ghost">解除身份关联</Button>
+                    )}
+                  </div>
+                )}
+                </section>
+
+              <section>
+                <SectionTitle>最近企业微信会话</SectionTitle>
+                <div className="mt-2 space-y-1">
+                  {sessions.length === 0 ? (
+                    <p className="py-4 text-xs text-muted-foreground">绑定并发送第一条消息后，会话会显示在这里。</p>
+                  ) : sessions.map(session => (
+                    <button className="flex w-full items-center justify-between rounded-lg px-2 py-2 text-left hover:bg-(--ui-row-hover-background)" key={session.id} onClick={() => navigate(sessionRoute(session.id))} type="button">
+                      <span className="min-w-0">
+                        <span className="block truncate text-sm">{session.title || '企业微信会话'}</span>
+                        <span className="block truncate text-[0.68rem] text-muted-foreground">
+                          {session.channel_identity_status === 'mapped'
+                            ? `已识别 · ${session.channel_identity_label || '企业用户'}${session.channel_identity_match_scope ? ` · ${session.channel_identity_match_scope}` : ''}`
+                            : '未知企业微信用户'}
+                        </span>
+                      </span>
+                      <span className="ml-3 shrink-0 text-xs text-muted-foreground">{session.message_count ?? 0} 条</span>
+                    </button>
+                  ))}
+                </div>
+              </section>
+            </div>
           </main>
         </div>
       )}

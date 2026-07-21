@@ -1126,6 +1126,22 @@ def _home_thread_env_var(platform_name: str) -> str:
     return f"{_home_target_env_var(platform_name)}_THREAD_ID"
 
 
+def _should_prompt_for_home_channel(source, history, adapter=None) -> bool:
+    """Return whether a fresh channel session needs the generic home prompt.
+
+    Enterprise Desktop owns the lifecycle and policy for its managed WeCom
+    adapter. It cannot persist ``/sethome`` through the managed profile, and a
+    personal Bot chat must not be silently promoted to a cron/cross-platform
+    delivery target. Keep the upstream prompt for every unmanaged channel.
+    """
+    platform = getattr(source, "platform", None)
+    if history or not platform or platform in {Platform.LOCAL, Platform.WEBHOOK}:
+        return False
+    if platform == Platform.WECOM and getattr(adapter, "_enterprise_managed_runtime", False) is True:
+        return False
+    return not bool(os.getenv(_home_target_env_var(platform.value)))
+
+
 def _restart_notification_pending() -> bool:
     """Return True when a /restart completion marker is waiting to be delivered."""
     return (_hermes_home / ".restart_notify.json").exists()
@@ -1495,6 +1511,7 @@ def _resolve_runtime_agent_kwargs() -> dict:
     before giving up.
     """
     from hermes_cli.runtime_provider import (
+        enterprise_runtime_required,
         resolve_runtime_provider,
         format_runtime_provider_error,
         _get_model_config,
@@ -1504,6 +1521,10 @@ def _resolve_runtime_agent_kwargs() -> dict:
     try:
         runtime = resolve_runtime_provider()
     except AuthError as auth_exc:
+        if enterprise_runtime_required():
+            # A partial or invalid managed bootstrap must not consult the
+            # user's local fallback chain, even when usable local keys exist.
+            raise RuntimeError(format_runtime_provider_error(auth_exc)) from auth_exc
         # Distinguish a transient rate-limit/quota cap (credentials are fine,
         # re-auth cannot help) from a genuine auth failure (expired/revoked
         # token). Both fall through to the fallback chain, but the log message
@@ -1554,7 +1575,9 @@ def _resolve_runtime_agent_kwargs() -> dict:
 
 def _try_resolve_fallback_provider() -> dict | None:
     """Attempt to resolve credentials from the fallback_model/fallback_providers config."""
-    from hermes_cli.runtime_provider import resolve_runtime_provider
+    from hermes_cli.runtime_provider import enterprise_runtime_required, resolve_runtime_provider
+    if enterprise_runtime_required():
+        return None
     try:
         import yaml as _y
         cfg_path = _hermes_home / "config.yaml"
@@ -2081,6 +2104,41 @@ import weakref as _weakref
 _gateway_runner_ref: _weakref.ref = lambda: None
 
 
+def deliver_desktop_wecom_reply_from_worker(
+    session_id: str,
+    text: str,
+    idempotency_key: str,
+    *,
+    timeout: float = 45.0,
+) -> bool:
+    """Deliver one Desktop final through the active original WeCom adapter.
+
+    The synchronous TUI worker supplies only a persisted Hermes session id.
+    The live runner resolves the remote target from its own SessionStore, so a
+    renderer cannot choose an arbitrary WeCom chat or smuggle credentials into
+    this boundary.
+    """
+    runner = _gateway_runner_ref()
+    loop = getattr(runner, "_gateway_loop", None) if runner is not None else None
+    if runner is None or not getattr(runner, "_running", False) or loop is None or not loop.is_running():
+        return False
+    try:
+        if asyncio.get_running_loop() is loop:
+            raise RuntimeError("Desktop WeCom worker delivery cannot block the gateway event loop")
+    except RuntimeError as exc:
+        if "cannot block" in str(exc):
+            raise
+    future = asyncio.run_coroutine_threadsafe(
+        runner.deliver_desktop_wecom_reply(
+            session_id=session_id,
+            text=text,
+            idempotency_key=idempotency_key,
+        ),
+        loop,
+    )
+    return bool(future.result(timeout=timeout))
+
+
 def _normalize_empty_agent_response(
     agent_result: dict,
     response: str,
@@ -2285,6 +2343,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self.config.sessions_dir, self.config,
             has_active_processes_fn=lambda key: process_registry.has_active_for_session(key),
         )
+        self._desktop_session_changed_callback = None
+        self._desktop_session_event_callback = None
+        self._desktop_wecom_delivery_keys: OrderedDict[str, str] = OrderedDict()
+        self._enterprise_wecom_lock = asyncio.Lock()
+        self._enterprise_wecom_binding_id: Optional[str] = None
+        self._enterprise_wecom_runtime_fingerprint: Optional[str] = None
+        self._enterprise_wecom_error_code: Optional[str] = None
+        self._enterprise_wecom_error_message: Optional[str] = None
+        self._startup_auto_resume_enabled = True
         self.delivery_router = DeliveryRouter(self.config)
         self._running = False
         self._gateway_loop: Optional[asyncio.AbstractEventLoop] = None
@@ -3060,6 +3127,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         model = _resolve_gateway_model(user_config)
         override = self._session_model_overrides.get(resolved_session_key) if resolved_session_key else None
+        from hermes_cli.runtime_provider import enterprise_runtime_required
+        managed_runtime = enterprise_runtime_required()
         if override:
             override_model = override.get("model", model)
             override_runtime = {
@@ -3069,7 +3138,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "api_mode": override.get("api_mode"),
                 "max_tokens": override.get("max_tokens"),
             }
-            if override_runtime.get("api_key"):
+            if override_runtime.get("api_key") and not managed_runtime:
                 logger.debug(
                     "Session model override (fast): session=%s config_model=%s -> override_model=%s provider=%s",
                     resolved_session_key or "", model, override_model,
@@ -3218,6 +3287,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             finally:
                 self.adapters.pop(adapter.platform, None)
                 self.delivery_router.adapters = self.adapters
+
+        if getattr(getattr(adapter, "config", None), "extra", {}).get(
+            "enterprise_managed_runtime"
+        ) is True:
+            # A hot-attached channel is subordinate to the Desktop backend.
+            # Its failure changes channel state but never stops Agent/session
+            # services or schedules an unmanaged config-based replacement.
+            self._enterprise_wecom_error_code = (
+                adapter.fatal_error_code or "wecom_runtime_disconnected"
+            )
+            self._enterprise_wecom_error_message = (
+                adapter.fatal_error_message or "Enterprise WeCom adapter disconnected"
+            )
+            self._enterprise_wecom_runtime_fingerprint = None
+            return
 
         # Queue retryable failures for background reconnection
         if adapter.fatal_error_retryable:
@@ -4871,6 +4955,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         agent is already running are skipped regardless, so a session
         scheduled at startup is never resumed a second time.
         """
+        if not getattr(self, "_startup_auto_resume_enabled", True):
+            logger.info(
+                "Skipping synthetic auto-resume for restart-interrupted sessions in this hosted runtime."
+            )
+            return 0
+
         window = _auto_continue_freshness_window()
         try:
             with self.session_store._lock:  # noqa: SLF001 — snapshot under lock
@@ -8340,6 +8430,294 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 pass
         return source
 
+    def set_desktop_session_changed_callback(self, callback) -> None:
+        """Install the Desktop experiment's narrow session invalidation sink."""
+        self._desktop_session_changed_callback = callback
+
+    def set_desktop_session_event_callback(self, callback) -> None:
+        """Install the Desktop experiment's live WeCom session event sink."""
+        self._desktop_session_event_callback = callback
+
+    def enterprise_wecom_status(self) -> Dict[str, Any]:
+        """Return credential-free state for the Desktop main process."""
+        adapter = self.adapters.get(Platform.WECOM)
+        connected = bool(
+            adapter is not None
+            and getattr(adapter, "_enterprise_managed_runtime", False)
+            and getattr(adapter, "_running", False)
+        )
+        state = "connected" if connected else (
+            "error" if self._enterprise_wecom_error_code else "detached"
+        )
+        return {
+            "state": state,
+            "bindingId": self._enterprise_wecom_binding_id,
+            "connected": connected,
+            "errorCode": self._enterprise_wecom_error_code,
+            "errorMessage": self._enterprise_wecom_error_message,
+        }
+
+    async def attach_enterprise_wecom(self, runtime: Dict[str, Any]) -> Dict[str, Any]:
+        """Hot-attach one managed WeCom adapter without restarting the runner."""
+        import uuid
+        import hashlib
+        from gateway.config import PlatformConfig
+
+        binding_id = str(runtime.get("binding_id") or "").strip()
+        try:
+            uuid.UUID(binding_id)
+        except (ValueError, AttributeError):
+            raise ValueError("invalid enterprise WeCom binding id")
+        required = {
+            "corp_id": 128,
+            "bot_id": 256,
+            "secret": 512,
+            "gateway_base_url": 2048,
+            "gateway_service_token": 4096,
+        }
+        normalized: Dict[str, str] = {}
+        for key, maximum in required.items():
+            value = str(runtime.get(key) or "").strip()
+            if not value or len(value) > maximum or any(ord(char) < 0x20 for char in value):
+                raise ValueError(f"invalid enterprise WeCom runtime field: {key}")
+            normalized[key] = value
+        runtime_fingerprint = hashlib.sha256(
+            "\0".join(
+                (binding_id, *(normalized[key] for key in sorted(normalized)))
+            ).encode("utf-8")
+        ).hexdigest()
+
+        async with self._enterprise_wecom_lock:
+            current = self.adapters.get(Platform.WECOM)
+            current_is_connected = bool(
+                current is not None
+                and getattr(current, "_enterprise_managed_runtime", False)
+                and getattr(current, "_running", False)
+            )
+            previous_error = (
+                self._enterprise_wecom_error_code,
+                self._enterprise_wecom_error_message,
+            )
+            if (
+                current is not None
+                and self._enterprise_wecom_binding_id == binding_id
+                and getattr(self, "_enterprise_wecom_runtime_fingerprint", None)
+                == runtime_fingerprint
+                and getattr(current, "_running", False)
+            ):
+                return self.enterprise_wecom_status()
+
+            platform_config = PlatformConfig(
+                enabled=True,
+                gateway_restart_notification=False,
+                extra={
+                    "enterprise_managed_runtime": True,
+                    "binding_id": binding_id,
+                    "corp_id": normalized["corp_id"],
+                    "bot_id": normalized["bot_id"],
+                    "secret": normalized["secret"],
+                    "gateway_base_url": normalized["gateway_base_url"],
+                    "gateway_service_token": normalized["gateway_service_token"],
+                    "dm_policy": "open",
+                    "group_policy": "open",
+                    "allow_from": [],
+                    "group_allow_from": [],
+                    "group_sessions_per_user": True,
+                    "thread_sessions_per_user": True,
+                },
+            )
+            candidate = self._create_adapter(Platform.WECOM, platform_config)
+            if candidate is None:
+                raise RuntimeError("enterprise WeCom adapter is unavailable")
+            # Authorization is intentionally open only for an adapter created
+            # through this authenticated Desktop runtime-control path.  Do not
+            # derive this marker from config.extra: ordinary Hermes WeCom
+            # configurations must retain the upstream allowlist/pairing gate.
+            candidate._enterprise_managed_open_access = True
+            candidate.set_message_handler(self._handle_message)
+            candidate.set_fatal_error_handler(self._handle_adapter_fatal_error)
+            candidate.set_session_store(self.session_store)
+            candidate.set_busy_session_handler(self._handle_active_session_busy_message)
+            candidate.set_topic_recovery_fn(self._recover_telegram_topic_thread_id)
+            candidate._busy_text_mode = self._busy_text_mode
+            self._enterprise_wecom_error_code = None
+            self._enterprise_wecom_error_message = None
+            try:
+                connected = await self._connect_adapter_with_timeout(candidate, Platform.WECOM)
+            except Exception as exc:
+                await self._safe_adapter_disconnect(candidate, Platform.WECOM)
+                if current_is_connected:
+                    (
+                        self._enterprise_wecom_error_code,
+                        self._enterprise_wecom_error_message,
+                    ) = previous_error
+                else:
+                    self._enterprise_wecom_error_code = "wecom_attach_failed"
+                    self._enterprise_wecom_error_message = str(exc)
+                raise
+            if not connected:
+                code = candidate.fatal_error_code or "wecom_attach_failed"
+                message = candidate.fatal_error_message or "WeCom adapter did not connect"
+                await self._safe_adapter_disconnect(candidate, Platform.WECOM)
+                if current_is_connected:
+                    (
+                        self._enterprise_wecom_error_code,
+                        self._enterprise_wecom_error_message,
+                    ) = previous_error
+                else:
+                    self._enterprise_wecom_error_code = code
+                    self._enterprise_wecom_error_message = message
+                raise RuntimeError(message)
+
+            self.adapters[Platform.WECOM] = candidate
+            self.delivery_router.adapters = self.adapters
+            self.config.platforms[Platform.WECOM] = platform_config
+            self._failed_platforms.pop(Platform.WECOM, None)
+            self._enterprise_wecom_binding_id = binding_id
+            self._enterprise_wecom_runtime_fingerprint = runtime_fingerprint
+            self._sync_voice_mode_state_to_adapter(candidate)
+            if current is not None and current is not candidate:
+                try:
+                    await current.cancel_background_tasks()
+                finally:
+                    await self._safe_adapter_disconnect(current, Platform.WECOM)
+            return self.enterprise_wecom_status()
+
+    async def detach_enterprise_wecom(
+        self, binding_id: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Detach only the managed adapter; Agent/backend lifecycle is untouched."""
+        async with self._enterprise_wecom_lock:
+            if (
+                binding_id
+                and self._enterprise_wecom_binding_id
+                and str(binding_id) != self._enterprise_wecom_binding_id
+            ):
+                raise ValueError("enterprise WeCom binding mismatch")
+            adapter = self.adapters.get(Platform.WECOM)
+            if adapter is not None and not getattr(adapter, "_enterprise_managed_runtime", False):
+                raise RuntimeError("refusing to detach an unmanaged WeCom adapter")
+            if adapter is not None:
+                self.adapters.pop(Platform.WECOM, None)
+                self.delivery_router.adapters = self.adapters
+                try:
+                    await adapter.cancel_background_tasks()
+                finally:
+                    await self._safe_adapter_disconnect(adapter, Platform.WECOM)
+            configured = self.config.platforms.get(Platform.WECOM)
+            if configured is not None and configured.extra.get("enterprise_managed_runtime") is True:
+                self.config.platforms.pop(Platform.WECOM, None)
+            self._failed_platforms.pop(Platform.WECOM, None)
+            self._enterprise_wecom_binding_id = None
+            self._enterprise_wecom_runtime_fingerprint = None
+            self._enterprise_wecom_error_code = None
+            self._enterprise_wecom_error_message = None
+            return self.enterprise_wecom_status()
+
+    def set_startup_auto_resume_enabled(self, enabled: bool) -> None:
+        """Control synthetic recovery turns without changing real user resumes."""
+        self._startup_auto_resume_enabled = bool(enabled)
+
+    async def _notify_desktop_session_changed(
+        self,
+        session_id: str,
+        reason: str,
+        *,
+        source=None,
+    ) -> None:
+        if source is not None and getattr(source, "platform", None) != Platform.WECOM:
+            return
+        callback = self._desktop_session_changed_callback
+        if callback is None or not session_id:
+            return
+        try:
+            result = callback(str(session_id), str(reason or "updated"))
+            if inspect.isawaitable(result):
+                await result
+        except Exception:
+            logger.debug("Desktop session.changed notification failed", exc_info=True)
+
+    async def _notify_desktop_session_event(
+        self,
+        event_type: str,
+        session_id: str,
+        payload: Optional[Dict[str, Any]] = None,
+        *,
+        source=None,
+    ) -> None:
+        """Mirror a WeCom turn state to Desktop without changing channel delivery."""
+        if source is not None and getattr(source, "platform", None) != Platform.WECOM:
+            return
+        callback = getattr(self, "_desktop_session_event_callback", None)
+        if callback is None or not event_type or not session_id:
+            return
+        try:
+            result = callback(str(event_type), str(session_id), dict(payload or {}))
+            if inspect.isawaitable(result):
+                await result
+        except Exception:
+            logger.debug("Desktop live session event notification failed", exc_info=True)
+
+    async def deliver_desktop_wecom_reply(
+        self,
+        *,
+        session_id: str,
+        text: str,
+        idempotency_key: str,
+    ) -> bool:
+        """Send one persisted Desktop final to its existing WeCom source."""
+        normalized_session_id = str(session_id or "").strip()
+        normalized_text = str(text or "").strip()
+        normalized_key = str(idempotency_key or "").strip()
+        if not normalized_session_id or not normalized_text or not normalized_key:
+            return False
+
+        entry = self.session_store.lookup_by_session_id(normalized_session_id)
+        source = getattr(entry, "origin", None) if entry is not None else None
+        if source is None or getattr(source, "platform", None) != Platform.WECOM:
+            return False
+        adapter = self.adapters.get(Platform.WECOM)
+        if adapter is None:
+            return False
+
+        prior = self._desktop_wecom_delivery_keys.get(normalized_key)
+        if prior in {"pending", "sent"}:
+            return prior == "sent"
+        self._desktop_wecom_delivery_keys[normalized_key] = "pending"
+        self._desktop_wecom_delivery_keys.move_to_end(normalized_key)
+        while len(self._desktop_wecom_delivery_keys) > 1024:
+            self._desktop_wecom_delivery_keys.popitem(last=False)
+
+        try:
+            result = await adapter.send(
+                source.chat_id,
+                normalized_text,
+                metadata=self._thread_metadata_for_source(source),
+            )
+        except Exception:
+            self._desktop_wecom_delivery_keys.pop(normalized_key, None)
+            logger.exception(
+                "Desktop final delivery through original WeCom adapter failed for session %s",
+                normalized_session_id,
+            )
+            return False
+        if not getattr(result, "success", False):
+            self._desktop_wecom_delivery_keys.pop(normalized_key, None)
+            logger.warning(
+                "Desktop final delivery through original WeCom adapter was rejected for session %s: %s",
+                normalized_session_id,
+                getattr(result, "error", "unknown error"),
+            )
+            return False
+
+        self._desktop_wecom_delivery_keys[normalized_key] = "sent"
+        await self._notify_desktop_session_changed(
+            normalized_session_id,
+            "desktop-final-delivered",
+            source=source,
+        )
+        return True
+
     async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
         """Inner handler that runs under the _running_agents sentinel guard."""
         _msg_start_time = time.time()
@@ -8395,7 +8773,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         session_entry = self.session_store.get_or_create_session(source)
         session_key = session_entry.session_key
+        try:
+            self.session_store.update_channel_source_metadata(
+                session_entry.session_id, source
+            )
+        except Exception:
+            logger.debug("Channel source metadata update failed", exc_info=True)
         self._cache_session_source(session_key, source)
+        await self._notify_desktop_session_event(
+            "message.start",
+            session_entry.session_id,
+            {"channel": "wecom", "reason": "channel-turn-started"},
+            source=source,
+        )
         if self._is_telegram_topic_lane(source):
             try:
                 binding = self._session_db.get_telegram_topic_binding(
@@ -8957,28 +9347,32 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 context_prompt += _intro_note
         
-        # One-time prompt if no home channel is set for this platform
-        # Skip for webhooks - they deliver directly to configured targets (github_comment, etc.)
-        if not history and source.platform and source.platform != Platform.LOCAL and source.platform != Platform.WEBHOOK:
+        # One-time prompt if no home channel is set for this platform. Managed
+        # Desktop WeCom intentionally suppresses it: /sethome is unavailable in
+        # managed mode and choosing a cron target is an enterprise control-plane
+        # decision, not first-message onboarding.
+        if _should_prompt_for_home_channel(
+            source,
+            history,
+            self.adapters.get(source.platform) if source.platform else None,
+        ):
             platform_name = source.platform.value
-            env_key = _home_target_env_var(platform_name)
-            if not os.getenv(env_key):
-                # Slack dispatches all Hermes commands through a single
-                # parent slash command `/hermes`; bare `/sethome` is not
-                # registered and would fail with "app did not respond".
-                sethome_cmd = (
-                    "/hermes sethome"
-                    if source.platform == Platform.SLACK
-                    else "/sethome"
-                )
-                notice = (
-                    f"📬 No home channel is set for {platform_name.title()}. "
-                    f"A home channel is where Hermes delivers cron job results "
-                    f"and cross-platform messages.\n\n"
-                    f"Type {sethome_cmd} to make this chat your home channel, "
-                    f"or ignore to skip."
-                )
-                await self._deliver_platform_notice(source, notice)
+            # Slack dispatches all Hermes commands through a single
+            # parent slash command `/hermes`; bare `/sethome` is not
+            # registered and would fail with "app did not respond".
+            sethome_cmd = (
+                "/hermes sethome"
+                if source.platform == Platform.SLACK
+                else "/sethome"
+            )
+            notice = (
+                f"📬 No home channel is set for {platform_name.title()}. "
+                f"A home channel is where Hermes delivers cron job results "
+                f"and cross-platform messages.\n\n"
+                f"Type {sethome_cmd} to make this chat your home channel, "
+                f"or ignore to skip."
+            )
+            await self._deliver_platform_notice(source, notice)
         
         # -----------------------------------------------------------------
         # Voice channel awareness — inject current voice channel state
@@ -9099,6 +9493,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "Discarding stale agent result for %s — generation %d is no longer current",
                     _quick_key or "?",
                     run_generation,
+                )
+                await self._notify_desktop_session_event(
+                    "message.interrupted",
+                    session_entry.session_id,
+                    {"channel": "wecom", "reason": "new-channel-message"},
+                    source=source,
                 )
                 _stale_adapter = self.adapters.get(source.platform)
                 if getattr(type(_stale_adapter), "pop_post_delivery_callback", None) is not None:
@@ -9495,6 +9895,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 session_entry.session_key,
                 last_prompt_tokens=agent_result.get("last_prompt_tokens", 0),
             )
+            await self._notify_desktop_session_changed(
+                session_entry.session_id,
+                "channel-turn-persisted",
+                source=source,
+            )
 
             # Intentional silence is a delivery decision, not a transcript
             # mutation.  The agent's [SILENT]/NO_REPLY assistant turn above is
@@ -9507,6 +9912,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     session_entry.session_id,
                 )
                 response = ""
+
+            if agent_result.get("interrupted"):
+                await self._notify_desktop_session_event(
+                    "message.interrupted",
+                    session_entry.session_id,
+                    {"channel": "wecom", "reason": "new-channel-message"},
+                    source=source,
+                )
+            else:
+                await self._notify_desktop_session_event(
+                    "message.complete",
+                    session_entry.session_id,
+                    {"channel": "wecom", "text": response},
+                    source=source,
+                )
 
             # Auto voice reply: send TTS audio before the text response
             _already_sent = bool(agent_result.get("already_sent"))
@@ -9601,10 +10021,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             session_entry.session_id,
                             _user_entry,
                         )
+                    await self._notify_desktop_session_changed(
+                        session_entry.session_id,
+                        "channel-turn-failed",
+                        source=source,
+                    )
             except Exception:
                 logger.debug("Failed to persist inbound user message after agent exception", exc_info=True)
             error_type = type(e).__name__
             error_detail = str(e)[:300] if str(e) else "no details available"
+            await self._notify_desktop_session_event(
+                "error",
+                session_entry.session_id,
+                {
+                    "channel": "wecom",
+                    "message": f"{error_type}: {error_detail}",
+                },
+                source=source,
+            )
             status_hint = ""
             status_code = getattr(e, "status_code", None)
             _hist_len = len(history) if 'history' in locals() else 0
@@ -12995,6 +13429,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         override = self._session_model_overrides.get(session_key)
         if not override:
             return model, runtime_kwargs
+        from hermes_cli.runtime_provider import enterprise_runtime_required
+        if enterprise_runtime_required():
+            # Managed session overrides may select an allowed model, but they
+            # never own provider identity or credentials.  Revalidate the
+            # model and keep the freshly resolved company-gateway runtime.
+            from hermes_cli.enterprise_policy import require_model_allowed
+
+            managed_model = override.get("model", model)
+            require_model_allowed(managed_model, action="runtime model switch")
+            return managed_model, runtime_kwargs
         model = override.get("model", model)
         for key in ("provider", "api_key", "base_url", "api_mode"):
             val = override.get(key)
@@ -13803,6 +14247,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         This is run in a thread pool to not block the event loop.
         Supports interruption via new messages.
         """
+        # Keep the queue in the coroutine scope so every local execution path,
+        # including paths that skip streaming setup, can safely drain it before
+        # the turn completes. The worker-thread callback only appends to it.
+        _desktop_stream_futures: List[Any] = []
+
         # ---- Proxy mode: delegate to remote API server ----
         if self._get_proxy_url():
             return await self._run_agent_via_proxy(
@@ -14681,6 +15130,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Set up stream consumer for token streaming or interim commentary.
             _stream_consumer = None
             _stream_delta_cb = None
+            _desktop_stream_enabled = bool(
+                source.platform == Platform.WECOM
+                and getattr(self, "_desktop_session_event_callback", None) is not None
+            )
             _scfg = getattr(getattr(self, 'config', None), 'streaming', None)
             if _scfg is None:
                 from gateway.config import StreamingConfig
@@ -14759,6 +15212,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         stream_consumer_holder[0] = _stream_consumer
                 except Exception as _sc_err:
                     logger.debug("Could not set up stream consumer: %s", _sc_err)
+
+            if _want_stream_deltas or _desktop_stream_enabled:
+                def _stream_delta_cb(text: str) -> None:
+                    if not _run_still_current():
+                        return
+                    if _stream_consumer is not None and _want_stream_deltas:
+                        _stream_consumer.on_delta(text)
+                    if _desktop_stream_enabled:
+                        _desktop_future = safe_schedule_threadsafe(
+                            self._notify_desktop_session_event(
+                                "message.delta",
+                                session_id,
+                                {"channel": "wecom", "text": text},
+                                source=source,
+                            ),
+                            _loop_for_step,
+                            logger=logger,
+                            log_message="desktop WeCom stream scheduling error",
+                        )
+                        if _desktop_future is not None:
+                            _desktop_stream_futures.append(_desktop_future)
 
             def _interim_assistant_cb(text: str, *, already_streamed: bool = False) -> None:
                 if not _run_still_current():
@@ -15360,7 +15834,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _conversation_kwargs["persist_user_message"] = message
                 if _persist_user_timestamp_override is not None:
                     _conversation_kwargs["persist_user_timestamp"] = _persist_user_timestamp_override
-                result = agent.run_conversation(_api_run_message, **_conversation_kwargs)
+                from agent.enterprise_channel_audit import channel_actor_audit_scope
+                with channel_actor_audit_scope(agent, source):
+                    result = agent.run_conversation(_api_run_message, **_conversation_kwargs)
             finally:
                 unregister_gateway_notify(_approval_session_key)
                 # Cancel any pending clarify entries so blocked agent
@@ -15917,6 +16393,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             _backup_agent.interrupt(_bp_text)
                             _interrupt_detected.set()
 
+            # The token callback runs on the agent worker thread. Drain every
+            # scheduled Desktop broadcast before returning to the outer handler,
+            # which emits message.complete on this loop. This preserves strict
+            # delta-before-complete ordering and prevents a late fragment from
+            # seeding a second assistant bubble after completion.
+            if not _inactivity_timeout and _desktop_stream_futures:
+                await asyncio.gather(
+                    *(asyncio.wrap_future(future) for future in list(_desktop_stream_futures)),
+                    return_exceptions=True,
+                )
+
             if _inactivity_timeout:
                 # Build a diagnostic summary from the agent's activity tracker.
                 _timed_out_agent = agent_holder[0]
@@ -16231,6 +16718,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         return result
                     next_message_id = self._reply_anchor_for_event(pending_event)
                     next_channel_prompt = getattr(pending_event, "channel_prompt", None)
+
+                await self._notify_desktop_session_event(
+                    "message.interrupted",
+                    session_id,
+                    {"channel": "wecom", "reason": "new-channel-message"},
+                    source=source,
+                )
+                await self._notify_desktop_session_event(
+                    "message.start",
+                    session_id,
+                    {"channel": "wecom", "reason": "channel-followup-started"},
+                    source=next_source,
+                )
 
                 # Restart typing indicator so the user sees activity while
                 # the follow-up turn runs.  The outer _process_message_background

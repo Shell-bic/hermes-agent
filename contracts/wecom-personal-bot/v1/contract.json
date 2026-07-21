@@ -1,0 +1,96 @@
+{
+  "contractSet": "wecom-personal-bot.v1",
+  "authority": {
+    "repository": "enterprise-gateway",
+    "path": "contracts/wecom-personal-bot/v1",
+    "desktopMirrorPath": "contracts/wecom-personal-bot/v1"
+  },
+  "boundaries": {
+    "messagingChannelPolicy": "messaging-channel-policy.v1",
+    "weComBotTransaction": "wecom-bot-transaction.v1",
+    "weComBotBinding": "wecom-bot-binding.v1"
+  },
+  "channelIdentity": {
+    "uiSurfaceToSessionSource": {
+      "wecom-personal": "wecom"
+    },
+    "rule": "UI surface ids and session source ids are distinct; no caller may infer one by string rewriting."
+  },
+  "policyHash": {
+    "algorithm": "sha256",
+    "encoding": "lowercase-hex",
+    "inputEncoding": "utf-8",
+    "excludeFields": ["policyHash"],
+    "canonicalFieldOrder": [
+      "contractVersion",
+      "hideUnlisted",
+      "visibleChannelIds",
+      "userManageableChannelIds",
+      "allowedChannelIds",
+      "requiredClientCapabilities"
+    ],
+    "arrayNormalization": "reject null and duplicates, then sort ordinal before hashing",
+    "jsonFormatting": "compact JSON with no insignificant whitespace"
+  },
+  "policySemantics": {
+    "managedMissingOrInvalid": "fail-closed with no visible, manageable, or allowed channels",
+    "unmanagedMissing": "full upstream catalog remains visible and operable",
+    "visibleDoesNotImplyAllowed": true,
+    "userManageableMustBeVisible": true,
+    "allowedMustBeVisible": true,
+    "bootstrapAndManifestMustSharePolicyHash": true,
+    "requiredClientCapability": "messaging-channel-policy.v1"
+  },
+  "desktopCapabilityHandshake": {
+    "header": "X-Hermes-Desktop-Capabilities",
+    "encoding": "comma-separated capability ids",
+    "requiredFor": ["GET /api/desktop/bootstrap", "POST /api/desktop/runtime/manifests"],
+    "requiredCapability": "messaging-channel-policy.v1",
+    "missingOrUnsupportedStatus": 426,
+    "missingOrUnsupportedCode": "desktop_capability_required"
+  },
+  "stateLayers": {
+    "transaction": ["pending", "authorized", "redeeming", "completed", "denied", "expired", "canceled", "error"],
+    "durableBinding": ["pending-owner-verification", "connecting", "connected", "disconnected", "suspended", "revoked"],
+    "connection": ["offline", "connecting", "online", "error"],
+    "uiTransient": [
+      "not-bound",
+      "auth-preparing",
+      "auth-pending",
+      "binding-created",
+      "owner-verification",
+      "connecting",
+      "connected",
+      "permission-denied",
+      "source-invalid",
+      "qr-expired",
+      "owner-mismatch",
+      "disconnected",
+      "revoked",
+      "gateway-offline"
+    ]
+  },
+  "security": {
+    "responseForbiddenPropertyNameFragments": ["secret", "ciphertext", "envelope", "privatekey", "keyhash", "credential", "lease"],
+    "ownerIdentity": "The Gateway derives the owner from the authenticated Desktop session; clients cannot submit or replace it.",
+    "ownerVerification": "A binding cannot become connected until sender.userid equals DesktopUser.ExternalSubjectId for the binding owner.",
+    "defaultDmPolicy": "owner-only",
+    "defaultGroupPolicy": "disabled"
+  },
+  "delivery": {
+    "desktopOffline": "The server worker remains connected and inbound messages remain queued.",
+    "desktopOnline": "Only the authenticated binding owner may lease queued messages and submit replies.",
+    "deliveryStates": ["queued", "leased", "processed", "failed"],
+    "firstReleaseRequiresDesktopRuntimeForReplies": true,
+    "deduplicationRequired": true,
+    "leaseAndAcknowledgementAreNotResponseMetadata": true
+  },
+  "limits": {
+    "maxChannelIdsPerList": 64,
+    "maxRequiredClientCapabilities": 32,
+    "maxChannelIdLength": 64,
+    "maxCapabilityIdLength": 128,
+    "maxAuthorizationUrlLength": 2048,
+    "maxBotDisplayNameLength": 128
+  }
+}

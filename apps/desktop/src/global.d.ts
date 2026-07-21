@@ -55,6 +55,17 @@ declare global {
         refreshPolicy: () => Promise<EnterpriseDesktopState>
         retryStop: () => Promise<EnterpriseLifecycleSnapshot>
         selectModel: (model: string) => Promise<EnterpriseDesktopState>
+        weComBot: {
+          cancel: () => Promise<EnterpriseWeComPersonalBotState>
+          focusAuthorization: () => Promise<EnterpriseWeComPersonalBotState>
+          onState: (callback: (state: EnterpriseWeComPersonalBotState) => void) => () => void
+          onSessionEvent: (callback: (event: import('./types/hermes').RpcEvent) => void) => () => void
+          regenerateVerification: () => Promise<EnterpriseWeComPersonalBotState>
+          refresh: () => Promise<EnterpriseWeComPersonalBotState>
+          revoke: () => Promise<EnterpriseWeComPersonalBotState>
+          unlinkIdentity: () => Promise<EnterpriseWeComPersonalBotState>
+          start: () => Promise<EnterpriseWeComPersonalBotState>
+        }
         skillHub: {
           detail: (key: string) => Promise<EnterpriseSkillHubItem>
           install: (payload: EnterpriseSkillHubInstallInput) => Promise<EnterpriseSkillHubInstallResult>
@@ -571,6 +582,84 @@ export interface EnterpriseToolPolicySnapshot {
   tools: EnterpriseToolPolicyItem[]
 }
 
+export interface EnterpriseMessagingChannelPolicy {
+  allowedChannelIds: string[]
+  contractVersion: 'messaging-channel-policy.v1'
+  hideUnlisted: boolean
+  policyHash: string
+  requiredClientCapabilities: string[]
+  userManageableChannelIds: string[]
+  visibleChannelIds: string[]
+}
+
+export type EnterpriseMessagingChannelPolicyStatus = 'applied' | 'fail-closed' | 'full-catalog'
+
+export interface EnterpriseMessagingChannelPolicyDecision {
+  allowedChannelIds: null | string[]
+  hideUnlisted: boolean
+  mode: 'managed' | 'unmanaged'
+  policy: EnterpriseMessagingChannelPolicy | null
+  reason: null | string
+  status: EnterpriseMessagingChannelPolicyStatus
+  userManageableChannelIds: null | string[]
+  visibleChannelIds: null | string[]
+}
+
+export type EnterpriseWeComBotChannelStatus =
+  | 'connected'
+  | 'connecting'
+  | 'authorizing'
+  | 'error'
+  | 'offline'
+  | 'revoked'
+  | 'unbound'
+
+export type EnterpriseWeComBotIdentityStatus = 'conflict' | 'expired' | 'locked' | 'pending' | 'unlinked' | 'unverified' | 'verified'
+
+export interface EnterpriseWeComBotIdentityClaim {
+  bindingId: string
+  claimId: string
+  code: string
+  contractVersion: 'wecom-channel-identity.v1'
+  expiresAt: string
+  failedAttempts: number
+  status: 'expired' | 'locked' | 'pending'
+}
+
+export interface EnterpriseWeComBotIdentityLink {
+  channelUserIdHint: string
+  contractVersion: 'wecom-channel-identity.v1'
+  displayName: null | string
+  linkId: string
+  userName: string
+  verificationMethod: string
+  verifiedAt: string
+}
+
+export interface EnterpriseWeComPublicBinding {
+  bindingId: string
+  createdAt: string
+  displayName: null | string
+  updatedAt: string
+}
+
+export interface EnterpriseWeComPersonalBotState {
+  authorizationPending: boolean
+  binding: EnterpriseWeComPublicBinding | null
+  channel: {
+    errorCode: null | string
+    localStopped: boolean
+    serverRevokePending: boolean
+    status: EnterpriseWeComBotChannelStatus
+  }
+  identity: {
+    claim: EnterpriseWeComBotIdentityClaim | null
+    errorCode: null | string
+    link: EnterpriseWeComBotIdentityLink | null
+    status: EnterpriseWeComBotIdentityStatus
+  }
+}
+
 export interface EnterpriseDesktopState {
   allowedModels: string[]
   authenticated: boolean
@@ -584,6 +673,7 @@ export interface EnterpriseDesktopState {
   error?: string | null
   generatedAt: null | string
   lockedSurfaces: string[]
+  messagingChannelPolicy?: EnterpriseMessagingChannelPolicyDecision
   modelRuntimeHash?: null | string
   modelProfiles: EnterpriseModelProfileSummary[]
   policyHash: null | string

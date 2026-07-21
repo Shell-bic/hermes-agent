@@ -299,6 +299,13 @@ export interface SessionInfo {
   output_tokens: number
   preview: null | string
   source: null | string
+  /** Enterprise channel identity resolved for this session. These are display
+   *  labels only and never change the session's authorization principal. */
+  channel_identity_status?: 'ambiguous' | 'mapped' | 'unknown' | null
+  channel_identity_label?: null | string
+  channel_identity_match_scope?: 'ambiguous' | 'corp-consensus' | 'exact' | 'none' | null
+  source_instance_id?: null | string
+  conversation_id?: null | string
   started_at: number
   title: null | string
   tool_call_count: number

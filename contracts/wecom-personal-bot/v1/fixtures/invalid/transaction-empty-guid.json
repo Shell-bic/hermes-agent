@@ -1,0 +1,8 @@
+{
+  "contractVersion": "wecom-bot-transaction.v1",
+  "transactionId": "00000000-0000-0000-0000-000000000000",
+  "status": "pending",
+  "authorizationUrl": "https://auth.example.invalid/wecom/bot/empty-guid",
+  "expiresAt": "2026-07-15T09:10:00Z",
+  "errorCode": null
+}

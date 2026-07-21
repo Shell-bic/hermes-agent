@@ -375,7 +375,7 @@ export function DesktopController() {
   // seeds every platform; the sidebar splits the rows per source.
   const refreshMessagingSessions = useCallback(async () => {
     try {
-      const result = await listAllProfileSessions(MESSAGING_SECTION_LIMIT, 1, 'exclude', 'recent', 'all', {
+      const result = await listAllProfileSessions(MESSAGING_SECTION_LIMIT, 0, 'exclude', 'recent', 'all', {
         excludeSources: MESSAGING_EXCLUDED_SOURCES
       })
 
@@ -647,6 +647,7 @@ export function DesktopController() {
     queryClient,
     refreshHermesConfig,
     refreshSessions,
+    selectedStoredSessionIdRef,
     sessionStateByRuntimeIdRef,
     updateSessionState
   })

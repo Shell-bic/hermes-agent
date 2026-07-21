@@ -70,6 +70,7 @@ export type GatewayEventPayload = {
   count?: number
   // status.update (kind=process → background process completion/watch-match)
   kind?: string
+  stored_session_id?: string
 }
 
 export function textPart(text: string): ChatMessagePart {
