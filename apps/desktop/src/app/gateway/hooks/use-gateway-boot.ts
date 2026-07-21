@@ -278,6 +278,20 @@ export function useGatewayBoot({
     })
 
     const offEvent = gateway.onEvent(event => callbacksRef.current.handleGatewayEvent(event))
+    const offWeComSessionEvent = desktop.enterprise?.weComBot?.onSessionEvent?.(event => {
+      callbacksRef.current.handleGatewayEvent(event)
+      if (event.type === 'message.start' || event.type === 'message.complete') {
+        void callbacksRef.current.refreshSessions().catch(() => undefined)
+      }
+      if (event.type === 'message.complete') {
+        // The completion event can arrive a few milliseconds before the durable
+        // session row is visible to the cross-profile reader. Re-read once after
+        // that write settles so WeCom conversations do not require a manual refresh.
+        setTimeout(() => {
+          void callbacksRef.current.refreshSessions().catch(() => undefined)
+        }, 500)
+      }
+    })
 
     // Wake signals: power resume (macOS/Windows), network coming back, and the
     // window regaining focus/visibility. Each nudges an immediate reconnect.
@@ -433,6 +447,7 @@ export function useGatewayBoot({
       offPowerResume?.()
       offState()
       offEvent()
+      offWeComSessionEvent?.()
       offExit()
       offWindowState?.()
       offBootProgress()

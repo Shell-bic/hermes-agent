@@ -81,6 +81,15 @@ export function SidebarSessionRow({
   // session is waiting on the user.
   const needsInput = useStore($attentionSessionIds).includes(session.id)
 
+  const channelIdentityLabel = session.source === 'wecom'
+    ? session.channel_identity_status === 'mapped'
+      ? session.channel_identity_label || '已识别'
+      : session.channel_identity_status === 'ambiguous'
+        ? '身份冲突'
+        : '未知用户'
+    : null
+
+
   return (
     <SessionContextMenu
       onArchive={onArchive}
@@ -206,6 +215,11 @@ export function SidebarSessionRow({
           <span className="min-w-0 flex-1 truncate text-[0.8125rem] font-normal text-(--ui-text-secondary) group-hover:text-foreground group-data-[working=true]:text-foreground/90">
             {title}
           </span>
+          {channelIdentityLabel && (
+            <span className="max-w-20 shrink-0 truncate text-[0.625rem] text-(--ui-text-tertiary)" title={channelIdentityLabel}>
+              {channelIdentityLabel}
+            </span>
+          )}
         </button>
         <div className="relative z-2 grid w-[1.375rem] place-items-center">
           {!isWorking && (
