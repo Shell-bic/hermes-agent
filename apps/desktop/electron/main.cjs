@@ -953,6 +953,7 @@ function registerMediaProtocol() {
 }
 
 let mainWindow = null
+let enterprisePublicStateRefreshPromise = null
 const enterpriseWeComRuntimeControlToken = crypto.randomBytes(32).toString('base64url')
 let enterpriseWeComRuntimeConnection = null
 const enterpriseWeComRuntimeControl = createEnterpriseWeComRuntimeControlClient({
@@ -6031,12 +6032,27 @@ function createWindow() {
 }
 
 async function refreshEnterprisePublicStateAndEnforceLifecycle() {
-  const state = await enterpriseRuntime.refreshPublicState()
-  if (enterpriseWeComGatewayRunnerExperiment.isEnabled() && !enterpriseRuntime.hasStoredSession()) {
-    enterpriseWeComRelay.stop()
-    await teardownPrimaryBackendAndWait()
+  if (enterprisePublicStateRefreshPromise) {
+    return enterprisePublicStateRefreshPromise
   }
-  return state
+
+  const refresh = (async () => {
+    const state = await enterpriseRuntime.refreshPublicState()
+    if (enterpriseWeComGatewayRunnerExperiment.isEnabled() && !enterpriseRuntime.hasStoredSession()) {
+      enterpriseWeComRelay.stop()
+      await teardownPrimaryBackendAndWait()
+    }
+    return state
+  })()
+  enterprisePublicStateRefreshPromise = refresh
+
+  try {
+    return await refresh
+  } finally {
+    if (enterprisePublicStateRefreshPromise === refresh) {
+      enterprisePublicStateRefreshPromise = null
+    }
+  }
 }
 
 function isTrustedEnterpriseRendererUrl(rawUrl) {
@@ -6089,6 +6105,12 @@ async function runEnterpriseManagedRecoveryAction(action) {
 
 ipcMain.handle('hermes:enterprise:status', async event => {
   assertTrustedEnterpriseSender(event)
+  // On cold start the renderer can mount before did-finish-load has completed
+  // the stored-session verification. Join that authoritative refresh instead
+  // of returning the constructor's stale unauthenticated placeholder.
+  if (enterpriseLifecycle.getSnapshot().state === 'recovering') {
+    return refreshEnterprisePublicStateAndEnforceLifecycle()
+  }
   return enterpriseRuntime.getPublicState()
 })
 ipcMain.handle('hermes:enterprise:lifecycle-status', async event => {

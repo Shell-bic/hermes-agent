@@ -104,6 +104,17 @@ test('managed lifecycle defers safeStorage decryption until Electron is ready', 
   assert.ok(lifecycleInitialization < electronReady)
 })
 
+test('renderer cold-start status joins the authoritative session recovery', () => {
+  assert.match(
+    main,
+    /async function refreshEnterprisePublicStateAndEnforceLifecycle\(\) \{[\s\S]*if \(enterprisePublicStateRefreshPromise\)[\s\S]*return enterprisePublicStateRefreshPromise[\s\S]*enterprisePublicStateRefreshPromise = refresh/
+  )
+  assert.match(
+    main,
+    /ipcMain\.handle\('hermes:enterprise:status',[\s\S]*state === 'recovering'[\s\S]*return refreshEnterprisePublicStateAndEnforceLifecycle\(\)[\s\S]*return enterpriseRuntime\.getPublicState\(\)/
+  )
+})
+
 test('quit logout account switch and invalid session stop the backend, while Bot unbind only detaches the adapter', () => {
   const revokeStart = main.indexOf("ipcMain.handle('hermes:enterprise:wecom-bot-revoke'")
   const revokeEnd = main.indexOf("ipcMain.handle('hermes:enterprise:wecom-bot-regenerate-verification'", revokeStart)
