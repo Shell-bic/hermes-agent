@@ -7,6 +7,7 @@ const test = require('node:test')
 
 const {
   loadOfflineRuntimePayload,
+  packagedOfflineRuntimeUpgradeRequired,
   patchWindowsVenv,
   provisionOfflineRuntime
 } = require('./offline-runtime.cjs')
@@ -79,6 +80,30 @@ test('offline payload validates platform, pinned commit, and critical hashes', (
   }
 })
 
+test('packaged enterprise runtime upgrades only when the release commit changed', () => {
+  const oldCommit = 'a'.repeat(40)
+  const newCommit = 'b'.repeat(40)
+  const base = {
+    isPackaged: true,
+    enterpriseManaged: true,
+    installStamp: { commit: newCommit },
+    bootstrapMarker: { schemaVersion: 1, pinnedCommit: oldCommit }
+  }
+
+  assert.equal(packagedOfflineRuntimeUpgradeRequired(base), true)
+  assert.equal(
+    packagedOfflineRuntimeUpgradeRequired({
+      ...base,
+      bootstrapMarker: { schemaVersion: 1, pinnedCommit: newCommit.toUpperCase() }
+    }),
+    false
+  )
+  assert.equal(packagedOfflineRuntimeUpgradeRequired({ ...base, enterpriseManaged: false }), false)
+  assert.equal(packagedOfflineRuntimeUpgradeRequired({ ...base, isPackaged: false }), false)
+  assert.equal(packagedOfflineRuntimeUpgradeRequired({ ...base, installStamp: null }), false)
+  assert.equal(packagedOfflineRuntimeUpgradeRequired({ ...base, bootstrapMarker: null }), false)
+})
+
 test('patchWindowsVenv replaces the build-machine Python home', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'hermes-offline-venv-'))
   try {
@@ -116,6 +141,43 @@ test('offline provisioning installs runtime and support tools without network ac
     assert.ok(fs.existsSync(path.join(home, 'node', 'agent-browser.cmd')))
     assert.match(fs.readFileSync(path.join(activeRoot, 'venv', 'pyvenv.cfg'), 'utf8'), /home\\python/)
     assert.ok(events.some(event => event.name === 'offline-copy' && event.state === 'succeeded'))
+  } finally {
+    fs.rmSync(sandbox, { recursive: true, force: true })
+  }
+})
+
+test('offline provisioning replaces an older runtime and preserves it as a backup', async () => {
+  const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), 'hermes-offline-upgrade-'))
+  const payloadRoot = path.join(sandbox, 'payload')
+  const home = path.join(sandbox, 'home')
+  const activeRoot = path.join(home, 'hermes-agent')
+  try {
+    createPayload(payloadRoot, 'b'.repeat(40))
+    fs.mkdirSync(activeRoot, { recursive: true })
+    fs.writeFileSync(path.join(activeRoot, 'old-runtime.txt'), '0.16.1')
+    fs.mkdirSync(path.join(home, 'python'), { recursive: true })
+    fs.writeFileSync(path.join(home, 'python', 'old-python.txt'), 'old')
+
+    const payload = loadOfflineRuntimePayload(payloadRoot, { platform: 'win32', arch: 'x64' })
+    const result = await provisionOfflineRuntime({
+      payload,
+      hermesHome: home,
+      activeRoot,
+      platform: 'win32'
+    })
+
+    assert.equal(result.receipt.commit, 'b'.repeat(40))
+    assert.ok(fs.existsSync(path.join(activeRoot, 'hermes_cli', 'main.py')))
+    assert.equal(fs.existsSync(path.join(activeRoot, 'old-runtime.txt')), false)
+    assert.ok(result.backupRoot)
+    assert.equal(
+      fs.readFileSync(path.join(result.backupRoot, 'hermes-agent', 'old-runtime.txt'), 'utf8'),
+      '0.16.1'
+    )
+    assert.equal(
+      fs.readFileSync(path.join(result.backupRoot, 'python', 'old-python.txt'), 'utf8'),
+      'old'
+    )
   } finally {
     fs.rmSync(sandbox, { recursive: true, force: true })
   }

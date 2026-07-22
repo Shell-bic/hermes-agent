@@ -33,6 +33,7 @@ const {
   shouldDisableWindowsRendererSandbox
 } = require('./bootstrap-platform.cjs')
 const { runBootstrap } = require('./bootstrap-runner.cjs')
+const { packagedOfflineRuntimeUpgradeRequired } = require('./offline-runtime.cjs')
 const {
   buildSessionWindowUrl,
   chatWindowWebPreferences,
@@ -2893,6 +2894,37 @@ function resolveHermesBackend(dashboardArgs) {
     return {
       kind: 'bootstrap-needed',
       label: 'Pinned WeCom experiment runtime is unavailable',
+      command: null,
+      args: dashboardArgs,
+      bootstrap: true,
+      env: {},
+      shell: false,
+      activeRoot: ACTIVE_HERMES_ROOT,
+      installStamp: INSTALL_STAMP,
+      isPackaged: IS_PACKAGED,
+      platform: process.platform
+    }
+  }
+
+  // Enterprise offline releases own the managed runtime version. Windows
+  // uninstall intentionally preserves HERMES_HOME, so a reinstall can leave
+  // a runnable older checkout and bootstrap marker behind. When the packaged
+  // release commit changed, enter the immutable offline bootstrap before PATH
+  // or system-Python fallbacks can select that stale runtime.
+  const bootstrapMarker = readBootstrapMarker()
+  if (packagedOfflineRuntimeUpgradeRequired({
+    isPackaged: IS_PACKAGED,
+    enterpriseManaged: ENTERPRISE_RUNTIME_OPTIONS.enabled,
+    installStamp: INSTALL_STAMP,
+    bootstrapMarker
+  })) {
+    rememberLog(
+      `[bootstrap] packaged enterprise runtime upgrade required: ` +
+        `${String(bootstrapMarker.pinnedCommit).slice(0, 12)} -> ${INSTALL_STAMP.commit.slice(0, 12)}`
+    )
+    return {
+      kind: 'bootstrap-needed',
+      label: 'Packaged enterprise runtime upgrade required',
       command: null,
       args: dashboardArgs,
       bootstrap: true,

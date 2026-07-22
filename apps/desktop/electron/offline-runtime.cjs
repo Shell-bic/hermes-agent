@@ -8,6 +8,26 @@ const crypto = require('node:crypto')
 const OFFLINE_RUNTIME_SCHEMA_VERSION = 1
 const COMMIT_RE = /^[0-9a-f]{40}$/i
 
+function packagedOfflineRuntimeUpgradeRequired(options = {}) {
+  const {
+    isPackaged = false,
+    enterpriseManaged = false,
+    installStamp = null,
+    bootstrapMarker = null
+  } = options
+
+  if (!isPackaged || !enterpriseManaged) return false
+
+  const targetCommit = String(installStamp?.commit || '').trim()
+  if (!COMMIT_RE.test(targetCommit)) return false
+  if (!bootstrapMarker || bootstrapMarker.schemaVersion !== 1) return false
+
+  const installedCommit = String(bootstrapMarker.pinnedCommit || '').trim()
+  if (installedCommit.length < 7) return false
+
+  return installedCommit.toLowerCase() !== targetCommit.toLowerCase()
+}
+
 function fileExists(filePath) {
   try {
     return fs.statSync(filePath).isFile()
@@ -200,6 +220,7 @@ async function provisionOfflineRuntime(options) {
 module.exports = {
   OFFLINE_RUNTIME_SCHEMA_VERSION,
   loadOfflineRuntimePayload,
+  packagedOfflineRuntimeUpgradeRequired,
   patchWindowsVenv,
   provisionOfflineRuntime,
   requiredPayloadPaths
