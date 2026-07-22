@@ -285,6 +285,15 @@ class TestProfileBuildDirective:
 
         assert "first message ever" in profile_build_directive()
 
+    def test_verified_enterprise_identity_skips_redundant_profile_offer(self):
+        from agent.onboarding import should_offer_profile_build
+
+        assert should_offer_profile_build({}) is True
+        assert should_offer_profile_build(
+            {},
+            has_verified_enterprise_identity=True,
+        ) is False
+
 
 class TestProfileBuildSeenFlag:
     def test_flag_round_trips(self, tmp_path):

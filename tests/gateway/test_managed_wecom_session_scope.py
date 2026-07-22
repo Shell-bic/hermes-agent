@@ -1,5 +1,11 @@
 from gateway.config import Platform
-from gateway.session import SessionSource, build_session_key
+from gateway.session import (
+    SessionSource,
+    build_session_context,
+    build_session_context_prompt,
+    build_session_key,
+)
+from gateway.config import GatewayConfig
 from hermes_state import SessionDB
 
 
@@ -62,6 +68,31 @@ def test_managed_group_forces_per_user_isolation_over_global_shared_setting():
     assert build_session_key(first, group_sessions_per_user=False) != build_session_key(
         second, group_sessions_per_user=False
     )
+
+
+def test_managed_group_identity_prompt_is_safe_because_session_is_per_user():
+    source = SessionSource(
+        platform=Platform.WECOM,
+        chat_type="group",
+        chat_id="group-a",
+        user_id="member-a",
+        user_name="member-a",
+        source_instance_id="binding-a",
+        conversation_id="group-a",
+        channel_identity_status="mapped",
+        channel_identity_label="贝佳豪",
+        channel_identity_match_scope="exact",
+        force_group_sessions_per_user=True,
+    )
+
+    context = build_session_context(
+        source,
+        GatewayConfig(group_sessions_per_user=False),
+    )
+    prompt = build_session_context_prompt(context)
+
+    assert context.shared_multi_user_session is False
+    assert 'Display name: "贝佳豪"' in prompt
 
 
 def test_channel_identity_labels_persist_in_rich_session_rows(tmp_path):

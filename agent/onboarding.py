@@ -183,6 +183,24 @@ def profile_build_directive() -> str:
     )
 
 
+def should_offer_profile_build(
+    config: Mapping[str, Any],
+    *,
+    has_verified_enterprise_identity: bool = False,
+) -> bool:
+    """Return whether first-contact profile onboarding should be offered.
+
+    A Gateway-verified enterprise identity already supplies the participant's
+    name. Asking them to introduce themselves again would contradict trusted
+    session context, so managed channel onboarding uses the concise intro.
+    """
+    return (
+        not has_verified_enterprise_identity
+        and profile_build_mode(config) == "ask"
+        and not is_seen(config, PROFILE_BUILD_FLAG)
+    )
+
+
 # -------------------------------------------------------------------------
 # State read / write
 # -------------------------------------------------------------------------
@@ -248,6 +266,7 @@ __all__ = [
     "detect_openclaw_residue",
     "profile_build_mode",
     "profile_build_directive",
+    "should_offer_profile_build",
     "is_seen",
     "mark_seen",
 ]

@@ -612,10 +612,9 @@ class WeComAdapter(BasePlatformAdapter):
             chat_id=chat_id,
             chat_type="group" if is_group else "dm",
             user_id=sender_id or None,
-            # Identity resolution is UI/audit metadata only.  Keep the Agent's
-            # SessionContext byte-stable when this actor later claims an
-            # enterprise identity; changing user_name would perturb the
-            # per-turn context prompt and destroy prompt-cache reuse.
+            # Keep the transport user_name opaque and stable.  The separately
+            # verified enterprise label is pinned to the Agent session by the
+            # session layer and may be injected as trusted identity data.
             user_name=sender_id or None,
         )
         if self._enterprise_managed_runtime:

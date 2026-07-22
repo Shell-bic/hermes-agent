@@ -1460,6 +1460,7 @@ from gateway.session import (
     build_session_context_prompt,
     build_session_key,
     is_shared_multi_user_session,
+    verified_enterprise_identity_label,
 )
 from gateway.delivery import DeliveryRouter
 from gateway.authz_mixin import GatewayAuthorizationMixin
@@ -9326,15 +9327,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             try:
                 from agent.onboarding import (
                     PROFILE_BUILD_FLAG,
-                    is_seen,
                     mark_seen,
                     profile_build_directive,
-                    profile_build_mode,
+                    should_offer_profile_build,
                 )
                 _onb_cfg = _load_gateway_config()
-                if (
-                    profile_build_mode(_onb_cfg) == "ask"
-                    and not is_seen(_onb_cfg, PROFILE_BUILD_FLAG)
+                if should_offer_profile_build(
+                    _onb_cfg,
+                    has_verified_enterprise_identity=(
+                        verified_enterprise_identity_label(context.source) is not None
+                    ),
                 ):
                     context_prompt += profile_build_directive()
                     mark_seen(_hermes_home / "config.yaml", PROFILE_BUILD_FLAG)

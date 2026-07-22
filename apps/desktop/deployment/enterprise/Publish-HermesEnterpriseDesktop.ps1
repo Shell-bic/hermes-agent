@@ -75,9 +75,13 @@ $portableName = "Hermes-$($package.version)-win-x64-portable.zip"
 $portablePath = Join-Path $outputRoot $portableName
 Compress-Archive -LiteralPath $unpacked -DestinationPath $portablePath -CompressionLevel Optimal
 
+$currentArtifactStem = "Hermes-$($package.version)-win-x64"
 $installers = @(Get-ChildItem -LiteralPath $releaseRoot -File | Where-Object {
-    $_.Extension -in '.exe', '.msi' -and $_.Name -like 'Hermes-*'
+    $_.Extension -in '.exe', '.msi' -and $_.BaseName -eq $currentArtifactStem
 })
+if ($installers.Count -eq 0) {
+    throw "No current-version Hermes installer ($currentArtifactStem) was found in: $releaseRoot"
+}
 foreach ($installer in $installers) {
     Copy-Item -LiteralPath $installer.FullName -Destination (Join-Path $outputRoot $installer.Name)
 }
