@@ -1,5 +1,6 @@
 const test = require('node:test')
 const assert = require('node:assert/strict')
+const fs = require('node:fs')
 const path = require('node:path')
 
 const {
@@ -67,7 +68,7 @@ test('enterprise desktop config allows private IP HTTP only behind the explicit 
   )
 })
 
-test('enterprise desktop config keeps the GatewayRunner experiment default-off and machine-gated', () => {
+test('enterprise desktop config requires an explicit GatewayRunner opt-in from the selected config', () => {
   const disabled = readEnterpriseDesktopConfig('desktop.json', {
     readFileSync: reader({
       'desktop.json': JSON.stringify({ schemaVersion: 1, gatewayUrl: 'https://gateway.example.com' })
@@ -153,7 +154,8 @@ test('enterprise desktop config falls back to a bundled deployment default', () 
           allowInsecureLanHttp: true,
           enabled: true,
           gatewayUrl: 'http://172.31.1.49:6500',
-          schemaVersion: 1
+          schemaVersion: 1,
+          weComGatewayRunnerExperiment: true
         })
       })
     }
@@ -162,7 +164,19 @@ test('enterprise desktop config falls back to a bundled deployment default', () 
   assert.deepEqual(config, {
     allowInsecureLanHttp: true,
     enabled: true,
-    gatewayUrl: 'http://172.31.1.49:6500'
+    gatewayUrl: 'http://172.31.1.49:6500',
+    weComGatewayRunnerExperiment: true
+  })
+})
+
+test('packaged enterprise deployment default enables one-click Desktop-hosted WeCom runtime', () => {
+  const configPath = path.resolve(__dirname, '..', 'deployment', 'enterprise', 'enterprise-desktop.default.json')
+
+  assert.deepEqual(readEnterpriseDesktopConfig(configPath, { readFileSync: fs.readFileSync }), {
+    allowInsecureLanHttp: true,
+    enabled: true,
+    gatewayUrl: 'http://172.31.1.49:6500',
+    weComGatewayRunnerExperiment: true
   })
 })
 

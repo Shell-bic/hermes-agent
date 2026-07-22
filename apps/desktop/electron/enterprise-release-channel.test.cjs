@@ -57,7 +57,7 @@ test('desktop package and Python runtime publish the same semantic version', () 
   assert.equal(desktopPackage.version, runtimeVersion)
 })
 
-test('enterprise Windows package embeds the LAN Gateway deployment default', () => {
+test('enterprise Windows package embeds the one-click LAN Gateway and WeCom runtime defaults', () => {
   const desktopPackage = JSON.parse(read('apps/desktop/package.json'))
   const deploymentConfig = JSON.parse(read('apps/desktop/deployment/enterprise/enterprise-desktop.default.json'))
   const desktopMain = read('apps/desktop/electron/main.cjs')
@@ -72,7 +72,12 @@ test('enterprise Windows package embeds the LAN Gateway deployment default', () 
     allowInsecureLanHttp: true,
     enabled: true,
     gatewayUrl: 'http://172.31.1.49:6500',
-    schemaVersion: 1
+    schemaVersion: 1,
+    weComGatewayRunnerExperiment: true
   })
   assert.match(desktopMain, /app\.isPackaged[\s\S]*resourcesPath, 'enterprise', 'enterprise-desktop\.json'/)
+  assert.match(
+    desktopMain,
+    /ENTERPRISE_RUNTIME_OPTIONS\.weComGatewayRunnerExperiment === true[\s\S]*desktopHostedRuntime: ENTERPRISE_WECOM_GATEWAY_RUNNER_ENABLED[\s\S]*enabled: ENTERPRISE_WECOM_GATEWAY_RUNNER_ENABLED/
+  )
 })

@@ -2,5 +2,6 @@
   "allowInsecureLanHttp": true,
   "enabled": true,
   "gatewayUrl": "http://172.31.1.49:6500",
-  "schemaVersion": 1
+  "schemaVersion": 1,
+  "weComGatewayRunnerExperiment": true
 }
