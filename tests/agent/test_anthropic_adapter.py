@@ -6,6 +6,7 @@ import time
 from types import SimpleNamespace
 from unittest.mock import patch, MagicMock
 
+import httpx
 import pytest
 
 from agent.prompt_caching import apply_anthropic_cache_control
@@ -97,6 +98,7 @@ class TestBuildAnthropicClient:
             kwargs = mock_sdk.Anthropic.call_args[1]
             assert kwargs["api_key"] == "sk-ant-api03-something"
             assert "auth_token" not in kwargs
+            assert kwargs["default_headers"]["Authorization"] is mock_sdk.omit
             # API key auth should still get common betas
             betas = kwargs["default_headers"]["anthropic-beta"]
             assert "interleaved-thinking-2025-05-14" in betas
@@ -110,8 +112,58 @@ class TestBuildAnthropicClient:
             kwargs = mock_sdk.Anthropic.call_args[1]
             assert kwargs["base_url"] == "https://custom.api.com"
             assert kwargs["default_headers"] == {
-                "anthropic-beta": "interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14"
+                "anthropic-beta": "interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14",
+                "Authorization": mock_sdk.omit,
             }
+
+    def test_api_key_request_omits_ambient_auth_token(self, monkeypatch):
+        """A machine-scoped bearer token must not mask a managed gateway key."""
+        import agent.anthropic_adapter as adapter
+
+        sdk = adapter._get_anthropic_sdk()
+        real_anthropic = sdk.Anthropic
+        observed_headers = {}
+
+        def handler(request):
+            observed_headers.update(request.headers)
+            return httpx.Response(
+                200,
+                json={
+                    "id": "msg_fixture",
+                    "type": "message",
+                    "role": "assistant",
+                    "model": "fixture-model",
+                    "content": [],
+                    "stop_reason": "end_turn",
+                    "stop_sequence": None,
+                    "usage": {"input_tokens": 1, "output_tokens": 1},
+                },
+            )
+
+        http_client = httpx.Client(transport=httpx.MockTransport(handler))
+
+        def build_with_mock_transport(**kwargs):
+            kwargs["http_client"] = http_client
+            return real_anthropic(**kwargs)
+
+        monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "dsk_machine_scope_fixture")
+        monkeypatch.setattr(sdk, "Anthropic", build_with_mock_transport)
+
+        client = build_anthropic_client(
+            "gw_managed_runtime_fixture_1234567890",
+            base_url="http://gateway.example/v1",
+        )
+        try:
+            client.messages.create(
+                model="fixture-model",
+                max_tokens=1,
+                messages=[{"role": "user", "content": "probe"}],
+            )
+        finally:
+            client.close()
+
+        assert observed_headers["x-api-key"] == "gw_managed_runtime_fixture_1234567890"
+        assert "authorization" not in observed_headers
 
     def test_custom_base_url_strips_trailing_v1(self):
         with patch("agent.anthropic_adapter._anthropic_sdk") as mock_sdk:
@@ -164,7 +216,8 @@ class TestBuildAnthropicClient:
             assert kwargs["auth_token"] == "minimax-secret-123"
             assert "api_key" not in kwargs
             assert kwargs["default_headers"] == {
-                "anthropic-beta": "interleaved-thinking-2025-05-14"
+                "anthropic-beta": "interleaved-thinking-2025-05-14",
+                "X-Api-Key": mock_sdk.omit,
             }
 
     def test_minimax_cn_anthropic_endpoint_omits_tool_streaming_beta(self):
@@ -177,7 +230,8 @@ class TestBuildAnthropicClient:
             assert kwargs["auth_token"] == "minimax-cn-secret-123"
             assert "api_key" not in kwargs
             assert kwargs["default_headers"] == {
-                "anthropic-beta": "interleaved-thinking-2025-05-14"
+                "anthropic-beta": "interleaved-thinking-2025-05-14",
+                "X-Api-Key": mock_sdk.omit,
             }
 
     def test_azure_foundry_anthropic_endpoint_uses_bearer_auth(self):

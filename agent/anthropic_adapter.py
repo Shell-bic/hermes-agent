@@ -73,6 +73,35 @@ ADAPTIVE_EFFORT_MAP = {
     "minimal": "low",
 }
 
+
+def _isolated_auth_headers(
+    anthropic_sdk: Any,
+    *,
+    auth_mode: str,
+    headers: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Prevent ambient Anthropic credentials from adding a second auth header.
+
+    The Anthropic SDK reads both ``ANTHROPIC_API_KEY`` and
+    ``ANTHROPIC_AUTH_TOKEN`` even when the caller explicitly supplies the
+    other credential.  On a managed company-gateway runtime this can produce
+    both ``X-Api-Key: gw_*`` and ``Authorization: Bearer dsk_*``.  Gateways
+    commonly give Authorization precedence, so the unrelated machine-scoped
+    bearer token masks the valid managed key.
+
+    ``anthropic.omit`` is the SDK-supported way to remove a default header.
+    Keep exactly one authentication mechanism on every client we construct.
+    """
+
+    isolated = dict(headers or {})
+    if auth_mode == "api_key":
+        isolated["Authorization"] = anthropic_sdk.omit
+    elif auth_mode == "bearer":
+        isolated["X-Api-Key"] = anthropic_sdk.omit
+    else:
+        raise ValueError(f"Unsupported Anthropic auth mode: {auth_mode}")
+    return isolated
+
 # ── Anthropic thinking-mode classification ────────────────────────────
 # Claude 4.6 replaced budget-based extended thinking with *adaptive* thinking,
 # and 4.7 additionally forbids the manual ``thinking`` block entirely and drops
@@ -691,8 +720,11 @@ def _build_anthropic_client_with_bearer_hook(
         normalized_base_url,
         drop_context_1m_beta=drop_context_1m_beta,
     )
-    if common_betas:
-        kwargs["default_headers"] = {"anthropic-beta": ",".join(common_betas)}
+    kwargs["default_headers"] = _isolated_auth_headers(
+        _anthropic_sdk,
+        auth_mode="bearer",
+        headers={"anthropic-beta": ",".join(common_betas)} if common_betas else None,
+    )
 
     return _anthropic_sdk.Anthropic(**kwargs)
 
@@ -778,10 +810,14 @@ def build_anthropic_client(
         # to be recognized as a valid Coding Agent. Without it, returns 403.
         # Check this BEFORE _requires_bearer_auth since both match api.kimi.com/coding.
         kwargs["api_key"] = api_key
-        kwargs["default_headers"] = {
-            "User-Agent": "claude-code/0.1.0",
-            **( {"anthropic-beta": ",".join(common_betas)} if common_betas else {} )
-        }
+        kwargs["default_headers"] = _isolated_auth_headers(
+            _anthropic_sdk,
+            auth_mode="api_key",
+            headers={
+                "User-Agent": "claude-code/0.1.0",
+                **({"anthropic-beta": ",".join(common_betas)} if common_betas else {}),
+            },
+        )
     elif _requires_bearer_auth(normalized_base_url):
         # Some Anthropic-compatible providers (e.g. MiniMax) expect the API key in
         # Authorization: Bearer *** for regular API keys. Route those endpoints
@@ -790,32 +826,45 @@ def build_anthropic_client(
         # not use Anthropic's sk-ant-api prefix and would otherwise be misread as
         # Anthropic OAuth/setup tokens.
         kwargs["auth_token"] = api_key
-        if common_betas:
-            kwargs["default_headers"] = {"anthropic-beta": ",".join(common_betas)}
+        kwargs["default_headers"] = _isolated_auth_headers(
+            _anthropic_sdk,
+            auth_mode="bearer",
+            headers={"anthropic-beta": ",".join(common_betas)} if common_betas else None,
+        )
     elif _is_third_party_anthropic_endpoint(base_url):
         # Third-party proxies (Microsoft Foundry, AWS Bedrock, etc.) use their
         # own API keys with x-api-key auth. Skip OAuth detection — their keys
         # don't follow Anthropic's sk-ant-* prefix convention and would be
         # misclassified as OAuth tokens.
         kwargs["api_key"] = api_key
-        if common_betas:
-            kwargs["default_headers"] = {"anthropic-beta": ",".join(common_betas)}
+        kwargs["default_headers"] = _isolated_auth_headers(
+            _anthropic_sdk,
+            auth_mode="api_key",
+            headers={"anthropic-beta": ",".join(common_betas)} if common_betas else None,
+        )
     elif _is_oauth_token(api_key):
         # OAuth access token / setup-token → Bearer auth + Claude Code identity.
         # Anthropic routes OAuth requests based on user-agent and headers;
         # without Claude Code's fingerprint, requests get intermittent 500s.
         all_betas = common_betas + _OAUTH_ONLY_BETAS
         kwargs["auth_token"] = api_key
-        kwargs["default_headers"] = {
-            "anthropic-beta": ",".join(all_betas),
-            "user-agent": f"claude-cli/{_get_claude_code_version()} (external, cli)",
-            "x-app": "cli",
-        }
+        kwargs["default_headers"] = _isolated_auth_headers(
+            _anthropic_sdk,
+            auth_mode="bearer",
+            headers={
+                "anthropic-beta": ",".join(all_betas),
+                "user-agent": f"claude-cli/{_get_claude_code_version()} (external, cli)",
+                "x-app": "cli",
+            },
+        )
     else:
         # Regular API key → x-api-key header + common betas
         kwargs["api_key"] = api_key
-        if common_betas:
-            kwargs["default_headers"] = {"anthropic-beta": ",".join(common_betas)}
+        kwargs["default_headers"] = _isolated_auth_headers(
+            _anthropic_sdk,
+            auth_mode="api_key",
+            headers={"anthropic-beta": ",".join(common_betas)} if common_betas else None,
+        )
 
     return _anthropic_sdk.Anthropic(**kwargs)
 
