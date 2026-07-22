@@ -127,9 +127,10 @@ test('enterprise desktop config rejects insecure non-loopback HTTP and ambiguous
   }
 })
 
-test('enterprise desktop config path order is machine, portable, then user', () => {
+test('enterprise desktop config path order keeps the bundled default last', () => {
   assert.deepEqual(
     resolveEnterpriseDesktopConfigPaths({
+      bundledConfigPath: 'D:\\Hermes\\resources\\enterprise\\enterprise-desktop.json',
       executablePath: 'D:\\Hermes\\Hermes.exe',
       programData: 'C:\\ProgramData',
       userDataPath: 'C:\\Users\\Ada\\AppData\\Roaming\\Hermes'
@@ -137,9 +138,32 @@ test('enterprise desktop config path order is machine, portable, then user', () 
     [
       'C:\\ProgramData\\Hermes\\enterprise-desktop.json',
       'D:\\Hermes\\enterprise-desktop.json',
-      'C:\\Users\\Ada\\AppData\\Roaming\\Hermes\\enterprise\\enterprise-desktop.json'
+      'C:\\Users\\Ada\\AppData\\Roaming\\Hermes\\enterprise\\enterprise-desktop.json',
+      'D:\\Hermes\\resources\\enterprise\\enterprise-desktop.json'
     ]
   )
+})
+
+test('enterprise desktop config falls back to a bundled deployment default', () => {
+  const config = loadEnterpriseDesktopConfig(
+    ['machine.json', 'portable.json', 'user.json', 'bundled.json'],
+    {
+      readFileSync: reader({
+        'bundled.json': JSON.stringify({
+          allowInsecureLanHttp: true,
+          enabled: true,
+          gatewayUrl: 'http://172.31.1.49:6500',
+          schemaVersion: 1
+        })
+      })
+    }
+  )
+
+  assert.deepEqual(config, {
+    allowInsecureLanHttp: true,
+    enabled: true,
+    gatewayUrl: 'http://172.31.1.49:6500'
+  })
 })
 
 test('enterprise desktop config paths omit unavailable machine config on non-Windows hosts', () => {

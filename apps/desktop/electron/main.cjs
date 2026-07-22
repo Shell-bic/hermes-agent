@@ -405,6 +405,9 @@ const ENTERPRISE_SKILL_INSTALL_OPERATION_STORE_PATH = path.join(
 )
 const ENTERPRISE_RUNTIME_OPTIONS = resolveEnterpriseRuntimeOptions(process.env, {
   configPaths: resolveEnterpriseDesktopConfigPaths({
+    bundledConfigPath: app.isPackaged
+      ? path.join(process.resourcesPath, 'enterprise', 'enterprise-desktop.json')
+      : null,
     executablePath: process.execPath,
     programData: process.env.PROGRAMDATA,
     userDataPath: app.getPath('userData')

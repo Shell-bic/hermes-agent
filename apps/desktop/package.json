@@ -2,7 +2,7 @@
   "name": "hermes",
   "productName": "Hermes",
   "private": true,
-  "version": "0.16.1",
+  "version": "0.16.2",
   "description": "Native desktop shell for Hermes Agent.",
   "author": "Nous Research",
   "type": "module",
@@ -190,6 +190,10 @@
       {
         "from": "build/offline-runtime",
         "to": "offline-runtime"
+      },
+      {
+        "from": "deployment/enterprise/enterprise-desktop.default.json",
+        "to": "enterprise/enterprise-desktop.json"
       },
       {
         "from": "assets/icon.ico",

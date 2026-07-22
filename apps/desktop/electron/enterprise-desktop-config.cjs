@@ -34,7 +34,13 @@ function normalizeEnterpriseDesktopGatewayUrl(
   return normalized
 }
 
-function resolveEnterpriseDesktopConfigPaths({ executablePath, pathApi = path, programData, userDataPath } = {}) {
+function resolveEnterpriseDesktopConfigPaths({
+  bundledConfigPath,
+  executablePath,
+  pathApi = path,
+  programData,
+  userDataPath
+} = {}) {
   const paths = []
 
   if (programData) {
@@ -45,6 +51,9 @@ function resolveEnterpriseDesktopConfigPaths({ executablePath, pathApi = path, p
   }
   if (userDataPath) {
     paths.push(pathApi.join(userDataPath, 'enterprise', 'enterprise-desktop.json'))
+  }
+  if (bundledConfigPath) {
+    paths.push(bundledConfigPath)
   }
 
   return paths

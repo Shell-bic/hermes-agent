@@ -56,3 +56,23 @@ test('desktop package and Python runtime publish the same semantic version', () 
 
   assert.equal(desktopPackage.version, runtimeVersion)
 })
+
+test('enterprise Windows package embeds the LAN Gateway deployment default', () => {
+  const desktopPackage = JSON.parse(read('apps/desktop/package.json'))
+  const deploymentConfig = JSON.parse(read('apps/desktop/deployment/enterprise/enterprise-desktop.default.json'))
+  const desktopMain = read('apps/desktop/electron/main.cjs')
+
+  assert.ok(
+    desktopPackage.build.extraResources.some(resource =>
+      resource.from === 'deployment/enterprise/enterprise-desktop.default.json' &&
+      resource.to === 'enterprise/enterprise-desktop.json'
+    )
+  )
+  assert.deepEqual(deploymentConfig, {
+    allowInsecureLanHttp: true,
+    enabled: true,
+    gatewayUrl: 'http://172.31.1.49:6500',
+    schemaVersion: 1
+  })
+  assert.match(desktopMain, /app\.isPackaged[\s\S]*resourcesPath, 'enterprise', 'enterprise-desktop\.json'/)
+})

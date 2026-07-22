@@ -10,30 +10,16 @@ Desktop 只需要 Enterprise Gateway 地址，不保存企业微信 `CorpSecret`
 
 ## 安装版（推荐）
 
-以管理员 PowerShell 运行：
+当前企业离线发行包已经内置 Gateway `http://172.31.1.49:6500`，并启用仅限私网 IP 的 HTTP 兼容开关。终端用户不需要运行 PowerShell、填写地址或创建 JSON；安装后直接启动 Hermes 即进入企业统一登录页。
 
-```powershell
-.\Configure-HermesEnterprise.ps1 -GatewayUrl "https://gateway.example.com" -Scope Machine
-```
-
-配置写入 `%ProgramData%\Hermes\enterprise-desktop.json`，同一台机器的所有用户生效。没有管理员权限时可使用 `-Scope User`，写入当前用户的 `%APPDATA%\Hermes\enterprise\enterprise-desktop.json`。
-
-局域网内部联调尚未配置 HTTPS 时，可显式开启仅限私网 IP 的 HTTP 开关：
-
-```powershell
-.\Configure-HermesEnterprise.ps1 `
-  -GatewayUrl "http://172.31.1.49:6500" `
-  -Scope User `
-  -AllowInsecureLanHttp
-```
-
-该开关只接受 `10.0.0.0/8`、`172.16.0.0/12`、`192.168.0.0/16` 或 IPv6 unique-local 地址字面量；域名和公网 IP 即使打开开关也会被拒绝。它只用于内部联调，生产发布仍须使用 HTTPS。
+内置配置位于安装资源 `resources/enterprise/enterprise-desktop.json`。它不包含账号、Token、CorpSecret 或任何企业微信凭据。
 
 推荐安装顺序：
 
 1. 运行 `Hermes-*-win-*.exe` 安装 Desktop。
-2. 以管理员 PowerShell 运行上面的配置命令。
-3. 启动或完全重启 Hermes；未登录用户会进入统一登录页。
+2. 启动 Hermes；未登录用户会直接进入统一登录页。
+
+如果以后 Gateway 地址变化，管理员仍可通过 `%ProgramData%\Hermes\enterprise-desktop.json` 统一覆盖内置默认值；重新发布新安装包时则应同步替换 `enterprise-desktop.default.json`。
 
 ## 离线首次启动包
 
@@ -55,6 +41,7 @@ npm run dist:win:nsis
 .\deployment\enterprise\Publish-HermesEnterpriseDesktop.ps1 `
   -OutputDirectory <output> `
   -RequireOfflineRuntime `
+  -RequireEmbeddedEnterpriseConfig `
   -Force
 ```
 
@@ -70,7 +57,7 @@ npm run dist:win:nsis
 
 - 生产 Gateway 必须使用 `https://`；localhost 可直接使用 `http://`，私网 IP HTTP 还必须在部署配置中显式设置 `allowInsecureLanHttp: true`。
 - `GatewayUrl` 必须是纯 origin，例如 `https://gateway.example.com:8443`；不能带用户名、密码、查询参数、fragment 或 `/wecom` 等路径。
-- `%ProgramData%` 机器配置 > 可执行文件同目录配置 > 当前用户配置。只要任意部署配置文件存在，就完全忽略用户环境变量；仅当三处配置都不存在时，才兼容开发环境变量。
+- `%ProgramData%` 机器配置 > 可执行文件同目录配置 > 当前用户配置 > 包内默认配置。只要任意部署配置文件存在，就完全忽略用户环境变量；仅当四处配置都不存在时，才兼容开发环境变量。
 - JSON 允许 `schemaVersion`、`enabled`、`gatewayUrl`、`allowInsecureLanHttp` 及当前个人 Bot 运行时兼容字段。出现任何企业微信凭据字段时 Desktop 会拒绝启动企业配置。
 
 ## 分发包校验

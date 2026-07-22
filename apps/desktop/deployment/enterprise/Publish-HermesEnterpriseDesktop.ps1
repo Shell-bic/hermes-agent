@@ -7,6 +7,8 @@ param(
 
     [switch]$RequireOfflineRuntime,
 
+    [switch]$RequireEmbeddedEnterpriseConfig,
+
     [switch]$Force
 )
 
@@ -35,6 +37,23 @@ if (Test-Path -LiteralPath $offlineRuntimeManifestPath -PathType Leaf) {
 }
 if ($RequireOfflineRuntime -and -not $offlineRuntimeManifest) {
     throw "Required offline runtime payload is missing from win-unpacked: $offlineRuntimeManifestPath"
+}
+
+$embeddedEnterpriseConfigPath = Join-Path $unpacked 'resources\enterprise\enterprise-desktop.json'
+$embeddedEnterpriseConfig = $null
+if (Test-Path -LiteralPath $embeddedEnterpriseConfigPath -PathType Leaf) {
+    $embeddedEnterpriseConfig = Get-Content -LiteralPath $embeddedEnterpriseConfigPath -Raw | ConvertFrom-Json
+}
+if ($RequireEmbeddedEnterpriseConfig -and -not $embeddedEnterpriseConfig) {
+    throw "Required embedded enterprise config is missing from win-unpacked: $embeddedEnterpriseConfigPath"
+}
+if ($embeddedEnterpriseConfig) {
+    if ($embeddedEnterpriseConfig.enabled -ne $true) {
+        throw 'Embedded enterprise config must enable enterprise mode.'
+    }
+    if ([string]::IsNullOrWhiteSpace([string]$embeddedEnterpriseConfig.gatewayUrl)) {
+        throw 'Embedded enterprise config must provide gatewayUrl.'
+    }
 }
 
 if (Test-Path -LiteralPath $outputRoot) {
@@ -139,8 +158,12 @@ $manifest = [ordered]@{
         sourceStateScope = 'all tracked repository changes plus untracked Desktop build inputs; unrelated untracked workspace files excluded'
     }
     configuration = [ordered]@{
+        embedded = [bool]$embeddedEnterpriseConfig
+        embeddedPath = if ($embeddedEnterpriseConfig) { 'resources/enterprise/enterprise-desktop.json' } else { $null }
+        embeddedGatewayUrl = if ($embeddedEnterpriseConfig) { [string]$embeddedEnterpriseConfig.gatewayUrl } else { $null }
+        installationReadyWithoutManualConfiguration = [bool]$embeddedEnterpriseConfig
         machinePath = '%ProgramData%\Hermes\enterprise-desktop.json'
-        precedence = @('machine', 'portable', 'user', 'environment fallback only when no deployment config exists')
+        precedence = @('machine', 'portable', 'user', 'bundled default', 'environment fallback only when no deployment config exists')
         allowedFields = @('schemaVersion', 'enabled', 'gatewayUrl', 'allowInsecureLanHttp', 'weComGatewayRunnerExperiment')
         gatewayUrlPolicy = 'HTTPS origin by default; loopback HTTP allowed; private IP HTTP requires explicit internal rehearsal gate'
         desktopSecretsAllowed = $false
