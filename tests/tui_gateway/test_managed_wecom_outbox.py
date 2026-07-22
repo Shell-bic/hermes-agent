@@ -23,6 +23,28 @@ def test_managed_source_context_requires_main_process_authorization(monkeypatch)
     assert server._managed_wecom_source_context(context) == context["source_context"]
 
 
+def test_managed_source_context_accepts_rotated_token_from_managed_env(tmp_path, monkeypatch):
+    stale = "gw_stale_source_token_1234567890"
+    fresh = "gw_fresh_source_token_1234567890"
+    monkeypatch.setenv("HERMES_ENTERPRISE_MANAGED", "1")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("COMPANY_GATEWAY_TOKEN", stale)
+    (tmp_path / ".env").write_text(
+        f'COMPANY_GATEWAY_TOKEN="{fresh}"\n',
+        encoding="utf-8",
+    )
+    context = {
+        "source_authorization": fresh,
+        "source_context": {
+            "binding_id": "11234567-89ab-4def-8abc-0123456789ab",
+            "conversation_id": "conversation-1",
+            "source": "wecom",
+        },
+    }
+
+    assert server._managed_wecom_source_context(context) == context["source_context"]
+
+
 def test_managed_wecom_source_metadata_persists_in_session_db(tmp_path):
     db = SessionDB(db_path=tmp_path / "state.db")
     try:

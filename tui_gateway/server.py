@@ -4153,7 +4153,9 @@ def _managed_wecom_source_context(params: dict) -> dict | None:
     source_context = params.get("source_context")
     if not isinstance(source_context, dict) or source_context.get("source") != "wecom":
         return None
-    expected = str(os.environ.get("COMPANY_GATEWAY_TOKEN") or "").strip()
+    from hermes_cli.enterprise_policy import current_enterprise_gateway_token
+
+    expected = current_enterprise_gateway_token()
     provided = str(params.get("source_authorization") or "").strip()
     if not expected or not provided or not hmac.compare_digest(provided, expected):
         raise ValueError("managed source authorization required")

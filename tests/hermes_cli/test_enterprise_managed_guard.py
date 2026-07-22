@@ -1,4 +1,5 @@
 import json
+import os
 
 import pytest
 import yaml
@@ -966,6 +967,59 @@ def test_runtime_provider_resolves_company_gateway_in_managed_mode(
     assert runtime["api_mode"] == "chat_completions"
     assert runtime["base_url"] == "https://gateway.example/v1"
     assert runtime["api_key"] == "gateway-token"
+
+
+def test_runtime_provider_refreshes_rotated_gateway_token_from_managed_env(
+    managed_policy, monkeypatch, _isolate_hermes_home
+):
+    from hermes_cli.config import get_hermes_home
+    from hermes_cli.runtime_provider import resolve_runtime_provider
+
+    home = get_hermes_home()
+    (home / "config.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "model": {"provider": "company-gateway", "default": "allowed/model"},
+                "providers": {
+                    "company-gateway": {
+                        "base_url": "https://gateway.example/v1",
+                        "key_env": "COMPANY_GATEWAY_TOKEN",
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    stale = "gw_stale_runtime_token_1234567890"
+    fresh = "gw_fresh_runtime_token_1234567890"
+    monkeypatch.setenv("COMPANY_GATEWAY_TOKEN", stale)
+    (home / ".env").write_text(
+        f'COMPANY_GATEWAY_TOKEN="{fresh}"\n',
+        encoding="utf-8",
+    )
+
+    runtime = resolve_runtime_provider(requested="company-gateway")
+
+    assert runtime["api_key"] == fresh
+    assert os.environ["COMPANY_GATEWAY_TOKEN"] == fresh
+
+
+def test_runtime_provider_ignores_non_gateway_token_in_managed_env(
+    managed_policy, monkeypatch, _isolate_hermes_home
+):
+    from hermes_cli.config import get_hermes_home
+    from hermes_cli.enterprise_policy import current_enterprise_gateway_token
+
+    home = get_hermes_home()
+    current = "gw_current_runtime_token_1234567890"
+    monkeypatch.setenv("COMPANY_GATEWAY_TOKEN", current)
+    (home / ".env").write_text(
+        'COMPANY_GATEWAY_TOKEN="dsk_not_a_gateway_token"\n',
+        encoding="utf-8",
+    )
+
+    assert current_enterprise_gateway_token() == current
+    assert os.environ["COMPANY_GATEWAY_TOKEN"] == current
 
 
 def test_enterprise_profile_token_resolves_runtime_profile_identity(

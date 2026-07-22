@@ -28,6 +28,8 @@ ENTERPRISE_GATEWAY_TOKEN_ENV = "COMPANY_GATEWAY_TOKEN"
 ENTERPRISE_PROFILE_PREFIX = "enterprise-profile:"
 ENTERPRISE_SKILL_POLICY_DENIED = "enterprise_skill_policy_denied"
 
+_ENTERPRISE_GATEWAY_TOKEN_PATTERN = re.compile(r"^gw_[A-Za-z0-9_-]{20,}$")
+
 _TRUE_VALUES = {"1", "true", "yes", "on"}
 _SAFE_ERROR_TOKEN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _WINDOWS_RESERVED_SKILL_NAMES = {
@@ -64,6 +66,56 @@ ROLE_MANAGEMENT_CAPABILITIES = frozenset({
 })
 
 _DEFAULT_DENY_CAPABILITIES = ROLE_MANAGEMENT_CAPABILITIES
+
+
+def current_enterprise_gateway_token() -> str:
+    """Return the latest managed Gateway token without exposing it.
+
+    Desktop may rotate the runtime manifest while the long-running Dashboard
+    and its workers remain alive.  Environment variables are process-local, so
+    those processes otherwise keep the token present at spawn time even after
+    Desktop atomically replaces the managed ``.env`` file.  Refresh only this
+    narrowly-scoped credential from the current ``HERMES_HOME`` and retain the
+    in-process value if the file is absent, incomplete, or malformed.
+    """
+
+    current = str(os.environ.get(ENTERPRISE_GATEWAY_TOKEN_ENV) or "").strip()
+    if not is_enterprise_managed():
+        return current
+
+    hermes_home = str(os.environ.get("HERMES_HOME") or "").strip()
+    if not hermes_home:
+        return current
+
+    try:
+        text = (Path(hermes_home) / ".env").read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        return current
+
+    prefix = f"{ENTERPRISE_GATEWAY_TOKEN_ENV}="
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line.startswith(prefix):
+            continue
+
+        value = line[len(prefix):].strip()
+        if value.startswith('"'):
+            try:
+                value = json.loads(value)
+            except (json.JSONDecodeError, TypeError):
+                return current
+        elif len(value) >= 2 and value[0] == value[-1] == "'":
+            value = value[1:-1]
+
+        candidate = str(value or "").strip()
+        if not _ENTERPRISE_GATEWAY_TOKEN_PATTERN.fullmatch(candidate):
+            return current
+
+        if candidate != current:
+            os.environ[ENTERPRISE_GATEWAY_TOKEN_ENV] = candidate
+        return candidate
+
+    return current
 
 _TOOL_POLICY_COLLECTION_KEYS = {
     "skills": ("skills",),

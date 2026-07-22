@@ -35,6 +35,7 @@ from hermes_cli.enterprise_policy import (
     ENTERPRISE_GATEWAY_TOKEN_ENV,
     ENTERPRISE_PROVIDER,
     EnterprisePolicyDenied,
+    current_enterprise_gateway_token,
     current_model_profile,
     is_enterprise_managed,
     load_enterprise_policy,
@@ -315,7 +316,7 @@ def _resolve_enterprise_gateway_runtime(
     policy = load_enterprise_policy()
     if not policy:
         raise _enterprise_bootstrap_error("enterprise policy snapshot is missing or invalid")
-    gateway_token = os.getenv(ENTERPRISE_GATEWAY_TOKEN_ENV, "").strip()
+    gateway_token = current_enterprise_gateway_token()
     if not gateway_token:
         raise _enterprise_bootstrap_error(
             f"{ENTERPRISE_GATEWAY_TOKEN_ENV} is missing"
