@@ -2162,7 +2162,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             api_kwargs, log_prefix=getattr(agent, "log_prefix", "")
         )
         # Use the Anthropic SDK's streaming context manager
-        with agent._anthropic_client.messages.stream(**api_kwargs) as stream:
+        with agent._anthropic_messages_client().messages.stream(**api_kwargs) as stream:
             # The Anthropic SDK exposes the raw httpx response on
             # ``stream.response``.  Snapshot diagnostic headers
             # immediately so they survive a stream that dies before the

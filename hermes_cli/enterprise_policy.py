@@ -19,6 +19,8 @@ from contextvars import ContextVar
 from pathlib import Path
 from typing import Any, Mapping, Optional
 
+from hermes_constants import get_hermes_home
+
 
 ENTERPRISE_MANAGED_ENV = "HERMES_ENTERPRISE_MANAGED"
 ENTERPRISE_POLICY_FILE_ENV = "HERMES_ENTERPRISE_TOOL_POLICY_FILE"
@@ -83,12 +85,8 @@ def current_enterprise_gateway_token() -> str:
     if not is_enterprise_managed():
         return current
 
-    hermes_home = str(os.environ.get("HERMES_HOME") or "").strip()
-    if not hermes_home:
-        return current
-
     try:
-        text = (Path(hermes_home) / ".env").read_text(encoding="utf-8")
+        text = (get_hermes_home() / ".env").read_text(encoding="utf-8")
     except (OSError, UnicodeError):
         return current
 

@@ -936,6 +936,41 @@ class TestCodexStreamCallbacks:
 class TestAnthropicStreamCallbacks:
     """Verify Anthropic streaming refreshes activity on every event."""
 
+    def test_anthropic_stream_uses_request_scoped_client(self):
+        from run_agent import AIAgent
+
+        agent = AIAgent(
+            api_key="test-key",
+            base_url="https://api.minimax.io/anthropic",
+            provider="minimax",
+            model="MiniMax-M2.7",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+        agent.api_mode = "anthropic_messages"
+        agent._interrupt_requested = False
+
+        final_message = SimpleNamespace(content=[], stop_reason="end_turn")
+        stream = MagicMock()
+        stream.__enter__ = MagicMock(return_value=stream)
+        stream.__exit__ = MagicMock(return_value=False)
+        stream.__iter__ = MagicMock(return_value=iter([]))
+        stream.get_final_message.return_value = final_message
+
+        request_client = MagicMock()
+        request_client.messages.stream.return_value = stream
+        stale_client = MagicMock()
+        agent._anthropic_client = stale_client
+        agent._anthropic_messages_client = MagicMock(return_value=request_client)
+
+        response = agent._interruptible_streaming_api_call({})
+
+        assert response is final_message
+        agent._anthropic_messages_client.assert_called_once_with()
+        request_client.messages.stream.assert_called_once_with()
+        stale_client.messages.stream.assert_not_called()
+
     def test_anthropic_stream_refreshes_activity_on_every_event(self):
         from run_agent import AIAgent
 

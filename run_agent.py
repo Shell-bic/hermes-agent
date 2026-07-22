@@ -3595,6 +3595,7 @@ class AIAgent:
         return True
 
     def _ensure_primary_openai_client(self, *, reason: str) -> Any:
+        self._refresh_enterprise_gateway_credentials()
         with self._openai_client_lock():
             client = getattr(self, "client", None)
             if client is not None and not self._is_openai_client_closed(client):
@@ -3866,6 +3867,131 @@ class AIAgent:
         logger.info("Copilot credentials refreshed from %s", token_source)
         return True
 
+    def _refresh_enterprise_gateway_credentials(self) -> bool:
+        """Adopt the current managed Gateway token before each model request.
+
+        Desktop atomically replaces the managed ``.env`` after login, role
+        changes, or runtime-manifest renewal.  AIAgent and both SDKs otherwise
+        retain the token that existed when the long-running process started.
+        Build the replacement client first, then swap it under the existing
+        client lock so a construction failure never leaves mixed metadata and
+        transport state.
+        """
+        if str(getattr(self, "provider", "") or "").strip().lower() != "company-gateway":
+            return False
+
+        from hermes_cli.enterprise_policy import current_enterprise_gateway_token
+
+        new_token = current_enterprise_gateway_token()
+        if not isinstance(new_token, str) or not new_token.strip():
+            return False
+        new_token = new_token.strip()
+
+        if self.api_mode == "anthropic_messages":
+            with self._openai_client_lock():
+                active_token = str(getattr(self, "_anthropic_api_key", "") or "").strip()
+            if new_token == active_token:
+                return False
+
+            from agent.anthropic_adapter import build_anthropic_client
+
+            try:
+                candidate = build_anthropic_client(
+                    new_token,
+                    getattr(self, "_anthropic_base_url", None),
+                    timeout=get_provider_request_timeout(self.provider, self.model),
+                    drop_context_1m_beta=bool(
+                        getattr(self, "_oauth_1m_beta_disabled", False)
+                    ),
+                )
+            except Exception as exc:
+                logger.warning("Failed to rebuild Enterprise Gateway Anthropic client")
+                raise RuntimeError(
+                    "Failed to refresh Enterprise Gateway credentials"
+                ) from exc
+
+            with self._openai_client_lock():
+                active_token = str(getattr(self, "_anthropic_api_key", "") or "").strip()
+                if new_token == active_token:
+                    try:
+                        candidate.close()
+                    except Exception:
+                        pass
+                    return False
+                old_client = getattr(self, "_anthropic_client", None)
+                self._anthropic_client = candidate
+                self._anthropic_api_key = new_token
+                self.api_key = new_token
+                self._is_anthropic_oauth = False
+                primary = getattr(self, "_primary_runtime", None)
+                if isinstance(primary, dict) and primary.get("provider") == "company-gateway":
+                    primary["api_key"] = new_token
+                    primary["anthropic_api_key"] = new_token
+
+            from agent.enterprise_channel_audit import _install_request_hooks
+
+            _install_request_hooks(self)
+            if old_client is not None:
+                try:
+                    old_client.close()
+                except Exception:
+                    pass
+            logger.info("Enterprise Gateway credentials refreshed")
+            return True
+
+        if self.api_mode not in {"chat_completions", "codex_responses"}:
+            return False
+
+        with self._openai_client_lock():
+            active_token = str(self._client_kwargs.get("api_key") or "").strip()
+            if new_token == active_token:
+                return False
+            candidate_kwargs = dict(self._client_kwargs)
+            candidate_kwargs["api_key"] = new_token
+
+        try:
+            candidate = self._create_openai_client(
+                candidate_kwargs,
+                reason="enterprise_gateway_credential_refresh",
+                shared=True,
+            )
+        except Exception as exc:
+            logger.warning("Failed to rebuild Enterprise Gateway OpenAI client")
+            raise RuntimeError(
+                "Failed to refresh Enterprise Gateway credentials"
+            ) from exc
+
+        with self._openai_client_lock():
+            active_token = str(self._client_kwargs.get("api_key") or "").strip()
+            if new_token == active_token:
+                self._close_openai_client(
+                    candidate,
+                    reason="duplicate_enterprise_gateway_credential_refresh",
+                    shared=True,
+                )
+                return False
+            old_client = getattr(self, "client", None)
+            self._client_kwargs = candidate_kwargs
+            self.client = candidate
+            self.api_key = new_token
+            primary = getattr(self, "_primary_runtime", None)
+            if isinstance(primary, dict) and primary.get("provider") == "company-gateway":
+                primary["api_key"] = new_token
+                primary_kwargs = primary.get("client_kwargs")
+                if isinstance(primary_kwargs, dict):
+                    primary_kwargs["api_key"] = new_token
+
+        from agent.enterprise_channel_audit import _install_request_hooks
+
+        _install_request_hooks(self)
+        self._close_openai_client(
+            old_client,
+            reason="replace:enterprise_gateway_credential_refresh",
+            shared=True,
+        )
+        logger.info("Enterprise Gateway credentials refreshed")
+        return True
+
     def _try_refresh_anthropic_client_credentials(self) -> bool:
         if self.api_mode != "anthropic_messages" or not hasattr(self, "_anthropic_api_key"):
             return False
@@ -4050,8 +4176,6 @@ class AIAgent:
         return pool.has_available()
 
     def _anthropic_messages_create(self, api_kwargs: dict):
-        if self.api_mode == "anthropic_messages":
-            self._try_refresh_anthropic_client_credentials()
         # Defensive: strip Responses-only kwargs that can leak in under an
         # api_mode-flip race (the Anthropic SDK raises a non-retryable
         # TypeError on them). See #31673.
@@ -4059,7 +4183,13 @@ class AIAgent:
         sanitize_anthropic_kwargs(
             api_kwargs, log_prefix=getattr(self, "log_prefix", "")
         )
-        return self._anthropic_client.messages.create(**api_kwargs)
+        return self._anthropic_messages_client().messages.create(**api_kwargs)
+
+    def _anthropic_messages_client(self):
+        """Return the current Anthropic SDK client for this request."""
+        self._refresh_enterprise_gateway_credentials()
+        self._try_refresh_anthropic_client_credentials()
+        return self._anthropic_client
 
     def _rebuild_anthropic_client(self) -> None:
         """Rebuild the Anthropic client after an interrupt or stale call.

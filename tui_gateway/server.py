@@ -2264,16 +2264,27 @@ def _apply_model_switch(
             }
 
     if pin_session_override and isinstance(session, dict):
-        session["model_override"] = {
+        model_override = {
             "model": result.new_model,
             "provider": result.target_provider,
-            "base_url": result.base_url,
-            "api_key": result.api_key,
-            "api_mode": result.api_mode,
             "model_profile_id": enterprise_selection.get("profile_id") or None,
             "request_overrides": enterprise_request_overrides or None,
             "max_tokens": enterprise_max_tokens,
         }
+        from hermes_cli.enterprise_policy import ENTERPRISE_PROVIDER, is_enterprise_managed
+
+        if not (
+            is_enterprise_managed()
+            and str(result.target_provider or "").strip().lower() == ENTERPRISE_PROVIDER
+        ):
+            model_override.update(
+                {
+                    "base_url": result.base_url,
+                    "api_key": result.api_key,
+                    "api_mode": result.api_mode,
+                }
+            )
+        session["model_override"] = model_override
 
     if agent:
         agent.switch_model(
@@ -3638,14 +3649,20 @@ def _make_agent(
             target_model=override_selection or model or None,
             **resolve_kwargs,
         )
+        from hermes_cli.enterprise_policy import ENTERPRISE_PROVIDER, is_enterprise_managed
+
+        managed_company_gateway = (
+            is_enterprise_managed()
+            and str(runtime.get("provider") or "").strip().lower() == ENTERPRISE_PROVIDER
+        )
         # The switch already resolved concrete credentials/endpoint; honor them
         # so a custom/named endpoint survives the rebuild even if global
         # resolution would pick a different one.
-        if override_base_url:
+        if override_base_url and not managed_company_gateway:
             runtime["base_url"] = override_base_url
-        if override_api_key:
+        if override_api_key and not managed_company_gateway:
             runtime["api_key"] = override_api_key
-        if override_api_mode:
+        if override_api_mode and not managed_company_gateway:
             runtime["api_mode"] = override_api_mode
         request_overrides = _merge_request_overrides(
             runtime.get("request_overrides"),

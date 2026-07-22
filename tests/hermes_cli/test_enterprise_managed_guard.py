@@ -1022,6 +1022,38 @@ def test_runtime_provider_ignores_non_gateway_token_in_managed_env(
     assert os.environ["COMPANY_GATEWAY_TOKEN"] == current
 
 
+def test_gateway_token_reader_honors_context_local_managed_home(
+    managed_policy, monkeypatch, tmp_path
+):
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    from hermes_cli.enterprise_policy import current_enterprise_gateway_token
+
+    process_home = tmp_path / "process-home"
+    process_home.mkdir()
+    (process_home / ".env").write_text(
+        'COMPANY_GATEWAY_TOKEN="gw_process_home_token_1234567890"\n',
+        encoding="utf-8",
+    )
+    managed_home = tmp_path / "managed-user-home"
+    managed_home.mkdir()
+    managed_token = "gw_managed_user_token_1234567890"
+    (managed_home / ".env").write_text(
+        f'COMPANY_GATEWAY_TOKEN="{managed_token}"\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(process_home))
+    monkeypatch.setenv(
+        "COMPANY_GATEWAY_TOKEN",
+        "gw_stale_process_token_1234567890",
+    )
+
+    context_token = set_hermes_home_override(managed_home)
+    try:
+        assert current_enterprise_gateway_token() == managed_token
+    finally:
+        reset_hermes_home_override(context_token)
+
+
 def test_enterprise_profile_token_resolves_runtime_profile_identity(
     managed_policy, monkeypatch, _isolate_hermes_home
 ):

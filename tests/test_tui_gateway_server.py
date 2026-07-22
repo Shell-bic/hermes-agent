@@ -3256,6 +3256,9 @@ def test_enterprise_config_set_model_allows_authorized_company_gateway(
         override = server._sessions["sid"]["model_override"]
         assert override["model"] == "allowed/model"
         assert override["provider"] == "company-gateway"
+        assert "api_key" not in override
+        assert "base_url" not in override
+        assert "api_mode" not in override
     finally:
         server._sessions.clear()
         reset_hermes_home_override(token)
@@ -3298,11 +3301,57 @@ def test_enterprise_config_set_model_profile_token_pins_request_overrides(
         assert override["request_overrides"] == {
             "extra_body": {"modelProfileId": "profile-allowed"}
         }
+        assert "api_key" not in override
+        assert "base_url" not in override
+        assert "api_mode" not in override
         assert agent.request_overrides == {
             "extra_body": {"modelProfileId": "profile-allowed"}
         }
     finally:
         server._sessions.clear()
+        reset_hermes_home_override(token)
+        _reset_server_config_cache()
+
+
+def test_enterprise_agent_rebuild_ignores_stale_session_transport_credentials(
+    monkeypatch, tmp_path
+):
+    token = _setup_enterprise_model_guard(monkeypatch, tmp_path)
+    managed_home = tmp_path / ".hermes"
+    fresh_token = "gw_fresh_runtime_token_1234567890"
+    (managed_home / ".env").write_text(
+        f'COMPANY_GATEWAY_TOKEN="{fresh_token}"\n',
+        encoding="utf-8",
+    )
+    stale_override = {
+        "model": "allowed/model",
+        "provider": "company-gateway",
+        "base_url": "https://stale-gateway.example/v1",
+        "api_key": "gw_stale_runtime_token_1234567890",
+        "api_mode": "codex_responses",
+    }
+    try:
+        with (
+            patch.object(server, "_get_db", return_value=MagicMock()),
+            patch.object(server, "_load_reasoning_config", return_value=None),
+            patch.object(server, "_load_service_tier", return_value=None),
+            patch.object(server, "_load_enabled_toolsets", return_value=None),
+            patch("run_agent.AIAgent") as mock_agent,
+        ):
+            server._make_agent(
+                "sid-enterprise",
+                "key-enterprise",
+                model_override=stale_override,
+                startup_skills=[],
+                startup_skill_policy={},
+            )
+
+        kwargs = mock_agent.call_args.kwargs
+        assert kwargs["provider"] == "company-gateway"
+        assert kwargs["base_url"] == "https://gateway.example/v1"
+        assert kwargs["api_key"] == fresh_token
+        assert kwargs["api_mode"] == "chat_completions"
+    finally:
         reset_hermes_home_override(token)
         _reset_server_config_cache()
 
