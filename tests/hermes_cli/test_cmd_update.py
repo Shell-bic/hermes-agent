@@ -39,6 +39,17 @@ def mock_args():
     return SimpleNamespace()
 
 
+def test_enterprise_managed_update_is_blocked_before_any_install_or_git_probe(mock_args, monkeypatch, capsys):
+    monkeypatch.setenv("HERMES_ENTERPRISE_MANAGED", "1")
+
+    with patch("hermes_cli.config.detect_install_method") as detect_install, patch("subprocess.run") as run:
+        cmd_update(mock_args)
+
+    assert "managed by the enterprise release channel" in capsys.readouterr().err
+    detect_install.assert_not_called()
+    run.assert_not_called()
+
+
 # ---------------------------------------------------------------------------
 # Managed-uv compatibility for tests that patch shutil.which
 # ---------------------------------------------------------------------------
@@ -184,7 +195,7 @@ class TestCmdUpdateBranchFallback:
         """Regression for issue #26172: forks whose local HEAD already matches
         origin/main must still consult upstream/main before printing
         "Already up to date!" — otherwise a fork that's caught up to its own
-        origin but behind NousResearch/hermes-agent silently misses updates.
+        origin but behind the enterprise release repository silently misses updates.
         """
         from hermes_cli import main as hm
 
@@ -199,7 +210,9 @@ class TestCmdUpdateBranchFallback:
         ), patch.object(hm, "_sync_with_upstream_if_needed") as sync_mock:
             cmd_update(mock_args)
 
-        sync_mock.assert_called_once_with(["git"], PROJECT_ROOT)
+        sync_mock.assert_called_once_with(
+            ["git", "-c", "windows.appendAtomically=false"], PROJECT_ROOT
+        )
         captured = capsys.readouterr()
         assert "Already up to date!" in captured.out
 

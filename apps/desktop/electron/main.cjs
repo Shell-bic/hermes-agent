@@ -410,13 +410,19 @@ const ENTERPRISE_RUNTIME_OPTIONS = resolveEnterpriseRuntimeOptions(process.env, 
     userDataPath: app.getPath('userData')
   })
 })
-// Branch-only WeCom experiment builds must never repair or update the shared
-// user runtime through the original Hermes `main` channel. Their Python root
-// is supplied explicitly by the experiment launcher, keeping the packaged
-// shell and its runtime on the same dirty worktree snapshot.
-const ENTERPRISE_WECOM_PINNED_RUNTIME =
+// The GatewayRunner is a normal enterprise feature once enabled by deployment
+// configuration. Only the explicit development launcher pins the Python root
+// to the current checkout; packaged enterprise builds must remain able to
+// bootstrap the exact release-stamped runtime on a fresh workstation.
+const ENTERPRISE_WECOM_GATEWAY_RUNNER_ENABLED =
   ENTERPRISE_RUNTIME_OPTIONS.weComGatewayRunnerExperiment === true ||
   process.env.HERMES_DESKTOP_WECOM_GATEWAY_RUNNER_EXPERIMENT === '1'
+const ENTERPRISE_WECOM_PINNED_RUNTIME =
+  process.env.HERMES_DESKTOP_WECOM_GATEWAY_RUNNER_EXPERIMENT === '1'
+// Enterprise runtime upgrades are owned by the enterprise release channel.
+// A client must never fetch or merge a public upstream branch in place.
+const ENTERPRISE_LOCAL_UPDATES_DISABLED =
+  ENTERPRISE_RUNTIME_OPTIONS.enabled || ENTERPRISE_WECOM_PINNED_RUNTIME
 const ENTERPRISE_MANAGED_OUTPUTS = ENTERPRISE_RUNTIME_OPTIONS.enabled || isEnterpriseManagedEnv(process.env)
 const ENTERPRISE_RENDERER_ARGUMENTS = ENTERPRISE_RUNTIME_OPTIONS.enabled
   ? [ENTERPRISE_MANAGED_RENDERER_ARGUMENT]
@@ -430,7 +436,10 @@ const enterpriseSkillInstallOperationStore = createEnterpriseSkillInstallOperati
   safeStorage
 })
 const enterpriseGatewayClient = ENTERPRISE_RUNTIME_OPTIONS.gatewayUrl
-  ? createEnterpriseGatewayClient({ baseUrl: ENTERPRISE_RUNTIME_OPTIONS.gatewayUrl })
+  ? createEnterpriseGatewayClient({
+      allowInsecureLanHttp: ENTERPRISE_RUNTIME_OPTIONS.allowInsecureLanHttp === true,
+      baseUrl: ENTERPRISE_RUNTIME_OPTIONS.gatewayUrl
+    })
   : null
 // Enterprise has one immutable managed runtime identity. The user/profile
 // selector and legacy connection files must never be able to turn it into a
@@ -440,6 +449,7 @@ const enterpriseManagedProfileGuard = createEnterpriseManagedProfileGuard({
 })
 let enterpriseLifecycle = null
 const enterpriseRuntime = createEnterpriseRuntime({
+  allowInsecureLanHttp: ENTERPRISE_RUNTIME_OPTIONS.allowInsecureLanHttp === true,
   authStore: enterpriseAuthStore,
   client: enterpriseGatewayClient,
   enabled: ENTERPRISE_RUNTIME_OPTIONS.enabled,
@@ -984,7 +994,7 @@ const enterpriseWeComController = createEnterpriseWeComController({
 const enterpriseWeComBotView = createEnterpriseWeComBotView({ BrowserWindow, rememberLog })
 const enterpriseWeComBotController = createEnterpriseWeComBotController({
   client: enterpriseRuntime.client,
-  desktopHostedRuntime: ENTERPRISE_WECOM_PINNED_RUNTIME,
+  desktopHostedRuntime: ENTERPRISE_WECOM_GATEWAY_RUNNER_ENABLED,
   getDesktopToken: () => enterpriseRuntime.getDesktopToken(),
   onBeforeBotRevoke: bindingId => enterpriseWeComGatewayRunnerExperiment.detach(bindingId),
   onBindingCompleted: binding => {
@@ -1000,7 +1010,7 @@ const enterpriseWeComBotController = createEnterpriseWeComBotController({
 })
 const enterpriseWeComGatewayRunnerExperiment = createEnterpriseWeComGatewayRunnerExperiment({
   client: enterpriseRuntime.client,
-  enabled: ENTERPRISE_WECOM_PINNED_RUNTIME,
+  enabled: ENTERPRISE_WECOM_GATEWAY_RUNNER_ENABLED,
   gatewayBaseUrl: ENTERPRISE_RUNTIME_OPTIONS.gatewayUrl,
   getDesktopToken: () => enterpriseRuntime.getDesktopToken(),
   getGatewayServiceToken: () => enterpriseRuntime.getGatewayToken(),
@@ -1958,11 +1968,11 @@ async function resolveHealedBranch(updateRoot, branch) {
 }
 
 async function checkUpdates() {
-  if (ENTERPRISE_WECOM_PINNED_RUNTIME) {
+  if (ENTERPRISE_LOCAL_UPDATES_DISABLED) {
     return {
       supported: false,
-      reason: 'enterprise-experiment-pinned-runtime',
-      message: 'Updates are disabled while the WeCom GatewayRunner branch experiment is active.'
+      reason: 'enterprise-managed-update-disabled',
+      message: 'Updates are managed by the enterprise release channel.'
     }
   }
 
@@ -2278,9 +2288,9 @@ function spawnDetachedForMaintenance(command, args, options) {
 // only this apply action changed.
 async function applyUpdates(opts = {}) {
   return updateOperationGate.run(async ({ markTerminal }) => {
-    if (ENTERPRISE_WECOM_PINNED_RUNTIME) {
-      const error = new Error('Updates are disabled while the WeCom GatewayRunner branch experiment is active.')
-      error.code = 'enterprise-experiment-update-disabled'
+    if (ENTERPRISE_LOCAL_UPDATES_DISABLED) {
+      const error = new Error('Updates are managed by the enterprise release channel.')
+      error.code = 'enterprise-managed-update-disabled'
       throw error
     }
     const updater = resolveUpdaterBinary()
@@ -2375,6 +2385,7 @@ async function applyUpdates(opts = {}) {
 
 async function handOffWindowsBootstrapRecovery(reason) {
   if (!IS_WINDOWS || !IS_PACKAGED) return false
+  if (ENTERPRISE_LOCAL_UPDATES_DISABLED) return false
 
   const updater = resolveUpdaterBinary()
   if (!updater) return false
@@ -7171,9 +7182,16 @@ ipcMain.handle('hermes:updates:apply', async (_event, payload) =>
   }))
 )
 
-ipcMain.handle('hermes:updates:branch:get', async () => readDesktopUpdateConfig())
+ipcMain.handle('hermes:updates:branch:get', async () =>
+  ENTERPRISE_LOCAL_UPDATES_DISABLED
+    ? { branch: DEFAULT_UPDATE_BRANCH, managedExternally: true }
+    : readDesktopUpdateConfig()
+)
 
 ipcMain.handle('hermes:updates:branch:set', async (_event, name) => {
+  if (ENTERPRISE_LOCAL_UPDATES_DISABLED) {
+    return { branch: DEFAULT_UPDATE_BRANCH, managedExternally: true }
+  }
   const branch = typeof name === 'string' && name.trim() ? name.trim() : DEFAULT_UPDATE_BRANCH
   writeDesktopUpdateConfig({ branch })
   return { branch }

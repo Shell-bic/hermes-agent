@@ -264,6 +264,13 @@ class TestWebServerEndpoints:
 
         assert web_server._dashboard_local_update_managed_externally() is True
 
+    def test_dashboard_update_capability_detects_enterprise_managed_runtime(self, monkeypatch):
+        import hermes_cli.web_server as web_server
+
+        monkeypatch.setenv("HERMES_ENTERPRISE_MANAGED", "1")
+
+        assert web_server._dashboard_local_update_managed_externally() is True
+
     # ── GET /api/media (remote image display) ───────────────────────────
 
     def test_get_media_serves_image_in_root(self):

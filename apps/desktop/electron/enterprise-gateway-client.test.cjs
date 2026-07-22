@@ -22,7 +22,7 @@ function jsonResponse(payload, { ok = true, status = 200, statusText = 'OK' } = 
   }
 }
 
-test('enterprise Gateway URL requires HTTPS except for localhost rehearsal', () => {
+test('enterprise Gateway URL requires HTTPS except for localhost or explicitly allowed private IP rehearsal', () => {
   assert.equal(
     normalizeEnterpriseGatewayBaseUrl('https://gateway.example.com/path/'),
     'https://gateway.example.com/path'
@@ -30,6 +30,22 @@ test('enterprise Gateway URL requires HTTPS except for localhost rehearsal', () 
   assert.equal(normalizeEnterpriseGatewayBaseUrl('http://localhost:5100/'), 'http://localhost:5100')
   assert.equal(normalizeEnterpriseGatewayBaseUrl('http://127.0.0.1:5100/'), 'http://127.0.0.1:5100')
   assert.throws(() => normalizeEnterpriseGatewayBaseUrl('http://10.0.0.5:5100'), /must use https/)
+  assert.equal(
+    normalizeEnterpriseGatewayBaseUrl('http://172.31.1.49:6500/', { allowInsecureLanHttp: true }),
+    'http://172.31.1.49:6500'
+  )
+  assert.equal(
+    normalizeEnterpriseGatewayBaseUrl('http://192.168.1.20:6500', { allowInsecureLanHttp: true }),
+    'http://192.168.1.20:6500'
+  )
+  assert.throws(
+    () => normalizeEnterpriseGatewayBaseUrl('http://8.8.8.8:6500', { allowInsecureLanHttp: true }),
+    /must use https/
+  )
+  assert.throws(
+    () => normalizeEnterpriseGatewayBaseUrl('http://gateway.example.com:6500', { allowInsecureLanHttp: true }),
+    /must use https/
+  )
 })
 
 test('login methods normalize only explicitly enabled known methods and keep auth origin main-only', () => {

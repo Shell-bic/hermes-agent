@@ -107,7 +107,15 @@ test('a historical link from another Bot binding does not skip the new claim', a
         assert.equal(bindingId, newBinding.bindingId)
         return newClaim
       },
-      weComPersonalBotChannelIdentities: async () => [rawLink],
+      weComPersonalBotChannelIdentities: async () => [
+        rawLink,
+        {
+          ...rawLink,
+          botId: 'migrated-bot-id',
+          linkId: '61234567-89ab-4def-8abc-0123456789ab',
+          sourceBindingId: null
+        }
+      ],
       weComPersonalBotIdentityClaim: async () => {
         throw Object.assign(new Error('missing'), { code: 'identity_claim_not_found', status: 404 })
       }
@@ -198,7 +206,9 @@ test('claim and link validators retain only the required main-process identity f
   const link = validateIdentityLink(rawLink)
   assert.equal(link.channelUserIdHint, 'woPx…IrMg')
   assert.equal(link.sourceBindingId, binding.bindingId)
+  assert.equal(validateIdentityLink({ ...rawLink, sourceBindingId: null }).sourceBindingId, null)
   assert.equal(Object.hasOwn(link, 'channelUserId'), false)
   assert.equal(Object.hasOwn(link, 'corpId'), false)
   assert.throws(() => validateIdentityClaim({ ...claim, code: '12345' }, binding.bindingId), /invalid/)
+  assert.throws(() => validateIdentityLink({ ...rawLink, sourceBindingId: undefined }), /invalid/)
 })

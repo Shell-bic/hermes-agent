@@ -16,6 +16,18 @@ def test_version_string_no_v_prefix():
     assert not __version__.startswith("v"), f"__version__ should not start with 'v', got {__version__!r}"
 
 
+def test_enterprise_managed_update_check_never_touches_git_or_cache(tmp_path, monkeypatch):
+    from hermes_cli.banner import check_for_updates
+
+    monkeypatch.setenv("HERMES_ENTERPRISE_MANAGED", "1")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    with patch("hermes_cli.banner.subprocess.run") as run:
+        assert check_for_updates() is None
+
+    run.assert_not_called()
+    assert not (tmp_path / ".update_check").exists()
+
+
 def test_check_for_updates_uses_cache(tmp_path, monkeypatch):
     """When cache is fresh, check_for_updates should return cached value without calling git."""
     from hermes_cli.banner import check_for_updates
@@ -109,13 +121,13 @@ def test_check_for_updates_official_ssh_origin_uses_https_probe(tmp_path):
     def fake_run(cmd, **kwargs):
         calls.append(cmd)
         if cmd == ["git", "remote", "get-url", "origin"]:
-            return MagicMock(returncode=0, stdout="git@github.com:NousResearch/hermes-agent.git\n")
+            return MagicMock(returncode=0, stdout="git@github.com:Shell-bic/hermes-agent.git\n")
         if cmd == ["git", "rev-parse", "HEAD"]:
             return MagicMock(returncode=0, stdout="local-sha\n")
         if cmd == [
             "git",
             "ls-remote",
-            "https://github.com/NousResearch/hermes-agent.git",
+            "https://github.com/Shell-bic/hermes-agent.git",
             "refs/heads/main",
         ]:
             return MagicMock(returncode=0, stdout="upstream-sha\trefs/heads/main\n")

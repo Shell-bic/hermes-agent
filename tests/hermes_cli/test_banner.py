@@ -79,7 +79,7 @@ def test_build_welcome_banner_title_is_hyperlinked_to_release():
     import tools.mcp_tool as _mcp
 
     _banner._latest_release_cache = None
-    tag_url = ("v2026.4.23", "https://github.com/NousResearch/hermes-agent/releases/tag/v2026.4.23")
+    tag_url = ("v2026.4.23", "https://github.com/Shell-bic/hermes-agent/releases/tag/v2026.4.23")
 
     buf = io.StringIO()
     with (
@@ -89,7 +89,14 @@ def test_build_welcome_banner_title_is_hyperlinked_to_release():
         _patch.object(_mcp, "get_mcp_status", return_value=[]),
         _patch.object(_banner, "get_latest_release_tag", return_value=tag_url),
     ):
-        console = Console(file=buf, force_terminal=True, color_system="truecolor", width=160)
+        console = Console(
+            file=buf,
+            force_terminal=True,
+            force_interactive=True,
+            legacy_windows=False,
+            color_system="truecolor",
+            width=160,
+        )
         _banner.build_welcome_banner(
             console=console, model="x", cwd="/tmp",
             session_id="abc123",

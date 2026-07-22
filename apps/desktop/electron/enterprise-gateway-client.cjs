@@ -1,4 +1,27 @@
-function normalizeEnterpriseGatewayBaseUrl(rawUrl) {
+const net = require('node:net')
+
+function isPrivateNetworkIp(hostname) {
+  const value = String(hostname || '').trim().toLowerCase().replace(/^\[|\]$/g, '')
+  const ipVersion = net.isIP(value)
+
+  if (ipVersion === 4) {
+    const octets = value.split('.').map(Number)
+    return (
+      octets[0] === 10 ||
+      (octets[0] === 172 && octets[1] >= 16 && octets[1] <= 31) ||
+      (octets[0] === 192 && octets[1] === 168)
+    )
+  }
+
+  if (ipVersion === 6) {
+    const firstHextet = Number.parseInt(value.split(':', 1)[0], 16)
+    return Number.isInteger(firstHextet) && (firstHextet & 0xfe00) === 0xfc00
+  }
+
+  return false
+}
+
+function normalizeEnterpriseGatewayBaseUrl(rawUrl, { allowInsecureLanHttp = false } = {}) {
   const value = String(rawUrl || '').trim()
 
   if (!value) {
@@ -19,8 +42,11 @@ function normalizeEnterpriseGatewayBaseUrl(rawUrl) {
   const hostname = parsed.hostname.toLowerCase()
   const isLoopback =
     hostname === 'localhost' || hostname.endsWith('.localhost') || hostname === '127.0.0.1' || hostname === '[::1]'
-  if (parsed.protocol !== 'https:' && !isLoopback) {
-    throw new Error('Enterprise gateway URL must use https:// unless it points to localhost.')
+  const isAllowedPrivateHttp = allowInsecureLanHttp === true && isPrivateNetworkIp(hostname)
+  if (parsed.protocol !== 'https:' && !isLoopback && !isAllowedPrivateHttp) {
+    throw new Error(
+      'Enterprise gateway URL must use https:// unless it points to localhost or an explicitly allowed private IP.'
+    )
   }
 
   parsed.hash = ''
@@ -124,8 +150,8 @@ function normalizeLoginMethodsResponse(payload) {
 }
 
 class EnterpriseGatewayClient {
-  constructor({ baseUrl, fetchImpl = globalThis.fetch, timeoutMs = 10000 } = {}) {
-    this.baseUrl = normalizeEnterpriseGatewayBaseUrl(baseUrl)
+  constructor({ allowInsecureLanHttp = false, baseUrl, fetchImpl = globalThis.fetch, timeoutMs = 10000 } = {}) {
+    this.baseUrl = normalizeEnterpriseGatewayBaseUrl(baseUrl, { allowInsecureLanHttp })
     this.fetchImpl = fetchImpl
     this.timeoutMs = Math.max(100, Number(timeoutMs) || 10000)
   }
@@ -624,6 +650,7 @@ module.exports = {
   EnterpriseGatewayError,
   EnterpriseGatewayClient,
   createEnterpriseGatewayClient,
+  isPrivateNetworkIp,
   normalizeLoginMethodsResponse,
   normalizeEnterpriseGatewayBaseUrl,
   normalizeLoginResponse,

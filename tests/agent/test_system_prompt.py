@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from agent.system_prompt import (
+    ENTERPRISE_MANAGED_CONTEXT_GUIDANCE,
     ENTERPRISE_POLICY_BEHAVIOR_GUIDANCE,
     build_system_prompt_parts,
 )
@@ -101,13 +102,21 @@ class TestCodingContextBlock:
         assert "coding agent" not in _stable_prompt(agent)
 
 
-class TestEnterprisePolicyBehaviorGuidance:
+class TestEnterpriseManagedGuidance:
     def test_injected_only_in_enterprise_managed_mode(self, monkeypatch):
         monkeypatch.setenv("HERMES_ENTERPRISE_MANAGED", "1")
 
         stable = _stable_prompt(_make_agent())
 
+        assert ENTERPRISE_MANAGED_CONTEXT_GUIDANCE in stable
         assert ENTERPRISE_POLICY_BEHAVIOR_GUIDANCE in stable
+        assert "Reply in Simplified Chinese by default" in stable
+        assert "authenticated Desktop and Company Gateway principal" in stable
+        assert "WeCom conversation" in stable
+        assert "not blanket access" in stable
+        assert "official company" in stable
+        assert "hot switch within that gateway" in stable
+        assert "same visible model name or runtime model ID" in stable
         assert "scheduled-job prompt" in stable
         assert "filesystem, terminal, cache" in stable
 
@@ -116,4 +125,13 @@ class TestEnterprisePolicyBehaviorGuidance:
 
         stable = _stable_prompt(_make_agent())
 
+        assert ENTERPRISE_MANAGED_CONTEXT_GUIDANCE not in stable
         assert ENTERPRISE_POLICY_BEHAVIOR_GUIDANCE not in stable
+
+    def test_does_not_freeze_dynamic_model_or_identity_values(self):
+        # The block is cached for the session. It should teach the model how to
+        # consult live state after a hot switch instead of embedding a value
+        # that can become stale or exposing policy-snapshot identity fields.
+        assert "currentModelProfileId" not in ENTERPRISE_MANAGED_CONTEXT_GUIDANCE
+        assert "enterpriseUserId" not in ENTERPRISE_MANAGED_CONTEXT_GUIDANCE
+        assert "use live runtime state" in ENTERPRISE_MANAGED_CONTEXT_GUIDANCE

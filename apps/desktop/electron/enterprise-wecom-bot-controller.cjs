@@ -43,7 +43,8 @@ function validateIdentityLink(value) {
       typeof value.desktopUserId !== 'string' || typeof value.userName !== 'string' ||
       (value.displayName !== null && typeof value.displayName !== 'string') ||
       typeof value.channelUserIdHint !== 'string' || typeof value.verificationMethod !== 'string' ||
-      typeof value.sourceBindingId !== 'string' || !BINDING_ID_PATTERN.test(value.sourceBindingId) ||
+      (value.sourceBindingId !== null &&
+        (typeof value.sourceBindingId !== 'string' || !BINDING_ID_PATTERN.test(value.sourceBindingId))) ||
       parseRfc3339DateTime(value.verifiedAt) === null) {
     throw invalidIdentityResponse()
   }

@@ -1135,6 +1135,14 @@ clone_repo() {
             log_info "Existing installation found, updating..."
             cd "$INSTALL_DIR"
 
+            # Enterprise releases have one source authority. Existing
+            # checkouts may still carry the original Hermes origin or an
+            # auto-added upstream remote; remove both routes before fetching.
+            git remote set-url origin "$REPO_URL_HTTPS"
+            if git remote get-url upstream >/dev/null 2>&1; then
+                git remote remove upstream
+            fi
+
             local autostash_ref=""
             if [ -n "$(git status --porcelain)" ]; then
                 # A previously interrupted update can leave the index with

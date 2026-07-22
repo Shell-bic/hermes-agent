@@ -38,6 +38,35 @@ test('enterprise desktop config allows local HTTP for workstation rehearsal', ()
   assert.deepEqual(config, { enabled: true, gatewayUrl: 'http://127.0.0.1:5100' })
 })
 
+test('enterprise desktop config allows private IP HTTP only behind the explicit deployment gate', () => {
+  const config = readEnterpriseDesktopConfig('desktop.json', {
+    readFileSync: reader({
+      'desktop.json': JSON.stringify({
+        allowInsecureLanHttp: true,
+        schemaVersion: 1,
+        gatewayUrl: 'http://172.31.1.49:6500'
+      })
+    })
+  })
+
+  assert.deepEqual(config, {
+    allowInsecureLanHttp: true,
+    enabled: true,
+    gatewayUrl: 'http://172.31.1.49:6500'
+  })
+  assert.throws(
+    () => readEnterpriseDesktopConfig('desktop.json', {
+      readFileSync: reader({
+        'desktop.json': JSON.stringify({
+          allowInsecureLanHttp: true,
+          gatewayUrl: 'http://8.8.8.8:6500'
+        })
+      })
+    }),
+    /must use https/
+  )
+})
+
 test('enterprise desktop config keeps the GatewayRunner experiment default-off and machine-gated', () => {
   const disabled = readEnterpriseDesktopConfig('desktop.json', {
     readFileSync: reader({
@@ -148,5 +177,16 @@ test('enterprise desktop config rejects invalid JSON and incomplete enabled conf
         readFileSync: reader({ 'desktop.json': JSON.stringify({ schemaVersion: 1, enabled: true }) })
       }),
     /does not provide gatewayUrl/
+  )
+  assert.throws(
+    () => readEnterpriseDesktopConfig('desktop.json', {
+      readFileSync: reader({
+        'desktop.json': JSON.stringify({
+          allowInsecureLanHttp: 'yes',
+          gatewayUrl: 'https://gateway.example.com'
+        })
+      })
+    }),
+    /allowInsecureLanHttp must be a boolean/
   )
 })

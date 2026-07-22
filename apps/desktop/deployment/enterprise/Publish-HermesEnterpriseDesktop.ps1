@@ -111,9 +111,16 @@ $manifest = [ordered]@{
     configuration = [ordered]@{
         machinePath = '%ProgramData%\Hermes\enterprise-desktop.json'
         precedence = @('machine', 'portable', 'user', 'environment fallback only when no deployment config exists')
-        allowedFields = @('schemaVersion', 'enabled', 'gatewayUrl')
-        gatewayUrlPolicy = 'HTTPS origin only; loopback HTTP allowed for local rehearsal'
+        allowedFields = @('schemaVersion', 'enabled', 'gatewayUrl', 'allowInsecureLanHttp', 'weComGatewayRunnerExperiment')
+        gatewayUrlPolicy = 'HTTPS origin by default; loopback HTTP allowed; private IP HTTP requires explicit internal rehearsal gate'
         desktopSecretsAllowed = $false
+    }
+    updatePolicy = [ordered]@{
+        authority = 'https://github.com/Shell-bic/hermes-agent.git'
+        runtimePin = 'exact build commit'
+        clientLocalUpdate = $false
+        publicUpstreamAllowed = $false
+        delivery = 'new enterprise desktop package'
     }
     distribution = [ordered]@{
         supportedPlatforms = @('windows')

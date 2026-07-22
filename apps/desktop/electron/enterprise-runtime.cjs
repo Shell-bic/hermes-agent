@@ -80,8 +80,11 @@ function resolveEnterpriseRuntimeOptions(env = process.env, { configPaths = [], 
   const rawGatewayUrl = hasDeploymentConfig
     ? config.gatewayUrl
     : String(env.HERMES_ENTERPRISE_GATEWAY_URL || env.HERMES_DESKTOP_ENTERPRISE_GATEWAY_URL || '').trim()
+  const allowInsecureLanHttp = hasDeploymentConfig && config.allowInsecureLanHttp === true
   const gatewayUrl = rawGatewayUrl
-    ? normalizeEnterpriseDesktopGatewayUrl(rawGatewayUrl, hasDeploymentConfig ? configPath : 'environment')
+    ? normalizeEnterpriseDesktopGatewayUrl(rawGatewayUrl, hasDeploymentConfig ? configPath : 'environment', {
+        allowInsecureLanHttp
+      })
     : ''
   const enabled = hasDeploymentConfig
     ? config.enabled
@@ -90,6 +93,7 @@ function resolveEnterpriseRuntimeOptions(env = process.env, { configPaths = [], 
   return {
     enabled,
     gatewayUrl,
+    ...(allowInsecureLanHttp ? { allowInsecureLanHttp: true } : {}),
     ...(config.weComGatewayRunnerExperiment === true ? { weComGatewayRunnerExperiment: true } : {})
   }
 }
@@ -299,6 +303,7 @@ function publicStateWithPolicy(state, policy, refresh = {}) {
 class EnterpriseRuntime {
   constructor({
     authStore,
+    allowInsecureLanHttp = false,
     client,
     enabled,
     gatewayUrl,
@@ -313,10 +318,16 @@ class EnterpriseRuntime {
     userDataPath
   } = {}) {
     this.enabled = Boolean(enabled)
+    this.allowInsecureLanHttp = allowInsecureLanHttp === true
     this.gatewayUrl = gatewayUrl || ''
     this.getLifecycle = typeof getLifecycle === 'function' ? getLifecycle : null
     this.authStore = authStore
-    this.client = client || (this.enabled && this.gatewayUrl ? createEnterpriseGatewayClient({ baseUrl: this.gatewayUrl }) : null)
+    this.client = client || (this.enabled && this.gatewayUrl
+      ? createEnterpriseGatewayClient({
+          allowInsecureLanHttp: this.allowInsecureLanHttp,
+          baseUrl: this.gatewayUrl
+        })
+      : null)
     this.homeWriter = homeWriter
     this.managedIdentityBinder = typeof managedIdentityBinder === 'function' ? managedIdentityBinder : null
     this.managedHermesHome = managedHermesHome || ''

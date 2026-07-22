@@ -2,5 +2,6 @@
   "schemaVersion": 1,
   "enabled": true,
   "gatewayUrl": "https://gateway.example.com",
-  "weComGatewayRunnerExperiment": false
+  "allowInsecureLanHttp": false,
+  "weComGatewayRunnerExperiment": true
 }

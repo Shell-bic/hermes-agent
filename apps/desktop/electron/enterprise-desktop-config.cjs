@@ -5,15 +5,20 @@ const { normalizeEnterpriseGatewayBaseUrl } = require('./enterprise-gateway-clie
 
 const ENTERPRISE_DESKTOP_CONFIG_SCHEMA_VERSION = 1
 const ENTERPRISE_DESKTOP_CONFIG_KEYS = new Set([
+  'allowInsecureLanHttp',
   'enabled',
   'gatewayUrl',
   'schemaVersion',
   'weComGatewayRunnerExperiment'
 ])
 
-function normalizeEnterpriseDesktopGatewayUrl(rawUrl, configPath = 'enterprise desktop config') {
+function normalizeEnterpriseDesktopGatewayUrl(
+  rawUrl,
+  configPath = 'enterprise desktop config',
+  { allowInsecureLanHttp = false } = {}
+) {
   const value = String(rawUrl || '').trim()
-  const normalized = normalizeEnterpriseGatewayBaseUrl(value)
+  const normalized = normalizeEnterpriseGatewayBaseUrl(value, { allowInsecureLanHttp })
   const parsed = new URL(value)
 
   if (parsed.username || parsed.password) {
@@ -75,7 +80,7 @@ function readEnterpriseDesktopConfig(configPath, { readFileSync = fs.readFileSyn
   if (unknownKeys.length > 0) {
     throw new Error(
       `Enterprise desktop config ${configPath} contains unsupported fields: ${unknownKeys.join(', ')}. ` +
-        'Only schemaVersion, enabled, gatewayUrl, and the internal experiment gate are allowed; ' +
+        'Only schemaVersion, enabled, gatewayUrl, allowInsecureLanHttp, and the internal experiment gate are allowed; ' +
         'enterprise credentials belong on the auth service.'
     )
   }
@@ -94,6 +99,9 @@ function readEnterpriseDesktopConfig(configPath, { readFileSync = fs.readFileSyn
   if (parsed.gatewayUrl !== undefined && typeof parsed.gatewayUrl !== 'string') {
     throw new Error(`Enterprise desktop config ${configPath} field gatewayUrl must be a string.`)
   }
+  if (parsed.allowInsecureLanHttp !== undefined && typeof parsed.allowInsecureLanHttp !== 'boolean') {
+    throw new Error(`Enterprise desktop config ${configPath} field allowInsecureLanHttp must be a boolean.`)
+  }
   if (parsed.weComGatewayRunnerExperiment !== undefined && typeof parsed.weComGatewayRunnerExperiment !== 'boolean') {
     throw new Error(
       `Enterprise desktop config ${configPath} field weComGatewayRunnerExperiment must be a boolean.`
@@ -101,7 +109,10 @@ function readEnterpriseDesktopConfig(configPath, { readFileSync = fs.readFileSyn
   }
 
   const rawGatewayUrl = String(parsed.gatewayUrl || '').trim()
-  const gatewayUrl = rawGatewayUrl ? normalizeEnterpriseDesktopGatewayUrl(rawGatewayUrl, configPath) : ''
+  const allowInsecureLanHttp = parsed.allowInsecureLanHttp === true
+  const gatewayUrl = rawGatewayUrl
+    ? normalizeEnterpriseDesktopGatewayUrl(rawGatewayUrl, configPath, { allowInsecureLanHttp })
+    : ''
   const enabled = parsed.enabled === true || gatewayUrl.length > 0
   if (enabled && !gatewayUrl) {
     throw new Error(`Enterprise desktop config ${configPath} enables enterprise mode but does not provide gatewayUrl.`)
@@ -110,6 +121,7 @@ function readEnterpriseDesktopConfig(configPath, { readFileSync = fs.readFileSyn
   return {
     enabled,
     gatewayUrl,
+    ...(allowInsecureLanHttp ? { allowInsecureLanHttp: true } : {}),
     ...(parsed.weComGatewayRunnerExperiment === true ? { weComGatewayRunnerExperiment: true } : {})
   }
 }

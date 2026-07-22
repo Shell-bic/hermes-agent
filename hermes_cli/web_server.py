@@ -1536,6 +1536,10 @@ def _dashboard_local_update_managed_externally() -> bool:
     still behave like their actual install method in the CLI.
     """
     try:
+        from hermes_cli.enterprise_policy import is_enterprise_managed
+
+        if is_enterprise_managed():
+            return True
         from hermes_constants import is_container
 
         return is_container()

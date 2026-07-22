@@ -392,10 +392,12 @@ class EnterpriseWeComRelay {
     }
   }
 
-  async flushComposerOutbox(token) {
+  async flushComposerOutbox(token, activeBindingId) {
     const storeFile = typeof this.storePath === 'function' ? this.storePath() : this.storePath
     if (!storeFile) return
+    if (!/^[0-9a-fA-F-]{36}$/.test(String(activeBindingId || ''))) return
     const queueDir = path.join(path.dirname(storeFile), 'wecom-composer-outbox')
+    const orphanedDir = path.join(path.dirname(storeFile), 'wecom-composer-outbox-orphaned')
     let names
     try { names = fs.readdirSync(queueDir).filter(name => /^[a-f0-9]{32}\.json$/.test(name)) } catch { return }
     for (const name of names) {
@@ -406,6 +408,11 @@ class EnterpriseWeComRelay {
       if (!payload || Object.keys(payload).length !== fields.length || fields.some(field => !(field in payload)) ||
           !/^[0-9a-fA-F-]{36}$/.test(payload.bindingId) || !validId(payload.conversationId) ||
           !validId(payload.idempotencyKey, 512) || !safeText(payload.text)) {
+        continue
+      }
+      if (payload.bindingId.toLowerCase() !== activeBindingId.toLowerCase()) {
+        fs.mkdirSync(orphanedDir, { recursive: true })
+        fs.renameSync(file, path.join(orphanedDir, name))
         continue
       }
       await this.client.submitWeComPersonalBotOutbox(token, {
@@ -426,7 +433,7 @@ class EnterpriseWeComRelay {
       const lease = await this.client.acquireWeComPersonalBotRuntimeLease(token)
       if (lease?.status === 'lease-lost' || lease?.status === 'replaced') return this.updateState('lease-lost')
       await this.flushPending(token)
-      await this.flushComposerOutbox(token)
+      await this.flushComposerOutbox(token, lease?.bindingId)
       const batch = await this.client.leaseWeComPersonalBotInbox(token, { maxMessages: 4 })
       const messages = Array.isArray(batch?.messages) ? batch.messages.map(validateInboxMessage) : []
       for (const message of messages) {

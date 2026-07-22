@@ -86,6 +86,21 @@ test('resolveEnterpriseRuntimeOptions loads machine config without requiring a t
   })
 })
 
+test('resolveEnterpriseRuntimeOptions propagates the explicit private IP HTTP deployment gate', () => {
+  const readFileSync = () => JSON.stringify({
+    allowInsecureLanHttp: true,
+    schemaVersion: 1,
+    enabled: true,
+    gatewayUrl: 'http://172.31.1.49:6500'
+  })
+
+  assert.deepEqual(resolveEnterpriseRuntimeOptions({}, { configPaths: ['machine.json'], readFileSync }), {
+    allowInsecureLanHttp: true,
+    enabled: true,
+    gatewayUrl: 'http://172.31.1.49:6500'
+  })
+})
+
 test('resolveEnterpriseRuntimeOptions propagates only an explicit machine GatewayRunner experiment opt-in', () => {
   const readFileSync = () => JSON.stringify({
     schemaVersion: 1,

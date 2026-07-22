@@ -1152,6 +1152,15 @@ function Install-Repository {
             $ErrorActionPreference = "Continue"
             $autostashRef = ""
             try {
+                # Enterprise releases have one source authority. Existing
+                # installs may still carry the original Hermes origin or an
+                # auto-added upstream remote from the public updater; remove
+                # those routes before the first network operation.
+                git -c windows.appendAtomically=false remote set-url origin $RepoUrlHttps 2>$null
+                $upstreamUrl = git -c windows.appendAtomically=false remote get-url upstream 2>$null
+                if ($LASTEXITCODE -eq 0 -and -not [string]::IsNullOrWhiteSpace(($upstreamUrl -join "`n"))) {
+                    git -c windows.appendAtomically=false remote remove upstream 2>$null
+                }
                 # This is a MANAGED checkout, not a repo the user edits. Git for
                 # Windows defaults to core.autocrlf=true, which renormalizes the
                 # repo's LF-only text files to CRLF in the working tree -- so

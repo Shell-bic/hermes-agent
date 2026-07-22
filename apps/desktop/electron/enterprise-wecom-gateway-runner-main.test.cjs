@@ -65,22 +65,38 @@ test('old relay runs only when the experiment is disabled, including the no-bind
   assert.doesNotMatch(main, /wecomGatewayRunnerLaunch/)
 })
 
-test('branch experiment pins its explicit runtime and disables original main updater recovery', () => {
+test('enterprise release separates the production GatewayRunner from the dev-only pinned runtime', () => {
   assert.match(
     main,
-    /const ENTERPRISE_WECOM_PINNED_RUNTIME =[\s\S]*ENTERPRISE_RUNTIME_OPTIONS\.weComGatewayRunnerExperiment === true \|\|[\s\S]*HERMES_DESKTOP_WECOM_GATEWAY_RUNNER_EXPERIMENT === '1'/
+    /const ENTERPRISE_WECOM_GATEWAY_RUNNER_ENABLED =[\s\S]*ENTERPRISE_RUNTIME_OPTIONS\.weComGatewayRunnerExperiment === true \|\|[\s\S]*HERMES_DESKTOP_WECOM_GATEWAY_RUNNER_EXPERIMENT === '1'/
   )
   assert.match(
     main,
-    /async function checkUpdates\(\) \{[\s\S]*if \(ENTERPRISE_WECOM_PINNED_RUNTIME\)[\s\S]*enterprise-experiment-pinned-runtime/
+    /const ENTERPRISE_WECOM_PINNED_RUNTIME =\s*process\.env\.HERMES_DESKTOP_WECOM_GATEWAY_RUNNER_EXPERIMENT === '1'/
   )
   assert.match(
     main,
-    /async function applyUpdates\(opts = \{\}\) \{[\s\S]*if \(ENTERPRISE_WECOM_PINNED_RUNTIME\)[\s\S]*enterprise-experiment-update-disabled/
+    /const ENTERPRISE_LOCAL_UPDATES_DISABLED =[\s\S]*ENTERPRISE_RUNTIME_OPTIONS\.enabled \|\| ENTERPRISE_WECOM_PINNED_RUNTIME/
+  )
+  assert.match(
+    main,
+    /async function checkUpdates\(\) \{[\s\S]*if \(ENTERPRISE_LOCAL_UPDATES_DISABLED\)[\s\S]*enterprise-managed-update-disabled/
+  )
+  assert.match(
+    main,
+    /async function applyUpdates\(opts = \{\}\) \{[\s\S]*if \(ENTERPRISE_LOCAL_UPDATES_DISABLED\)[\s\S]*enterprise-managed-update-disabled/
   )
   assert.match(
     main,
     /if \(backend\.kind === 'bootstrap-needed'\) \{[\s\S]*if \(ENTERPRISE_WECOM_PINNED_RUNTIME\)[\s\S]*enterprise-experiment-runtime-unavailable[\s\S]*handOffWindowsBootstrapRecovery/
+  )
+  assert.match(
+    main,
+    /async function handOffWindowsBootstrapRecovery\(reason\) \{[\s\S]*if \(ENTERPRISE_LOCAL_UPDATES_DISABLED\) return false/
+  )
+  assert.match(
+    main,
+    /desktopHostedRuntime: ENTERPRISE_WECOM_GATEWAY_RUNNER_ENABLED[\s\S]*enabled: ENTERPRISE_WECOM_GATEWAY_RUNNER_ENABLED/
   )
   assert.match(main, /const venvRoot = resolvePythonVenvRoot\(root\)[\s\S]*pythonPathEntries: \[root\],[\s\S]*venvRoot/)
   assert.match(
