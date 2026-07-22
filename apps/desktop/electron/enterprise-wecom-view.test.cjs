@@ -6,12 +6,14 @@ const {
   isAllowedWeComNavigation,
   normalizeQrBounds,
   parseSecureUrl,
+  safeNavigationTarget,
   WE_COM_FIT_CSS,
   WE_COM_PAGE_ZOOM_FACTOR
 } = require('./enterprise-wecom-view.cjs')
 
 function createHarness() {
   const calls = []
+  const logs = []
   const listeners = new Map()
   const registeredEvents = []
   let currentUrl = 'https://open.work.weixin.qq.com/wwopen/sso/qrConnect'
@@ -64,9 +66,10 @@ function createHarness() {
   const view = createEnterpriseWeComView({
     WebContentsView: FakeWebContentsView,
     getHostWindow: () => hostWindow,
-    randomUUID: () => 'partition-id'
+    randomUUID: () => 'partition-id',
+    rememberLog: line => logs.push(line)
   })
-  return { calls, listeners, registeredEvents, setCurrentUrl: url => (currentUrl = url), view }
+  return { calls, listeners, logs, registeredEvents, setCurrentUrl: url => (currentUrl = url), view }
 }
 
 test('QR view uses an ephemeral sandbox and denies windows downloads and permissions', async () => {
@@ -142,6 +145,53 @@ test('QR navigation allowlist is exact for auth paths and constrained for offici
   let redirectBlocked = false
   redirect({ preventDefault: () => (redirectBlocked = true) }, 'https://evil.test/escaped-by-302')
   assert.equal(redirectBlocked, true)
+
+  const frameNavigate = listeners.get('will-frame-navigate')
+  let allowedFrameBlocked = false
+  frameNavigate({
+    isMainFrame: true,
+    preventDefault: () => (allowedFrameBlocked = true),
+    url: 'https://open.work.weixin.qq.com/wwopen/sso/qrConnect?state=secret'
+  })
+  assert.equal(allowedFrameBlocked, false)
+
+  let unsafeFrameBlocked = false
+  frameNavigate({
+    isMainFrame: false,
+    preventDefault: () => (unsafeFrameBlocked = true),
+    url: 'https://evil.test/frame'
+  })
+  assert.equal(unsafeFrameBlocked, true)
+})
+
+test('QR load failures log only a sanitized target and stable error label', async () => {
+  const { logs, view } = createHarness()
+  const transaction = 'opaque_transaction_secret_123'
+  const OriginalView = view.WebContentsView
+  view.WebContentsView = class extends OriginalView {
+    constructor(options) {
+      super(options)
+      this.webContents.loadURL = async () => {
+        throw Object.assign(new Error(`failed at https://auth.example.com/wecom/login/${transaction}?state=oauth-secret`), {
+          code: 'ERR_FAILED'
+        })
+      }
+    }
+  }
+
+  await assert.rejects(
+    () => view.open(`https://auth.example.com/wecom/login/${transaction}`, {
+      authorizationOrigin: 'https://auth.example.com'
+    }),
+    /failed at/
+  )
+  assert.equal(logs.length, 1)
+  assert.equal(
+    logs[0],
+    '[enterprise-wecom] QR view load failed stage=load-url code=ERR_FAILED target=https://auth.example.com/wecom/login/[redacted]'
+  )
+  assert.equal(logs[0].includes(transaction), false)
+  assert.equal(logs[0].includes('oauth-secret'), false)
 })
 
 test('QR view rejects userinfo query fragment and origin mismatch before construction', async () => {
@@ -190,4 +240,8 @@ test('navigation helper rejects unknown schemes and exact-path lookalikes', () =
   assert.equal(isAllowedWeComNavigation('https://auth.example.com/wecom/callback', rules), true)
   assert.equal(isAllowedWeComNavigation('https://auth.example.com/wecom/callback.evil', rules), false)
   assert.equal(isAllowedWeComNavigation('javascript:alert(1)', rules), false)
+  assert.equal(
+    safeNavigationTarget('https://auth.example.com/wecom/login/opaque_transaction_secret?state=oauth-secret'),
+    'https://auth.example.com/wecom/login/[redacted]'
+  )
 })

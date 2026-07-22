@@ -53,6 +53,23 @@ function isAllowedWeComNavigation(rawUrl, allowedPaths) {
   }
 }
 
+function safeNavigationTarget(rawUrl) {
+  try {
+    const parsed = parseSecureUrl(rawUrl)
+    const pathname = /^\/wecom\/login\/[^/]+$/.test(parsed.pathname)
+      ? '/wecom/login/[redacted]'
+      : parsed.pathname
+    return `${parsed.origin}${pathname}`
+  } catch {
+    return 'invalid-url'
+  }
+}
+
+function safeErrorLabel(error) {
+  const value = String(error?.code || error?.errno || error?.name || 'unknown')
+  return value.replace(/[^A-Za-z0-9_.-]/g, '_').slice(0, 80) || 'unknown'
+}
+
 function normalizeQrBounds(bounds, contentBounds = {}) {
   if (!bounds || bounds.visible === false) {
     return { height: 0, width: 0, x: 0, y: 0, visible: false }
@@ -128,10 +145,18 @@ class EnterpriseWeComView {
         this.rememberLog('[enterprise-wecom] blocked QR view navigation')
       }
     }
+    const denyFrameNavigation = details => {
+      if (!isAllowedWeComNavigation(details?.url, this.allowedPaths)) {
+        details?.preventDefault?.()
+        this.rememberLog('[enterprise-wecom] blocked QR view frame navigation')
+      }
+    }
     view.webContents.setWindowOpenHandler(() => ({ action: 'deny' }))
     view.webContents.on('will-navigate', denyNavigation)
     view.webContents.on('will-redirect', denyNavigation)
-    view.webContents.on('will-frame-navigate', denyNavigation)
+    // Electron 40 emits one Event<WebContentsWillFrameNavigateEventParams>
+    // details object here, unlike the legacy (event, url) navigation events.
+    view.webContents.on('will-frame-navigate', denyFrameNavigation)
     view.webContents.on('did-finish-load', async () => {
       try {
         const current = parseSecureUrl(view.webContents.getURL())
@@ -161,6 +186,9 @@ class EnterpriseWeComView {
     try {
       await view.webContents.loadURL(parsed.toString())
     } catch (error) {
+      this.rememberLog(
+        `[enterprise-wecom] QR view load failed stage=load-url code=${safeErrorLabel(error)} target=${safeNavigationTarget(parsed)}`
+      )
       await this.destroy()
       throw error
     }
@@ -240,5 +268,7 @@ module.exports = {
   createEnterpriseWeComView,
   isAllowedWeComNavigation,
   normalizeQrBounds,
-  parseSecureUrl
+  parseSecureUrl,
+  safeErrorLabel,
+  safeNavigationTarget
 }
