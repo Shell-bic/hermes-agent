@@ -58,12 +58,13 @@ function buildDesktopBackendPath({
   pathModule = pathModuleForPlatform(platform)
 } = {}) {
   const delimiter = delimiterForPlatform(platform)
+  const hermesNodeRoot = hermesHome && platform === 'win32' ? pathModule.join(hermesHome, 'node') : null
   const hermesNodeBin = hermesHome ? pathModule.join(hermesHome, 'node', 'bin') : null
   const venvBin = venvRoot ? pathModule.join(venvRoot, platform === 'win32' ? 'Scripts' : 'bin') : null
   const saneEntries = platform === 'win32' ? [] : POSIX_SANE_PATH_ENTRIES
 
   return appendUniquePathEntries(
-    [hermesNodeBin, venvBin, currentPath, saneEntries],
+    [hermesNodeRoot, hermesNodeBin, venvBin, currentPath, saneEntries],
     { delimiter }
   )
 }

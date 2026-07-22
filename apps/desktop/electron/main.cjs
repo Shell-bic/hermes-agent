@@ -3080,6 +3080,7 @@ async function ensureRuntime(backend) {
       sourceRepoRoot: SOURCE_REPO_ROOT,
       hermesHome: HERMES_HOME,
       logRoot: path.join(HERMES_HOME, 'logs'),
+      offlinePayloadRoot: IS_PACKAGED ? path.join(process.resourcesPath, 'offline-runtime') : null,
       abortSignal: bootstrapAbortController.signal,
       onEvent: ev => {
         // Tee every bootstrap event to (a) the desktop log for forensics

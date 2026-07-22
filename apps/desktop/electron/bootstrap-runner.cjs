@@ -39,6 +39,7 @@ const fsp = require('node:fs/promises')
 const path = require('node:path')
 const https = require('node:https')
 const { spawn } = require('node:child_process')
+const { loadOfflineRuntimePayload, provisionOfflineRuntime } = require('./offline-runtime.cjs')
 
 const IS_WINDOWS = process.platform === 'win32'
 
@@ -609,6 +610,7 @@ async function runBootstrap(opts) {
     logRoot,
     onEvent,
     abortSignal,
+    offlinePayloadRoot,
     writeMarker // callback to write the bootstrap-complete marker; main.cjs provides
   } = opts
 
@@ -654,6 +656,45 @@ async function runBootstrap(opts) {
   })
 
   try {
+    // Enterprise offline distributions carry the exact source runtime,
+    // Python environment, Git Bash, Node, and browser CLI beside app.asar.
+    // Prefer that immutable payload before resolving install.ps1 so a fresh
+    // workstation never needs GitHub, PyPI, npm, uv, or winget.
+    const offlinePayload = loadOfflineRuntimePayload(offlinePayloadRoot, { installStamp })
+    if (offlinePayload) {
+      emit({
+        type: 'manifest',
+        protocolVersion: 'offline-runtime.v1',
+        stages: [
+          {
+            name: 'offline-copy',
+            title: 'Installing packaged Hermes runtime',
+            category: 'install',
+            needs_user_input: false
+          }
+        ]
+      })
+      emit({
+        type: 'log',
+        line: `[offline] using packaged runtime ${offlinePayload.manifest.commit.slice(0, 12)} from ${offlinePayload.root}`
+      })
+      const provisioned = await provisionOfflineRuntime({
+        payload: offlinePayload,
+        hermesHome,
+        activeRoot,
+        platform: process.platform,
+        emit
+      })
+      const markerPayload = {
+        pinnedCommit: installStamp ? installStamp.commit : offlinePayload.manifest.commit,
+        pinnedBranch: installStamp ? installStamp.branch : offlinePayload.manifest.branch || null,
+        offlineRuntime: true
+      }
+      const marker = typeof writeMarker === 'function' ? writeMarker(markerPayload) : markerPayload
+      emit({ type: 'complete', marker, offlineRuntime: provisioned.receipt })
+      return { ok: true, marker, offlineRuntime: provisioned.receipt }
+    }
+
     // 1. Resolve the platform installer.
     const scriptInfo = await resolveInstallScript({ installStamp, sourceRepoRoot, hermesHome, emit })
     const installerKind = scriptInfo.kind || 'powershell'

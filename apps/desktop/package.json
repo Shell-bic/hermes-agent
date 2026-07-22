@@ -2,7 +2,7 @@
   "name": "hermes",
   "productName": "Hermes",
   "private": true,
-  "version": "0.16.0",
+  "version": "0.16.1",
   "description": "Native desktop shell for Hermes Agent.",
   "author": "Nous Research",
   "type": "module",
@@ -41,6 +41,7 @@
     "test:enterprise:lifecycle": "node --test electron/enterprise-managed-lifecycle.test.cjs",
     "test:enterprise:runtime-closure": "node --test electron/enterprise-runtime-closure.test.cjs",
     "test:enterprise:backend-ownership": "node --test electron/enterprise-backend-ownership.test.cjs",
+    "test:enterprise:offline-runtime": "node --test electron/offline-runtime.test.cjs",
     "test:enterprise:profile": "node --test electron/enterprise-managed-profile.test.cjs",
     "test:enterprise:bootstrap-fixture-consumer": "node scripts/test-desktop-bootstrap-fixture-consumer.cjs",
     "test:enterprise:x1-bootstrap-matrix": "node --test scripts/x1-enterprise-bootstrap-matrix.test.cjs",
@@ -185,6 +186,10 @@
       {
         "from": "build/native-deps",
         "to": "native-deps"
+      },
+      {
+        "from": "build/offline-runtime",
+        "to": "offline-runtime"
       },
       {
         "from": "assets/icon.ico",

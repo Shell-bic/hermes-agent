@@ -5,6 +5,8 @@ param(
 
     [string]$ReleaseDirectory,
 
+    [switch]$RequireOfflineRuntime,
+
     [switch]$Force
 )
 
@@ -24,6 +26,15 @@ if (-not (Test-Path -LiteralPath $releaseRoot -PathType Container)) {
 $unpacked = Join-Path $releaseRoot 'win-unpacked'
 if (-not (Test-Path -LiteralPath (Join-Path $unpacked 'Hermes.exe') -PathType Leaf)) {
     throw "Runnable win-unpacked/Hermes.exe was not found in: $releaseRoot"
+}
+
+$offlineRuntimeManifestPath = Join-Path $unpacked 'resources\offline-runtime\manifest.json'
+$offlineRuntimeManifest = $null
+if (Test-Path -LiteralPath $offlineRuntimeManifestPath -PathType Leaf) {
+    $offlineRuntimeManifest = Get-Content -LiteralPath $offlineRuntimeManifestPath -Raw | ConvertFrom-Json
+}
+if ($RequireOfflineRuntime -and -not $offlineRuntimeManifest) {
+    throw "Required offline runtime payload is missing from win-unpacked: $offlineRuntimeManifestPath"
 }
 
 if (Test-Path -LiteralPath $outputRoot) {
@@ -146,6 +157,19 @@ $manifest = [ordered]@{
         releaseClass = if ($gitDirty) { 'internal-pilot-dirty' } else { 'internal-pilot-unsigned' }
         codeSigning = 'unsigned'
         productionRequirement = 'authorized commit, clean worktree, enterprise code signing, rebuild, and verification'
+        offlineFirstLaunch = [bool]$offlineRuntimeManifest
+        githubRequiredForFirstLaunch = -not [bool]$offlineRuntimeManifest
+        offlineRuntime = if ($offlineRuntimeManifest) {
+            [ordered]@{
+                schemaVersion = $offlineRuntimeManifest.schemaVersion
+                commit = $offlineRuntimeManifest.commit
+                version = $offlineRuntimeManifest.version
+                platform = $offlineRuntimeManifest.platform
+                arch = $offlineRuntimeManifest.arch
+                fileCount = $offlineRuntimeManifest.fileCount
+                bytesBeforeManifest = $offlineRuntimeManifest.bytesBeforeManifest
+            }
+        } else { $null }
     }
     artifacts = $artifactEntries
 }

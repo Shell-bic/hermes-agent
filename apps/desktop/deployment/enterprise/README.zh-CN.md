@@ -35,6 +35,29 @@ Desktop 只需要 Enterprise Gateway 地址，不保存企业微信 `CorpSecret`
 2. 以管理员 PowerShell 运行上面的配置命令。
 3. 启动或完全重启 Hermes；未登录用户会进入统一登录页。
 
+## 离线首次启动包
+
+文件名或发布清单标记为 `offlineFirstLaunch=true` 的企业包，除 Electron Desktop 外还内置固定提交的 Hermes Runtime、便携 Python 3.11、锁定的 Python 依赖、Git Bash、Node.js 和浏览器 CLI。全新电脑第一次启动时直接把载荷部署到 `%LOCALAPPDATA%\hermes`，不访问 GitHub、PyPI、npm、Astral 或 winget。
+
+离线边界：
+
+- 安装和 Runtime 首次初始化不要求公网，只要求之后能访问配置的 Enterprise Gateway。
+- 离线 Runtime 的提交必须与 Desktop `install-stamp.json` 完全一致，关键文件 SHA-256 不一致会拒绝启动，不回退到公网下载。
+- 已存在但不完整的旧 Runtime 会保存在 `%LOCALAPPDATA%\hermes\offline-runtime-backups\<timestamp>`，不会静默删除。
+- 浏览器自动化优先使用目标电脑已有的 Edge/Chrome；包内不额外复制 Chromium。没有系统浏览器时聊天和企业能力仍可运行，但本地浏览器工具不可用。
+- 企业托管模式继续禁止客户端原地升级。发布新版本时重新分发新的完整离线安装包。
+
+构建机先生成离线载荷，再执行 Desktop 打包：
+
+```powershell
+.\scripts\Build-HermesOfflineRuntime.ps1 -Force
+npm run dist:win:nsis
+.\deployment\enterprise\Publish-HermesEnterpriseDesktop.ps1 `
+  -OutputDirectory <output> `
+  -RequireOfflineRuntime `
+  -Force
+```
+
 ## 便携版
 
 ```powershell
@@ -52,7 +75,7 @@ Desktop 只需要 Enterprise Gateway 地址，不保存企业微信 `CorpSecret`
 
 ## 分发包校验
 
-发布目录中的 `manifest.json` 记录构建版本、Git 状态、配置优先级和可运行产物；Git 状态覆盖全仓库已跟踪修改，并额外检查 Desktop 构建输入目录内的未跟踪文件，不会被未参与构建的工作区临时文件误报。`SHA256SUMS.txt` 覆盖安装包、portable ZIP、部署脚本、模板和 manifest。交付或上传服务器前执行：
+发布目录中的 `manifest.json` 记录构建版本、Git 状态、配置优先级、离线首次启动状态和可运行产物；Git 状态覆盖全仓库已跟踪修改，并额外检查 Desktop 构建输入目录内的未跟踪文件，不会被未参与构建的工作区临时文件误报。`SHA256SUMS.txt` 覆盖安装包、portable ZIP、部署脚本、模板和 manifest。交付或上传服务器前执行：
 
 ```powershell
 Get-Content .\SHA256SUMS.txt
@@ -65,7 +88,7 @@ Get-FileHash .\Hermes-*-win-*.exe -Algorithm SHA256
 
 ## 企业更新边界
 
-- 企业发行仓库唯一固定为 `https://github.com/Shell-bic/hermes-agent.git`；首次启动按安装包内的精确提交号安装 Runtime。
+- 企业发行仓库唯一固定为 `https://github.com/Shell-bic/hermes-agent.git`；联网包首次启动按安装包内的精确提交号安装 Runtime，离线包直接使用同一精确提交的内置 Runtime。
 - 企业托管模式不提供 Desktop、Dashboard 或 `hermes update` 本地升级；客户端不会拉取或合并原版 Hermes 的 `main`。
 - 安装/修复现有 Runtime 时会把 `origin` 纠正为企业发行仓库，并移除历史 `upstream` remote。
 - 升级方式是部署新的企业安装包。新包再次按其构建提交执行可重复的 Runtime 安装或修复。
