@@ -52,7 +52,7 @@ Desktop 只需要 Enterprise Gateway 地址，不保存企业微信 `CorpSecret`
 
 ## 分发包校验
 
-发布目录中的 `manifest.json` 记录构建版本、Git 状态、配置优先级和可运行产物；`SHA256SUMS.txt` 覆盖安装包、portable ZIP、部署脚本、模板和 manifest。交付或上传服务器前执行：
+发布目录中的 `manifest.json` 记录构建版本、Git 状态、配置优先级和可运行产物；Git 状态覆盖全仓库已跟踪修改，并额外检查 Desktop 构建输入目录内的未跟踪文件，不会被未参与构建的工作区临时文件误报。`SHA256SUMS.txt` 覆盖安装包、portable ZIP、部署脚本、模板和 manifest。交付或上传服务器前执行：
 
 ```powershell
 Get-Content .\SHA256SUMS.txt

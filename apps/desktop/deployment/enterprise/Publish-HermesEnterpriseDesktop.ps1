@@ -58,16 +58,35 @@ foreach ($file in Get-ChildItem -LiteralPath $PSScriptRoot -File) {
     Copy-Item -LiteralPath $file.FullName -Destination (Join-Path $deploymentTarget $file.Name)
 }
 
-$gitCommit = (& git -C $desktopRoot rev-parse HEAD).Trim()
-$gitBranch = (& git -C $desktopRoot branch --show-current).Trim()
-$statusLines = @(& git -C $desktopRoot status --porcelain=v1 --untracked-files=all -- . | Sort-Object)
-$sourceFiles = @(& git -C $desktopRoot ls-files --modified --others --exclude-standard -- . | Sort-Object -Unique)
+$repoRoot = (& git -C $desktopRoot rev-parse --show-toplevel).Trim()
+$gitCommit = (& git -C $repoRoot rev-parse HEAD).Trim()
+$gitBranch = (& git -C $repoRoot branch --show-current).Trim()
+$trackedStatusLines = @(& git -C $repoRoot status --porcelain=v1 --untracked-files=no | Sort-Object)
+$trackedSourceFiles = @(& git -C $repoRoot diff --name-only HEAD -- | Sort-Object -Unique)
+$untrackedBuildScopes = @(
+    'apps/desktop/assets',
+    'apps/desktop/deployment',
+    'apps/desktop/electron',
+    'apps/desktop/public',
+    'apps/desktop/scripts',
+    'apps/desktop/src',
+    'apps/desktop/package.json'
+)
+$untrackedBuildFiles = @(
+    & git -C $repoRoot ls-files --others --exclude-standard -- $untrackedBuildScopes |
+        Sort-Object -Unique
+)
+$statusLines = @(
+    $trackedStatusLines
+    $untrackedBuildFiles | ForEach-Object { "?? $_" }
+)
+$sourceFiles = @($trackedSourceFiles + $untrackedBuildFiles | Sort-Object -Unique)
 $sourceStateLines = [System.Collections.Generic.List[string]]::new()
 foreach ($line in $statusLines) {
     $sourceStateLines.Add("status:$line")
 }
 foreach ($relativePath in $sourceFiles) {
-    $sourcePath = Join-Path $desktopRoot $relativePath
+    $sourcePath = Join-Path $repoRoot $relativePath
     if (Test-Path -LiteralPath $sourcePath -PathType Leaf) {
         $sourceHash = (Get-FileHash -LiteralPath $sourcePath -Algorithm SHA256).Hash.ToLowerInvariant()
         $sourceStateLines.Add("file:$($relativePath.Replace('\', '/')):$sourceHash")
@@ -106,7 +125,7 @@ $manifest = [ordered]@{
         statusEntryCount = $statusLines.Count
         sourceFileCount = $sourceFiles.Count
         sourceStateSha256 = $sourceStateSha256
-        sourceStateScope = 'apps/desktop modified and untracked source; ignored node_modules, release, cache, and artifacts excluded'
+        sourceStateScope = 'all tracked repository changes plus untracked Desktop build inputs; unrelated untracked workspace files excluded'
     }
     configuration = [ordered]@{
         machinePath = '%ProgramData%\Hermes\enterprise-desktop.json'
