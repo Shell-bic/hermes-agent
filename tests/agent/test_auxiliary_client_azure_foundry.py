@@ -252,6 +252,8 @@ class TestAuxAzureFoundryEntra:
                 self.base_url = kwargs.get("base_url", "")
 
         class _FakeAnthropicSDK:
+            omit = object()
+
             class Anthropic:
                 def __init__(self, **kwargs):
                     received["anthropic"] = kwargs

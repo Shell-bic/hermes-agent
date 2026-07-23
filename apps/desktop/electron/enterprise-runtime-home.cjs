@@ -960,6 +960,16 @@ function publicEnterpriseState({ bootstrap = null, manifest = null, modelProfile
 function buildManagedConfigYaml({ manifest, displayLanguage = ENTERPRISE_UI_POLICY_DEFAULT.defaultLocale }) {
   const gatewayBaseUrl = normalizeGatewayApiBaseUrl(manifest.gatewayApiBaseUrl || manifest.gatewayBaseUrl)
   const defaultModel = manifest.defaultModel || asArray(manifest.allowedModels)[0] || ''
+  const profiles = mergedModelProfiles(manifest.modelProfiles)
+  const currentProfileId = String(manifest.currentModelProfileId || manifest.defaultModelProfileId || '').trim()
+  const currentProfile = currentProfileId
+    ? profiles.find(profile => String(profile.id || '').trim() === currentProfileId) || null
+    : profiles.find(profile => profile.model === defaultModel) || null
+  const supportsVision = Boolean(
+    currentProfile?.capabilities?.vision
+      || currentProfile?.capabilities?.supportsVision
+      || currentProfile?.capabilities?.supports_vision
+  )
   const apiMode = resolveManifestApiMode(manifest)
   const config = {
     agent: {
@@ -971,7 +981,8 @@ function buildManagedConfigYaml({ manifest, displayLanguage = ENTERPRISE_UI_POLI
     model: {
       provider: MANAGED_PROVIDER,
       default: defaultModel,
-      api_mode: apiMode
+      api_mode: apiMode,
+      supports_vision: supportsVision
     },
     providers: {
       [MANAGED_PROVIDER]: {

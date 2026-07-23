@@ -2222,7 +2222,10 @@ def _normalize_main_runtime(main_runtime: Optional[Dict[str, Any]]) -> Dict[str,
     return normalized
 
 
-def _enterprise_auxiliary_runtime(model: Optional[str] = None) -> Optional[Dict[str, Any]]:
+def _enterprise_auxiliary_runtime(
+    model: Optional[str] = None,
+    task: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
     """Resolve the sole auxiliary runtime allowed by a managed home.
 
     Partial enterprise bootstrap artifacts count as managed intent.  The
@@ -2238,17 +2241,27 @@ def _enterprise_auxiliary_runtime(model: Optional[str] = None) -> Optional[Dict[
         return None
     from hermes_cli.enterprise_policy import (
         ENTERPRISE_PROVIDER,
+        auxiliary_model_selection,
         current_model,
         load_enterprise_policy,
+        resolve_model_selection,
     )
 
-    target_model = str(model or "").strip() or current_model(load_enterprise_policy())
+    policy = load_enterprise_policy()
+    primary_model = _read_main_model() or current_model(policy)
+    selection = (
+        auxiliary_model_selection(task, primary_model=primary_model, policy=policy)
+        if task
+        else resolve_model_selection(str(model or "").strip() or primary_model, policy)
+    )
+    target_selection = selection.get("selection") or selection.get("model") or primary_model
     runtime = resolve_runtime_provider(
         requested=ENTERPRISE_PROVIDER,
-        target_model=target_model or None,
+        target_model=target_selection or None,
     )
     runtime = dict(runtime)
-    runtime["model"] = target_model
+    runtime["model"] = selection.get("model") or primary_model
+    runtime["selection"] = target_selection
     return runtime
 
 
@@ -3605,7 +3618,7 @@ def resolve_provider_client(
             client_obj, final_model_str, api_key_str, base_url_str, api_mode,
         )
 
-    managed_runtime = _enterprise_auxiliary_runtime(model)
+    managed_runtime = _enterprise_auxiliary_runtime(model, task)
     if managed_runtime is not None:
         from hermes_cli.enterprise_policy import ENTERPRISE_PROVIDER
 
@@ -4769,7 +4782,7 @@ def _get_cached_client(
     preventing the fd-exhaustion that previously occurred in long-running
     gateways where recycled worker threads created unbounded entries (#10200).
     """
-    managed_runtime = _enterprise_auxiliary_runtime(model)
+    managed_runtime = _enterprise_auxiliary_runtime(model, task)
     if managed_runtime is not None:
         provider = str(managed_runtime.get("provider") or "")
         model = str(managed_runtime.get("model") or model or "")
@@ -4901,7 +4914,7 @@ def _resolve_task_provider_model(
     to "custom" and the task uses that direct endpoint. api_mode is one of
     "chat_completions", "codex_responses", or None (auto-detect).
     """
-    managed_runtime = _enterprise_auxiliary_runtime(model)
+    managed_runtime = _enterprise_auxiliary_runtime(model, task)
     if managed_runtime is not None:
         from hermes_cli.enterprise_policy import ENTERPRISE_PROVIDER
 
@@ -5325,10 +5338,20 @@ def call_llm(
     """
     resolved_provider, resolved_model, resolved_base_url, resolved_api_key, resolved_api_mode = _resolve_task_provider_model(
         task, provider, model, base_url, api_key)
+    managed_runtime = _enterprise_auxiliary_runtime(resolved_model, task)
     effective_extra_body = _get_task_extra_body(task)
     effective_extra_body.update(extra_body or {})
+    if managed_runtime is not None:
+        request_overrides = managed_runtime.get("request_overrides")
+        managed_extra_body = (
+            request_overrides.get("extra_body")
+            if isinstance(request_overrides, dict)
+            else None
+        )
+        if isinstance(managed_extra_body, dict):
+            effective_extra_body.update(managed_extra_body)
 
-    if task == "vision" and _enterprise_auxiliary_runtime(resolved_model) is None:
+    if task == "vision" and managed_runtime is None:
         effective_provider, client, final_model = resolve_vision_provider_client(
             provider=resolved_provider if resolved_provider != "auto" else provider,
             model=resolved_model or model,
@@ -5360,6 +5383,7 @@ def call_llm(
             api_key=resolved_api_key,
             api_mode=resolved_api_mode,
             main_runtime=main_runtime,
+            task=task,
         )
         if client is None:
             # When the user explicitly chose a non-OpenRouter provider but no
@@ -5834,10 +5858,20 @@ async def async_call_llm(
     """
     resolved_provider, resolved_model, resolved_base_url, resolved_api_key, resolved_api_mode = _resolve_task_provider_model(
         task, provider, model, base_url, api_key)
+    managed_runtime = _enterprise_auxiliary_runtime(resolved_model, task)
     effective_extra_body = _get_task_extra_body(task)
     effective_extra_body.update(extra_body or {})
+    if managed_runtime is not None:
+        request_overrides = managed_runtime.get("request_overrides")
+        managed_extra_body = (
+            request_overrides.get("extra_body")
+            if isinstance(request_overrides, dict)
+            else None
+        )
+        if isinstance(managed_extra_body, dict):
+            effective_extra_body.update(managed_extra_body)
 
-    if task == "vision" and _enterprise_auxiliary_runtime(resolved_model) is None:
+    if task == "vision" and managed_runtime is None:
         effective_provider, client, final_model = resolve_vision_provider_client(
             provider=resolved_provider if resolved_provider != "auto" else provider,
             model=resolved_model or model,
@@ -5870,6 +5904,7 @@ async def async_call_llm(
             api_key=resolved_api_key,
             api_mode=resolved_api_mode,
             main_runtime=main_runtime,
+            task=task,
         )
         if client is None:
             _explicit = (resolved_provider or "").strip().lower()

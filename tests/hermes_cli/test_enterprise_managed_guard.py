@@ -726,6 +726,11 @@ def test_managed_model_set_allows_policy_model(client, managed_policy):
     )
     assert resp.status_code == 200
     assert resp.json()["provider"] == "company-gateway"
+    from hermes_constants import get_hermes_home
+
+    config = yaml.safe_load((get_hermes_home() / "config.yaml").read_text(encoding="utf-8"))
+    assert config["model"]["default"] == "allowed/model"
+    assert config["model"]["supports_vision"] is False
 
 
 def test_managed_mcp_manage_is_rejected_by_locked_surface(client, managed_policy):

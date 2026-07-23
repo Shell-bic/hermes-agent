@@ -3508,9 +3508,19 @@ def _enterprise_context_length(caps: Dict[str, Any], defaults: Dict[str, Any]) -
     return 0
 
 
+def _enterprise_configured_main_model(policy: Dict[str, Any]) -> str:
+    cfg = load_config()
+    model_cfg = cfg.get("model") if isinstance(cfg, dict) else None
+    if isinstance(model_cfg, dict):
+        configured = str(model_cfg.get("default") or model_cfg.get("name") or "").strip()
+        if configured:
+            return configured
+    return enterprise_current_model(policy) or enterprise_default_model(policy)
+
+
 def _enterprise_model_info_payload() -> Dict[str, Any]:
     policy = load_enterprise_policy()
-    model = enterprise_current_model(policy) or enterprise_default_model(policy)
+    model = _enterprise_configured_main_model(policy)
     default = enterprise_default_model(policy)
     caps = enterprise_capabilities(policy, model)
     defaults = enterprise_runtime_defaults(policy, model)
@@ -3534,7 +3544,7 @@ def _enterprise_model_info_payload() -> Dict[str, Any]:
 
 def _enterprise_model_options_payload() -> Dict[str, Any]:
     policy = load_enterprise_policy()
-    current = enterprise_current_model(policy) or enterprise_default_model(policy)
+    current = _enterprise_configured_main_model(policy)
     provider = managed_model_option_provider(policy)
     return {
         "model": current,
@@ -3572,6 +3582,12 @@ def _apply_enterprise_model_assignment(scope: str, provider: str, model: str, ta
         model_cfg = {}
     model_cfg["provider"] = ENTERPRISE_PROVIDER
     model_cfg["default"] = model
+    selected_capabilities = enterprise_capabilities(load_enterprise_policy(), model)
+    model_cfg["supports_vision"] = bool(
+        selected_capabilities.get("vision")
+        or selected_capabilities.get("supportsVision")
+        or selected_capabilities.get("supports_vision")
+    )
     model_cfg.pop("base_url", None)
     model_cfg.pop("api_key", None)
     model_cfg.pop("api", None)
@@ -3839,7 +3855,7 @@ def get_auxiliary_models(profile: Optional[str] = None):
     try:
         if is_enterprise_managed():
             policy = load_enterprise_policy()
-            model = enterprise_current_model(policy) or enterprise_default_model(policy)
+            model = _enterprise_configured_main_model(policy)
             aux_policy = enterprise_auxiliary_policy(policy, model)
             return {
                 "policy": aux_policy,

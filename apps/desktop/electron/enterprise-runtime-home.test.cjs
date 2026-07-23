@@ -258,6 +258,7 @@ test('managed runtime home writes company-gateway config and token env only in p
   assert.match(config, /agent:\n {2}api_max_retries: 1/)
   assert.match(config, /display:\n {2}language: "zh"/)
   assert.match(config, /api_mode: "chat_completions"/)
+  assert.match(config, /supports_vision: false/)
   assert.match(env, /COMPANY_GATEWAY_TOKEN="gateway-secret"/)
   assert.equal(result.env[GATEWAY_TOKEN_ENV], 'gateway-secret')
   assert.deepEqual(policy.allowedModels, ['gpt-4.1', 'claude-sonnet'])

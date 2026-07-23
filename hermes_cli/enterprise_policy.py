@@ -1445,6 +1445,13 @@ def auxiliary_policy(policy: Optional[Mapping[str, Any]] = None, model: str = ""
     policy = policy or load_enterprise_policy()
     raw = _policy_value(policy, "auxiliaryPolicy")
     result = dict(scrub_secret_fields(raw)) if isinstance(raw, dict) else {}
+    if (
+        "defaultAuxiliaryModelProfileId" in result
+        or "taskModelProfileOverrides" in result
+        or "default_auxiliary_model_profile_id" in result
+        or "task_model_profile_overrides" in result
+    ):
+        return result
     resolved = resolve_model_selection(_text(model) or current_model(policy), policy)
     model_id = resolved["profile_id"] or resolved["model"]
     for profile in model_profiles(policy):
@@ -1454,6 +1461,53 @@ def auxiliary_policy(policy: Optional[Mapping[str, Any]] = None, model: str = ""
                 result.update(dict(scrub_secret_fields(profile_policy)))
             break
     return result
+
+
+def auxiliary_model_selection(
+    task: str = "",
+    *,
+    primary_model: str = "",
+    policy: Optional[Mapping[str, Any]] = None,
+) -> dict[str, str]:
+    """Resolve an enterprise auxiliary task to an allowed model profile.
+
+    Role policy uses profile IDs so duplicate upstream model names remain
+    unambiguous. Missing, conflicting, or disabled auxiliary routes follow
+    the employee's current primary model.
+    """
+    policy = policy or load_enterprise_policy()
+    primary = _text(primary_model) or current_model(policy)
+    aux = auxiliary_policy(policy)
+    allow_auxiliary = aux.get("allowAuxiliaryModels")
+    if allow_auxiliary is None:
+        allow_auxiliary = aux.get("allow_auxiliary_models", True)
+
+    target_profile_id = ""
+    if _truthy(allow_auxiliary):
+        overrides = aux.get("taskModelProfileOverrides")
+        if not isinstance(overrides, Mapping):
+            overrides = aux.get("task_model_profile_overrides")
+        task_key = _text(task).lower()
+        if isinstance(overrides, Mapping) and task_key:
+            target_profile_id = _text(overrides.get(task_key))
+        if not target_profile_id:
+            target_profile_id = _text(
+                aux.get("defaultAuxiliaryModelProfileId")
+                or aux.get("default_auxiliary_model_profile_id")
+            )
+
+    if target_profile_id:
+        allowed_profile_ids = {
+            _text(profile.get("id"))
+            for profile in allowed_model_profiles(policy)
+        }
+        if target_profile_id in allowed_profile_ids:
+            return resolve_model_selection(
+                f"{ENTERPRISE_PROFILE_PREFIX}{target_profile_id}",
+                policy,
+            )
+
+    return resolve_model_selection(primary, policy)
 
 
 def allowed_model_profiles(policy: Optional[Mapping[str, Any]] = None) -> list[dict[str, Any]]:
